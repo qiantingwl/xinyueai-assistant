@@ -1,18 +1,25 @@
-# Xinyue AI Assistant · 心悦AI助手
+<h1 align="center">Xinyue AI Assistant · 心悦AI助手</h1>
 
-> Based on [Aivory](https://github.com/hjxwz123/Aivory) (Apache-2.0). The UI branding and default site name have been changed to "Xinyue AI"; everything else follows upstream. All credit to the upstream author.
+<p align="center">
+  <b>A self-hosted, multi-model AI workspace in a single container</b><br>
+  Multi-model chat · Multi-turn tool calling · RAG knowledge base · Python sandbox · Team spaces · Quotas · Admin console
+</p>
 
-> 简体中文文档见 [README.md](README.md)。
+<p align="center">
+  <a href="#quick-start">Quick Start</a> · <a href="#features">Features</a> · <a href="#common-environment-variables">Environment</a> · <a href="./README.md">简体中文</a>
+</p>
 
-A self-hosted, multi-model AI workspace that runs in a single container: multi-model chat, multi-turn tool calling, knowledge base (RAG), code sandbox, team spaces, subscription quotas, and a full admin console — ready out of the box.
-
-![Xinyue AI workspace](docs/screenshots/workspace.png)
-
-## Preview
-
-| Workspace | Sign in |
-| --- | --- |
-| ![Workspace](docs/screenshots/workspace.png) | ![Sign in](docs/screenshots/login.png) |
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="Xinyue AI chat" width="86%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/workspace.png" alt="Workspace" width="49%" />
+  <img src="docs/screenshots/admin.png" alt="Admin console" width="49%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/admin-channels.png" alt="Channels" width="49%" />
+  <img src="docs/screenshots/login.png" alt="Sign in" width="49%" />
+</p>
 
 ## Features
 
@@ -42,15 +49,14 @@ docker run -d --name xinyueai-assistant \
   -p 8787:8787 \
   -v xinyueai-data:/app/data \
   -e JWT_SECRET="$(openssl rand -hex 32)" \
-  -e ENABLE_MOCK_PROVIDER=true \
   xinyueai-assistant:latest
 ```
 
 Open `http://localhost:8787`:
 
 1. The first visit lands on the setup page — **the first account you create becomes the admin**
-2. Go to `/admin/channels` in the admin console, add a provider channel (API base URL + key), then create at least one chat model
-3. With `ENABLE_MOCK_PROVIDER=true` a mock channel is seeded, so you can try the full flow without any real API key
+2. Go to `/admin/channels` in the admin console, add a provider channel (API base URL + key), then create at least one chat model and set it as the default
+3. Head back to the chat page and start talking; knowledge bases, files, and team spaces are managed from the same console
 
 Conversations, uploads, and artifacts live in the `xinyueai-data` volume and survive image upgrades.
 
@@ -61,7 +67,6 @@ See [.env.example](.env.example) for the full list. The ones you'll touch most:
 | Variable | Default | Description |
 |---|---|---|
 | `JWT_SECRET` | built-in placeholder (**change in production**) | Token signing secret, 32+ random bytes recommended |
-| `ENABLE_MOCK_PROVIDER` | `true` | Seeds a mock channel for first-run experience; set `false` once real channels are configured |
 | `DATABASE_URL` | embedded SQLite file | Set to `postgres://...` to switch to PostgreSQL |
 | `REDIS_URL` | disabled | Enables Redis-backed cache, rate limiting, and cross-process stream notifications |
 | `QDRANT_URL` | disabled | Enables vector search (hybrid RAG retrieval + dynamic top-K) |
@@ -84,6 +89,8 @@ docker rm -f xinyueai-assistant
 
 React 19 + Vite + TypeScript · Tailwind CSS 4 · Go 1.24 · SQLite / PostgreSQL · optional Redis and Qdrant
 
-## License
+## Acknowledgements & License
 
-[Apache-2.0](LICENSE)
+This repository is a fork of [Aivory](https://github.com/hjxwz123/Aivory) (Apache-2.0): the UI branding and default site name have been changed to "Xinyue AI", everything else follows upstream. All credit to the upstream author.
+
+Released under the [Apache-2.0](LICENSE) license.

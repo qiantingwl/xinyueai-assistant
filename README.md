@@ -1,16 +1,25 @@
-# 心悦AI助手 · Xinyue AI Assistant
+<h1 align="center">心悦AI助手 · Xinyue AI Assistant</h1>
 
-> 基于 [Aivory](https://github.com/hjxwz123/Aivory)（Apache-2.0）二次开发，界面品牌与默认站点名已改为「心悦AI」，其余能力与部署方式跟随上游。感谢上游作者的出色工作。
+<p align="center">
+  <b>一个容器跑起来的自部署多模型 AI 工作空间</b><br>
+  多模型对话 · 多轮工具调用 · 知识库（RAG）· Python 沙箱 · 团队空间 · 订阅配额 · 管理后台
+</p>
 
-一个容器跑起来的自部署多模型 AI 工作空间：多模型对话、多轮工具调用、知识库、代码沙箱、团队空间、订阅配额和管理后台，全部开箱即用。
+<p align="center">
+  <a href="#快速开始">快速开始</a> · <a href="#功能一览">功能一览</a> · <a href="#常见环境变量">环境变量</a> · <a href="./README.en.md">English</a>
+</p>
 
-![心悦AI助手工作台](docs/screenshots/workspace.png)
-
-## 界面预览
-
-| 工作台 | 登录 |
-| --- | --- |
-| ![工作台](docs/screenshots/workspace.png) | ![登录](docs/screenshots/login.png) |
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="心悦AI助手对话界面" width="86%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/workspace.png" alt="工作台" width="49%" />
+  <img src="docs/screenshots/admin.png" alt="管理后台" width="49%" />
+</p>
+<p align="center">
+  <img src="docs/screenshots/admin-channels.png" alt="渠道管理" width="49%" />
+  <img src="docs/screenshots/login.png" alt="登录" width="49%" />
+</p>
 
 ## 功能一览
 
@@ -40,26 +49,24 @@ docker run -d --name xinyueai-assistant \
   -p 8787:8787 \
   -v xinyueai-data:/app/data \
   -e JWT_SECRET="$(openssl rand -hex 32)" \
-  -e ENABLE_MOCK_PROVIDER=true \
   xinyueai-assistant:latest
 ```
 
 启动后打开 `http://localhost:8787`：
 
 1. 首次访问进入初始化页，**第一个注册的账号自动成为管理员**
-2. 进入管理后台 `/admin/channels`，添加模型渠道（填 API 地址和 Key），再创建至少一个聊天模型
-3. 开着 `ENABLE_MOCK_PROVIDER=true` 时自带 Mock 模型——不配真实 Key 也能先把完整流程跑一遍
+2. 登录后进入管理后台 `/admin/channels`，添加模型渠道（填 API 地址和 Key），再创建至少一个聊天模型并设为默认
+3. 回到对话页即可开始聊天；知识库、文件、团队空间都在同一套后台里管理
 
 对话记录、上传文件和生成产物都存在 `xinyueai-data` 卷里，升级镜像不丢数据。
 
-## 常用环境变量
+## 常见环境变量
 
 完整清单见 [.env.example](.env.example)。最常用的几个：
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `JWT_SECRET` | 内置示例值（**生产必改**） | 登录令牌签名密钥，建议 32 字节以上随机串 |
-| `ENABLE_MOCK_PROVIDER` | `true` | 种子一个 Mock 渠道便于开箱体验，接入真实模型后可设为 `false` |
 | `DATABASE_URL` | 内嵌 SQLite 文件 | 设为 `postgres://...` 即切换到 PostgreSQL |
 | `REDIS_URL` | 未启用 | 设置后用 Redis 做缓存、限流与跨进程流式通知 |
 | `QDRANT_URL` | 未启用 | 设置后启用向量检索（RAG 混合检索 + 动态 Top-K） |
@@ -82,6 +89,8 @@ docker rm -f xinyueai-assistant
 
 React 19 + Vite + TypeScript · Tailwind CSS 4 · Go 1.24 · SQLite / PostgreSQL · 可选 Redis 与 Qdrant
 
-## License
+## 致谢与许可
 
-[Apache-2.0](LICENSE)
+本仓库基于 [Aivory](https://github.com/hjxwz123/Aivory)（Apache-2.0）二次开发：界面品牌与默认站点名已改为「心悦AI」，其余能力与部署方式跟随上游。感谢上游作者的出色工作。
+
+本项目同样以 [Apache-2.0](LICENSE) 协议开源。
