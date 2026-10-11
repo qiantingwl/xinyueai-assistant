@@ -23,15 +23,13 @@
 
 ## Features
 
-| | Feature | What you get |
-|---|---|---|
-| 💬 | **Multi-model chat** | Claude, GPT, Gemini, or any OpenAI-compatible endpoint in one UI; channels and keys are managed in the admin console, switch models per message |
-| 🛠 | **Multi-turn tool calling** | Web search, page fetch, Python, image generation, memory, and skills chained automatically (48 calls per turn by default) |
-| 📚 | **Knowledge base (RAG)** | PDF / Office / Markdown / spreadsheets / images; structure-aware chunking, hybrid retrieval when a vector DB is configured, automatic full-text fallback otherwise, answers with citations |
-| 🐍 | **Python sandbox (optional)** | One isolated workspace per conversation with pandas, matplotlib, python-pptx preinstalled; charts and documents become download cards; safe-mode arithmetic fallback when no sandbox is deployed |
-| 👥 | **Team workspaces** | Shared conversations, files, and knowledge bases with invite links and member attribution |
-| 💳 | **Subscriptions & quotas** | User tiers, daily limits, credits and redemption codes, optional payment gateways |
-| 🛡 | **Admin console** | Channels, models, tools, users, knowledge bases, subscriptions, backups, and system settings in one place |
+- **Multi-model chat**: Claude, GPT, Gemini, or any OpenAI-compatible endpoint in one UI; channels and keys are managed in the admin console, switch models per message.
+- **Multi-turn tool calling**: Web search, page fetch, Python, image generation, memory, and skills chained automatically (48 calls per turn by default).
+- **Knowledge base (RAG)**: PDF, Office, Markdown, spreadsheets, and images; structure-aware chunking, hybrid retrieval when a vector DB is configured, automatic full-text fallback otherwise, answers with citations.
+- **Python sandbox (optional)**: One isolated workspace per conversation with pandas, matplotlib, python-pptx preinstalled; charts and documents become download cards; safe-mode arithmetic fallback when no sandbox is deployed.
+- **Team workspaces**: Shared conversations, files, and knowledge bases with invite links and member attribution.
+- **Subscriptions & quotas**: User tiers, daily limits, credits and redemption codes, optional payment gateways.
+- **Admin console**: Channels, models, tools, users, knowledge bases, subscriptions, backups, and system settings in one place.
 
 ## Quick Start (single container)
 
