@@ -1,5 +1,7 @@
 # Aivory — production deployment
 
+> Note: this repository does not ship `docker-compose.prod.yml` (the full-stack compose file). Prefer the single-container deployment in the root README; this document is kept as a reference for full-stack environment variables.
+
 <p align="center">
   <a href="./README.md"><strong>English</strong></a> ·
   <a href="./README.zh-CN.md">简体中文</a>

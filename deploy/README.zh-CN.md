@@ -1,5 +1,7 @@
 # Aivory — 生产部署
 
+> 注：本仓库未附带 `docker-compose.prod.yml`（完整栈部署文件）。推荐使用根目录 README 中的单容器方式部署；本文档保留用于参考完整栈的环境变量与配置思路。
+
 <p align="center">
   <a href="./README.md">English</a> ·
   <a href="./README.zh-CN.md"><strong>简体中文</strong></a>
