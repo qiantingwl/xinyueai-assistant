@@ -1,0 +1,264 @@
+import { useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
+import { SettingsRow, SettingsSection } from './SettingsLayout'
+import { useSettings } from '@/store/settings'
+import { useTheme } from '@/store/theme'
+import { useLanguage } from '@/store/language'
+import { SUPPORTED_LANGUAGES } from '@/i18n'
+import { type ChatWidthPref, type FontPref, FONT_PRESETS } from '@/types/settings'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
+import { Sun, Moon, Monitor } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { toast } from '@/hooks/use-toast'
+import { persistUserSettings } from '@/lib/user-settings'
+
+// Slider stops, narrow → full. Order defines the slider's left-to-right axis;
+// widths live in tokens.css ([data-chat-width=…] → --layout-message-max-w).
+const CHAT_WIDTH_STOPS: readonly ChatWidthPref[] = ['narrow', 'comfortable', 'wide', 'full', 'max']
+
+// CSS family per typeface preset so each card previews in its own font,
+// regardless of which font is currently applied to the document.
+const FONT_PREVIEW: Record<FontPref, string> = {
+  default: "'Geist Variable', 'Geist', 'PingFang SC', 'Microsoft YaHei', ui-sans-serif, sans-serif",
+  humanist: "'Avenir Next', Avenir, 'Segoe UI', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif",
+  rounded: "'SF Pro Rounded', 'Yuanti SC', 'STYuanti-SC-Regular', ui-rounded, 'Arial Rounded MT Bold', sans-serif",
+  serif: "'Fraunces Variable', 'Fraunces', 'Songti SC', STSong, ui-serif, Georgia, serif",
+}
+
+export default function Appearance() {
+  const pref = useTheme((s) => s.pref)
+  const setPref = useTheme((s) => s.setPref)
+  const syncSystem = useTheme((s) => s.syncSystem)
+  const appearance = useSettings((s) => s.appearance)
+  const setAppearance = useSettings((s) => s.setAppearance)
+  const lang = useLanguage((s) => s.lang)
+  const setLang = useLanguage((s) => s.setLang)
+  const { t } = useTranslation(['settings', 'common'])
+
+  useEffect(() => syncSystem(), [syncSystem])
+  function onChangeFont(opt: FontPref) {
+    setAppearance({ font: opt })
+    void persistUserSettings({ font_family: opt }).catch(() => {})
+  }
+
+  function onChangeLanguage(v: string) {
+    setLang(v as typeof lang)
+  }
+
+  function onChangeChatWidth(v: typeof appearance.chatWidth) {
+    setAppearance({ chatWidth: v })
+    void persistUserSettings({ chat_width: v }).catch(() => {})
+  }
+
+  function onToggleUserMessageMarkdown(enabled: boolean) {
+    setAppearance({ userMessageMarkdown: enabled })
+    void persistUserSettings({ user_message_markdown: enabled })
+      .catch((e) => {
+        setAppearance({ userMessageMarkdown: !enabled })
+        toast.error(t('common:actions.failed', { defaultValue: 'Failed to save' }), e instanceof Error ? e.message : undefined)
+      })
+  }
+
+  return (
+    <div className="mx-auto max-w-[60rem]">
+      <header className="mb-8">
+        <h1 className="text-xl font-semibold tracking-normal text-[var(--color-fg)]">{t('appearance.title')}</h1>
+        <p className="mt-2.5 text-sm text-[var(--color-fg-muted)]">{t('appearance.subtitle')}</p>
+      </header>
+
+      <SettingsSection title={t('appearance.theme')} description={t('appearance.themeBody')}>
+        <SettingsRow label={t('appearance.colorTheme')} description={t('appearance.colorThemeBody')}>
+          <div className="flex items-center gap-2">
+            <ThemeChip current={pref} value="light" onClick={() => setPref('light')} icon={<Sun size={14} aria-hidden />} label={t('appearance.light')} />
+            <ThemeChip current={pref} value="dark" onClick={() => setPref('dark')} icon={<Moon size={14} aria-hidden />} label={t('appearance.dark')} />
+            <ThemeChip current={pref} value="system" onClick={() => setPref('system')} icon={<Monitor size={14} aria-hidden />} label={t('appearance.system')} />
+          </div>
+        </SettingsRow>
+        <SettingsRow label={t('appearance.language')} description={t('appearance.languageBody')}>
+          <Select value={lang} onValueChange={onChangeLanguage}>
+            <SelectTrigger className="w-48" aria-label={t('appearance.language')}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SUPPORTED_LANGUAGES.map((l) => (
+                <SelectItem key={l.code} value={l.code}>
+                  {l.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </SettingsRow>
+      </SettingsSection>
+
+      <SettingsSection title={t('appearance.density')} description={t('appearance.densityBody')}>
+        <SettingsRow label={t('appearance.spacing')} description={t('appearance.spacingBody')}>
+          <div className="inline-flex items-center gap-1 p-0.5 rounded-[10px] bg-[var(--color-bg-muted)] border border-[var(--color-border-subtle)]">
+            <Segment current={appearance.density} value="cozy" onClick={() => setAppearance({ density: 'cozy' })}>
+              {t('appearance.cozy')}
+            </Segment>
+            <Segment
+              current={appearance.density}
+              value="comfortable"
+              onClick={() => setAppearance({ density: 'comfortable' })}
+            >
+              {t('appearance.comfortable')}
+            </Segment>
+          </div>
+        </SettingsRow>
+        <SettingsRow label={t('appearance.chatWidth.label')} description={t('appearance.chatWidth.body')}>
+          {/* w-56 (not 64): the row's control slot can't shrink, and at the sm
+              breakpoint's narrowest dialog a 256px control overflows the card. */}
+          <div className="w-56">
+            <input
+              type="range"
+              min={0}
+              max={CHAT_WIDTH_STOPS.length - 1}
+              step={1}
+              value={Math.max(0, CHAT_WIDTH_STOPS.indexOf(appearance.chatWidth))}
+              onChange={(e) => onChangeChatWidth(CHAT_WIDTH_STOPS[Number(e.target.value)])}
+              aria-label={t('appearance.chatWidth.label')}
+              aria-valuetext={t(`appearance.chatWidth.${appearance.chatWidth}`)}
+              className="w-full accent-[var(--color-accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] rounded-full"
+            />
+            <div className="mt-1 flex justify-between">
+              {CHAT_WIDTH_STOPS.map((stop) => (
+                <button
+                  key={stop}
+                  type="button"
+                  onClick={() => onChangeChatWidth(stop)}
+                  className={cn(
+                    'text-[11px] interactive rounded-[4px] px-0.5',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                    appearance.chatWidth === stop
+                      ? 'text-[var(--color-fg)] font-medium'
+                      : 'text-[var(--color-fg-subtle)] hover:text-[var(--color-fg-muted)]',
+                  )}
+                >
+                  {t(`appearance.chatWidth.${stop}`)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </SettingsRow>
+        <SettingsRow label={t('appearance.userMessageMarkdown.label')} description={t('appearance.userMessageMarkdown.body')}>
+          <Switch
+            checked={appearance.userMessageMarkdown}
+            onCheckedChange={(v) => onToggleUserMessageMarkdown(Boolean(v))}
+            aria-label={t('appearance.userMessageMarkdown.label')}
+          />
+        </SettingsRow>
+        <SettingsRow label={t('appearance.fontSize')} description={t('appearance.fontSizeBody')}>
+          <div className="inline-flex items-center gap-1 p-0.5 rounded-[10px] bg-[var(--color-bg-muted)] border border-[var(--color-border-subtle)]">
+            <Segment current={appearance.fontSize} value="sm" onClick={() => setAppearance({ fontSize: 'sm' })}>
+              S
+            </Segment>
+            <Segment current={appearance.fontSize} value="md" onClick={() => setAppearance({ fontSize: 'md' })}>
+              M
+            </Segment>
+            <Segment current={appearance.fontSize} value="lg" onClick={() => setAppearance({ fontSize: 'lg' })}>
+              L
+            </Segment>
+          </div>
+        </SettingsRow>
+        <SettingsRow label={t('appearance.font.title')} description={t('appearance.font.subtitle')}>
+          <div className="flex flex-wrap gap-2 sm:justify-end">
+            {FONT_PRESETS.map((opt) => {
+              const active = appearance.font === opt
+              return (
+                <button
+                  key={opt}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => onChangeFont(opt)}
+                  style={{ fontFamily: FONT_PREVIEW[opt] }}
+                  className={cn(
+                    'flex min-w-[7.25rem] flex-col items-start gap-1 rounded-[10px] border px-3 py-2.5 text-left interactive',
+                    'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                    active
+                      ? 'border-[var(--color-accent)] bg-[var(--color-accent-soft)]'
+                      : 'border-[var(--color-border)] hover:border-[var(--color-border-strong)]',
+                  )}
+                >
+                  <span className="text-[20px] font-medium leading-none tracking-normal text-[var(--color-fg)]">Aa 字体</span>
+                  <span className="text-[11px] leading-tight tracking-normal text-[var(--color-fg-muted)]">
+                    {t(`appearance.font.options.${opt}`)}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        </SettingsRow>
+      </SettingsSection>
+    </div>
+  )
+}
+
+function ThemeChip({
+  current,
+  value,
+  onClick,
+  icon,
+  label,
+}: {
+  current: string
+  value: string
+  onClick: () => void
+  icon: React.ReactNode
+  label: string
+}) {
+  const active = current === value
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'inline-flex items-center gap-1.5 h-9 px-3.5 rounded-[10px] text-sm font-medium interactive',
+        active
+          ? 'bg-[var(--color-fg)] text-[var(--color-fg-inverted)]'
+          : 'text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg)] border border-[var(--color-border)]',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  )
+}
+
+function Segment({
+  current,
+  value,
+  onClick,
+  children,
+}: {
+  current: string
+  value: string
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  const active = current === value
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'h-8 px-3 rounded-[8px] text-[13px] font-medium interactive',
+        active
+          ? 'bg-[var(--color-surface)] text-[var(--color-fg)] shadow-[var(--shadow-xs)]'
+          : 'text-[var(--color-fg-muted)] hover:text-[var(--color-fg)]',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+      )}
+    >
+      {children}
+    </button>
+  )
+}

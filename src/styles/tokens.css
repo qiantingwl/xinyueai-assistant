@@ -1,0 +1,712 @@
+/* ============================================================================
+ * Aivory — Design Tokens
+ * Single source of truth for color, type, spacing, radius, shadow, motion, z.
+ * Surfaced as CSS variables consumed by Tailwind v4 @theme + raw CSS.
+ * ============================================================================
+ *
+ * Visual identity (v2 — deliberately differentiated)
+ * - Cold porcelain background with a faint lilac cast; never #fff.
+ * - Deep indigo ink. High contrast, hi-fi reading surface.
+ * - Primary accent: electric violet — saturated, modern, ownable.
+ * - Secondary accent: sage moss — used only for AI-state moments.
+ * - Display type: Fraunces (variable, soft optical sizing) — distinct from
+ *   Source Serif/New York. Body type: Geist Sans (geometric, neutral).
+ * ============================================================================ */
+
+:root {
+  /* ---------- LIGHT THEME ----------------------------------------------- */
+
+  /* Hue (oklch) that drives EVERY neutral surface, so switching the accent
+     re-tints the whole UI — background, cards, borders, text — not just the
+     buttons. Overridden per accent preset at the bottom of this file. */
+  --accent-hue: 290;
+
+  /* Backgrounds — porcelain tinted by --accent-hue */
+  --color-bg: oklch(98.4% 0.006 var(--accent-hue));
+  /* page — lower chroma, more neutral */
+  --color-bg-muted: oklch(96.5% 0.016 var(--accent-hue));
+  /* slightly recessed */
+  --color-surface: oklch(99.2% 0.007 var(--accent-hue));
+  /* cards, popovers */
+  --color-surface-raised: oklch(99.6% 0.005 var(--accent-hue));
+  /* dialogs, command */
+  --color-surface-sunken: oklch(95% 0.018 var(--accent-hue));
+  /* code wells, inputs */
+  --color-overlay: oklch(18% 0.03 var(--accent-hue) / 0.42);
+  /* dim layer */
+
+  /* Foreground — ink tinted by --accent-hue */
+  --color-fg: oklch(22% 0.040 var(--accent-hue));
+  /* primary text */
+  --color-fg-muted: oklch(44% 0.030 var(--accent-hue));
+  /* secondary text */
+  --color-fg-subtle: oklch(58% 0.025 var(--accent-hue));
+  /* hint text */
+  --color-fg-faint: oklch(72% 0.020 var(--accent-hue));
+  /* placeholder */
+  --color-fg-inverted: oklch(98.4% 0.010 var(--accent-hue));
+  /* on dark surfaces */
+
+  /* Borders & dividers — tinted by --accent-hue */
+  --color-border: oklch(89% 0.018 var(--accent-hue));
+  --color-border-strong: oklch(80% 0.024 var(--accent-hue));
+  --color-border-subtle: oklch(93% 0.014 var(--accent-hue));
+  --color-divider: oklch(91% 0.016 var(--accent-hue));
+
+  /* Accents — electric violet, owned and unmistakable */
+  --color-accent: #01f;
+  --color-accent-hover: #01f;
+  --color-accent-soft: #eef0ff;
+  --color-accent-fg: oklch(99% 0.004 280);
+
+  /* Secondary accent — moss/sage for AI moments */
+  --color-secondary: oklch(60% 0.085 150);
+  --color-secondary-soft: oklch(94% 0.035 150);
+
+  /* Semantic */
+  --color-success: oklch(60% 0.135 160);
+  --color-success-soft: oklch(94% 0.045 160);
+  --color-warning: oklch(74% 0.16 70);
+  --color-warning-soft: oklch(95% 0.05 70);
+  --color-danger: oklch(58% 0.215 18);
+  --color-danger-soft: oklch(95% 0.045 18);
+  --color-info: oklch(60% 0.13 235);
+  --color-info-soft: oklch(95% 0.03 235);
+  /* Composer tools derive from the user's accent instead of owning a fixed hue. */
+  --color-tool-selection: color-mix(in oklch, var(--color-accent) 66%, white);
+  --color-tool-selection-hover: color-mix(in oklch, var(--color-accent) 74%, white);
+  --color-tool-selection-soft: color-mix(in oklch, var(--color-accent-soft) 58%, var(--color-surface));
+  --color-tool-selection-border: color-mix(in oklch, var(--color-accent) 30%, var(--color-border-subtle));
+  --color-tool-selection-text: color-mix(in oklch, var(--color-accent) 80%, black);
+  --color-tool-selection-fg: color-mix(in oklch, var(--color-accent) 65%, black);
+  --color-tool-idle: color-mix(in oklch, var(--color-fg) 4%, var(--color-surface));
+
+  /* Focus ring — violet, calm */
+  --color-ring: rgb(0 17 255 / 0.55);
+
+  /* Chat-specific */
+  --color-user-bubble: #ebf5ff;
+  --color-user-bubble-border: oklch(88% 0.026 var(--accent-hue));
+  --color-assistant-bubble: transparent;
+  /* Code wells track the active accent hue (like every other surface) so the
+     block tints with the theme instead of sitting on a fixed violet. */
+  --color-code-bg: oklch(96% 0.014 var(--accent-hue));
+  --color-code-fg: oklch(30% 0.040 var(--accent-hue));
+  /* §1.1 calm-monotone syntax palette — three subtle hues over the code-fg
+     baseline so highlighting reads as "this is a string / keyword / comment"
+     without breaking the editorial monochrome feel. */
+  --color-syntax-comment: oklch(58% 0.030 265);
+  --color-syntax-string: oklch(48% 0.090 25);
+  --color-syntax-keyword: oklch(40% 0.110 305);
+  --color-syntax-number: oklch(45% 0.110 95);
+  --color-syntax-type: oklch(40% 0.090 200);
+  --color-syntax-fn: oklch(40% 0.095 245);
+  --color-kbd-bg: oklch(97% 0.008 280);
+  --color-kbd-border: oklch(84% 0.014 270);
+  /* Canvas behind rendered HTML previews / matplotlib figures. Stays paper-
+     light in BOTH themes on purpose: model HTML assumes a browser-default
+     white canvas, and flipping it dark would render its text unreadable.
+     Not pure white (§7) — faint porcelain. */
+  --color-preview-canvas: oklch(99.2% 0.003 280);
+
+  /* ---------- TYPOGRAPHY -----------------------------------------------
+     Primary families are the self-hosted @fontsource *Variable* faces
+     (imported in main.tsx); the non-variable + system names remain as
+     graceful fallbacks. */
+  --font-serif: 'Fraunces Variable', 'Fraunces', 'Cormorant Garamond', 'Iowan Old Style', Charter, ui-serif, serif;
+  --font-sans: 'Geist Variable', 'Geist', 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', 'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+
+  /* Type scale — modular, generous */
+  --text-xs: 0.75rem;
+  /* 12 */
+  --text-sm: 0.8125rem;
+  /* 13 */
+  --text-base: 0.9375rem;
+  /* 15 — body */
+  --text-md: 1rem;
+  /* 16 */
+  --text-lg: 1.125rem;
+  /* 18 */
+  --text-xl: 1.375rem;
+  /* 22 */
+  --text-2xl: 1.75rem;
+  /* 28 */
+  --text-3xl: 2.125rem;
+  /* 34 */
+  --text-4xl: 2.75rem;
+  /* 44 */
+  --text-5xl: 3.5rem;
+  /* 56 */
+  --text-6xl: 4.5rem;
+  /* 72 */
+
+  --leading-tight: 1.1;
+  --leading-snug: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.65;
+  --leading-loose: 1.85;
+
+  --tracking-tighter: -0.04em;
+  --tracking-tight: -0.02em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.04em;
+  --tracking-wider: 0.08em;
+
+  /* ---------- SPACING -------------------------------------------------- */
+  --space-0: 0;
+  --space-px: 1px;
+  --space-0\.5: 0.125rem;
+  --space-1: 0.25rem;
+  --space-1\.5: 0.375rem;
+  --space-2: 0.5rem;
+  --space-2\.5: 0.625rem;
+  --space-3: 0.75rem;
+  --space-3\.5: 0.875rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-7: 1.75rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-14: 3.5rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+  --space-32: 8rem;
+
+  /* ---------- RADIUS --------------------------------------------------- */
+  --radius-none: 0;
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.75rem;
+  /* One shell radius for the composer, popup menus, dialogs, and notices. */
+  --radius-popup: 1.375rem;
+  --radius-full: 9999px;
+
+  /* ---------- SHADOWS — calm, layered ---------------------------------- */
+  --shadow-xs: 0 1px 2px 0 oklch(18% 0.04 270 / 0.05);
+  --shadow-sm: 0 1px 3px 0 oklch(18% 0.04 270 / 0.07), 0 1px 2px -1px oklch(18% 0.04 270 / 0.05);
+  --shadow-md: 0 4px 12px -3px oklch(18% 0.04 270 / 0.09), 0 2px 4px -2px oklch(18% 0.04 270 / 0.05);
+  --shadow-lg: 0 12px 28px -6px oklch(18% 0.04 270 / 0.12), 0 4px 10px -4px oklch(18% 0.04 270 / 0.07);
+  --shadow-xl: 0 24px 48px -12px oklch(18% 0.04 270 / 0.18);
+  --shadow-2xl: 0 40px 80px -20px oklch(18% 0.04 270 / 0.24);
+  --shadow-inner: inset 0 1px 2px 0 oklch(18% 0.04 270 / 0.06);
+  --shadow-ring: 0 0 0 3px var(--color-ring);
+  --shadow-popover: 0 12px 32px -8px oklch(18% 0.04 270 / 0.14), 0 4px 12px -4px oklch(18% 0.04 270 / 0.09), 0 0 0 1px var(--color-border);
+
+  /* ---------- MOTION — subtle, organic --------------------------------- */
+  --ease-standard: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-elastic: cubic-bezier(0.68, -0.6, 0.32, 1.6);
+
+  --duration-instant: 80ms;
+  --duration-fast: 140ms;
+  --duration-base: 220ms;
+  --duration-slow: 320ms;
+  --duration-slower: 500ms;
+  --duration-slowest: 800ms;
+
+  /* ---------- Z-INDEX -------------------------------------------------- */
+  --z-base: 0;
+  --z-raised: 10;
+  --z-sticky: 20;
+  --z-overlay: 40;
+  --z-drawer: 50;
+  --z-dialog: 60;
+  --z-popover: 70;
+  --z-toast: 80;
+  --z-tooltip: 90;
+  --z-max: 9999;
+
+  /* ---------- PROJECT ACCENTS ------------------------------------------- */
+  /* Per-project color accents — tint (soft bg), bar (strong bg), text. */
+
+  /* violet */
+  --color-project-violet-tint: oklch(94% 0.045 290);
+  --color-project-violet-bar: oklch(58% 0.225 290);
+  --color-project-violet-text: oklch(38% 0.150 290);
+
+  /* sage */
+  --color-project-sage-tint: oklch(94% 0.035 150);
+  --color-project-sage-bar: oklch(60% 0.085 150);
+  --color-project-sage-text: oklch(36% 0.070 150);
+
+  /* amber */
+  --color-project-amber-tint: oklch(95% 0.045 75);
+  --color-project-amber-bar: oklch(68% 0.150 75);
+  --color-project-amber-text: oklch(38% 0.100 70);
+
+  /* rose */
+  --color-project-rose-tint: oklch(95% 0.045 18);
+  --color-project-rose-bar: oklch(62% 0.180 18);
+  --color-project-rose-text: oklch(40% 0.140 18);
+
+  /* slate */
+  --color-project-slate-tint: oklch(93% 0.012 270);
+  --color-project-slate-bar: oklch(52% 0.040 270);
+  --color-project-slate-text: oklch(32% 0.030 270);
+
+  /* teal */
+  --color-project-teal-tint: oklch(94% 0.040 200);
+  --color-project-teal-bar: oklch(60% 0.110 200);
+  --color-project-teal-text: oklch(36% 0.080 200);
+
+  /* Sidebar — visually distinct panel, higher contrast than content area */
+  --color-sidebar-bg: #f7f7f9;
+  --color-sidebar-border: oklch(91% 0.004 270);
+  --color-sidebar-hover: oklch(95.5% 0.004 270);
+  --color-sidebar-active: oklch(94.2% 0.004 270);
+  --color-sidebar-active-ink: oklch(18% 0.005 270);
+
+  /* ---------- LAYOUT --------------------------------------------------- */
+  --layout-sidebar-w-min: 14rem;
+  --layout-sidebar-w: 16.25rem;
+  --layout-sidebar-w-max: 25rem;
+  /* desktop sidebar: 224 min / 280 default / 400 max */
+  --layout-sidebar-w-collapsed: 3.5rem;
+  --layout-topbar-h: 3.5rem;
+  --layout-composer-max-w: 50rem;
+  --layout-content-max-w: 76rem;
+  --layout-prose-max-w: 44rem;
+  --layout-message-max-w: 48rem;
+
+  /* ---------- MOBILE LAYOUT (§ mobile redesign) ------------------------ *
+   * Named so every phone surface speaks one vocabulary instead of scattering
+   * env()/44px/px-4. Desktop never reads these except where noted; the phone
+   * @media block below overrides the responsive ones. */
+  /* Device safe areas — the ', 0px' fallback is mandatory so calc()/max() never
+   * break on non-notch browsers (env() is empty there). We intentionally do not
+   * reserve the iPhone home-indicator inset: mobile controls use regular visual
+   * padding and run to the bottom edge. */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: 0px;
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --tap-min: 2.75rem;
+  /* 44 — minimum mobile touch target */
+  --layout-topbar-h-mobile: 3rem;
+  /* 48 — slim mobile app bar */
+  --layout-drawer-w: min(76vw, 17rem);
+  /* compact phone nav slide-over; always leaves a scrim */
+  --layout-gutter-mobile: 1rem;
+  /* 16 — shared mobile content edge */
+  --layout-thread-gap: 2rem;
+  /* turn rhythm; → 1.5rem on phone below */
+  --layout-thread-bottom-gutter: 6rem;
+  /* clears the sticky composer + safe area */
+  --text-chat-body: var(--text-base);
+  /* chat body; → 16px on phone below */
+  --text-input-mobile: 1rem;
+  /* 16 — composer / command-palette input font on phones. Only consumed via a
+   * `max-sm:` utility, so one :root value suffices. MUST stay ≥16px: a smaller
+   * font makes iOS Safari zoom the viewport on focus (the field was previously
+   * referencing this token UNDEFINED, so the phone font-size silently fell back
+   * to the inherited value and the zoom guard didn't hold). */
+}
+
+/* Phone overrides (≤639px = the `phone` query). Touch-comfortable body + a
+ * tighter turn rhythm; base/desktop values above are untouched. */
+@media (max-width: 639px) {
+  :root {
+    --text-chat-body: 1rem;
+    /* 16 — comfortable + defeats iOS focus-zoom */
+    --layout-thread-gap: 1.5rem;
+    /* 24 — tighter turns on a small screen */
+  }
+}
+
+/* Chat width preference (§ appearance → layout) — four slider presets around
+ * the 48rem default. "full" widens the editorial column toward the whole chat
+ * pane, but still capped so very wide screens keep a comfortable measure
+ * (edge-to-edge text is hard to read). Message containers keep their
+ * horizontal padding as the safe gutter. */
+[data-chat-width='narrow'] {
+  --layout-message-max-w: 44rem;
+}
+[data-chat-width='wide'] {
+  --layout-message-max-w: min(56rem, 100%);
+}
+[data-chat-width='full'] {
+  --layout-message-max-w: min(62rem, 100%);
+}
+/* "max" — wider than full, but a PERCENTAGE cap keeps a proportional gutter on
+ * every pane (never edge-to-edge); ~92% leaves roughly half the whitespace
+ * "full" leaves on a typical desktop. The rem ceiling stops it running away on
+ * ultra-wide monitors. */
+[data-chat-width='max'] {
+  --layout-message-max-w: min(80rem, 92%);
+}
+
+/* ============================================================================
+ * DENSITY — cozy shrinks spacing & radii for a denser layout.
+ * Default "comfortable" uses the base tokens above. "cozy" overrides below.
+ * ============================================================================ */
+:root[data-density="cozy"] {
+  --text-base: 0.875rem;
+  /* 14 — tighter body text */
+  --leading-normal: 1.45;
+  --leading-relaxed: 1.55;
+  --space-3: 0.5rem;
+  --space-4: 0.75rem;
+  --space-5: 1rem;
+  --space-6: 1.25rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --layout-topbar-h: 3rem;
+}
+
+/* ============================================================================
+ * FONT-SIZE SCALE — sm / md (default) / lg.
+ * ============================================================================ */
+:root[data-fontsize="sm"] {
+  --text-xs: 0.6875rem;
+  /* 11 */
+  --text-sm: 0.75rem;
+  /* 12 */
+  --text-base: 0.8125rem;
+  /* 13 */
+  --text-md: 0.875rem;
+  /* 14 */
+  --text-lg: 1rem;
+  /* 16 */
+}
+
+:root[data-fontsize="lg"] {
+  --text-xs: 0.8125rem;
+  /* 13 */
+  --text-sm: 0.875rem;
+  /* 14 */
+  --text-base: 1rem;
+  /* 16 */
+  --text-md: 1.0625rem;
+  /* 17 */
+  --text-lg: 1.25rem;
+  /* 20 */
+}
+
+/* ============================================================================
+ * BODY TYPEFACE — personalization (§ Personalization → font).
+ * Default keeps Geist. The remaining presets deliberately change category and
+ * silhouette instead of offering three near-identical neo-grotesk sans faces.
+ * ============================================================================ */
+:root[data-font="humanist"],
+:root[data-font="inter"] {
+  --font-sans: 'Avenir Next', Avenir, 'Segoe UI', 'Hiragino Sans GB', 'Microsoft YaHei', ui-sans-serif, sans-serif;
+}
+
+:root[data-font="rounded"],
+:root[data-font="system"] {
+  --font-sans: 'SF Pro Rounded', 'Yuanti SC', 'STYuanti-SC-Regular', ui-rounded, 'Arial Rounded MT Bold', 'Microsoft YaHei', sans-serif;
+}
+
+:root[data-font="serif"] {
+  --font-sans: 'Fraunces Variable', 'Fraunces', 'Songti SC', STSong, 'Iowan Old Style', Charter, ui-serif, Georgia, serif;
+}
+
+/* ============================================================================
+ * DARK THEME — neutral charcoal surfaces with clear contrast.
+ * ============================================================================ */
+.dark {
+  --color-bg: #1f1f1f;
+  --color-bg-muted: #252525;
+  --color-surface: #202020;
+  --color-surface-raised: #2a2a2a;
+  --color-surface-sunken: #181818;
+  --color-overlay: rgb(0 0 0 / 0.66);
+
+  --color-fg: #f5f5f5;
+  --color-fg-muted: #b3b3b3;
+  --color-fg-subtle: #858585;
+  --color-fg-faint: #5f5f5f;
+  --color-fg-inverted: #202020;
+
+  --color-border: #3a3a3a;
+  --color-border-strong: #4a4a4a;
+  --color-border-subtle: #303030;
+  --color-divider: #2d2d2d;
+
+  --color-accent: #01f;
+  --color-accent-hover: #01f;
+  --color-accent-soft: #171b4a;
+  --color-accent-fg: oklch(15% 0.025 275);
+
+  --color-secondary: oklch(74% 0.105 150);
+  --color-secondary-soft: oklch(28% 0.050 150);
+
+  --color-success: oklch(74% 0.135 160);
+  --color-success-soft: oklch(28% 0.060 160);
+  --color-warning: oklch(80% 0.14 80);
+  --color-warning-soft: oklch(28% 0.05 80);
+  --color-danger: oklch(70% 0.20 18);
+  --color-danger-soft: oklch(28% 0.07 18);
+  --color-info: oklch(72% 0.13 235);
+  --color-info-soft: oklch(28% 0.05 235);
+  --color-tool-selection: color-mix(in oklch, var(--color-accent) 72%, white);
+  --color-tool-selection-hover: color-mix(in oklch, var(--color-accent) 82%, white);
+  --color-tool-selection-soft: color-mix(in oklch, var(--color-accent-soft) 78%, var(--color-surface));
+  --color-tool-selection-border: color-mix(in oklch, var(--color-accent) 32%, var(--color-border-strong));
+  --color-tool-selection-text: color-mix(in oklch, var(--color-accent) 82%, white);
+  --color-tool-selection-fg: var(--color-accent-fg);
+  --color-tool-idle: color-mix(in oklch, var(--color-fg) 6%, var(--color-surface));
+
+  --color-ring: rgb(0 17 255 / 0.65);
+
+  --color-user-bubble: #2b2b2b;
+  --color-user-bubble-border: #3d3d3d;
+  --color-assistant-bubble: transparent;
+  --color-code-bg: #181818;
+  --color-code-fg: #e5e5e5;
+  /* §1.1 dark-mode syntax tones — same hue intent, brighter to read on dark. */
+  --color-syntax-comment: oklch(60% 0.030 265);
+  --color-syntax-string: oklch(80% 0.110 25);
+  --color-syntax-keyword: oklch(76% 0.140 305);
+  --color-syntax-number: oklch(82% 0.140 95);
+  --color-syntax-type: oklch(78% 0.110 200);
+  --color-syntax-fn: oklch(78% 0.120 245);
+  --color-kbd-bg: #2a2a2a;
+  --color-kbd-border: #484848;
+
+  /* Project accents — dark overrides */
+  --color-project-violet-tint: oklch(28% 0.090 290);
+  --color-project-violet-bar: oklch(72% 0.215 290);
+  --color-project-violet-text: oklch(82% 0.180 290);
+
+  --color-project-sage-tint: oklch(28% 0.050 150);
+  --color-project-sage-bar: oklch(74% 0.105 150);
+  --color-project-sage-text: oklch(82% 0.090 150);
+
+  --color-project-amber-tint: oklch(28% 0.060 75);
+  --color-project-amber-bar: oklch(78% 0.135 75);
+  --color-project-amber-text: oklch(84% 0.120 75);
+
+  --color-project-rose-tint: oklch(28% 0.065 18);
+  --color-project-rose-bar: oklch(74% 0.170 18);
+  --color-project-rose-text: oklch(84% 0.150 18);
+
+  --color-project-slate-tint: oklch(26% 0.025 275);
+  --color-project-slate-bar: oklch(70% 0.030 275);
+  --color-project-slate-text: oklch(84% 0.020 275);
+
+  --color-project-teal-tint: oklch(26% 0.060 200);
+  --color-project-teal-bar: oklch(74% 0.110 200);
+  --color-project-teal-text: oklch(84% 0.100 200);
+
+  /* Sidebar — deep dark panel in dark mode (ChatGPT-style contrast) */
+  --color-sidebar-bg: #101010;
+  --color-sidebar-border: #2b2b2b;
+  --color-sidebar-hover: #292929;
+  --color-sidebar-active: #333333;
+  --color-sidebar-active-ink: #f5f5f5;
+
+  --shadow-xs: 0 1px 2px 0 oklch(0% 0 0 / 0.22);
+  --shadow-sm: 0 1px 3px 0 oklch(0% 0 0 / 0.32), 0 1px 2px -1px oklch(0% 0 0 / 0.22);
+  --shadow-md: 0 4px 12px -3px oklch(0% 0 0 / 0.38), 0 2px 4px -2px oklch(0% 0 0 / 0.24);
+  --shadow-lg: 0 12px 28px -6px oklch(0% 0 0 / 0.46), 0 4px 10px -4px oklch(0% 0 0 / 0.28);
+  --shadow-xl: 0 24px 48px -12px oklch(0% 0 0 / 0.58);
+  --shadow-2xl: 0 40px 80px -20px oklch(0% 0 0 / 0.72);
+  --shadow-inner: inset 0 1px 2px 0 oklch(0% 0 0 / 0.32);
+  --shadow-popover: 0 12px 32px -8px oklch(0% 0 0 / 0.46), 0 4px 12px -4px oklch(0% 0 0 / 0.32), 0 0 0 1px var(--color-border);
+}
+
+/* ============================================================================
+ * ACCENT PRESETS — chosen via /settings/appearance.
+ *
+ * Each preset overrides --color-accent, its hover, its soft tint, and the
+ * focus ring. The accent-fg stays the same (near-white on light, near-bg on
+ * dark) because all six presets sit at L ≈ 55-60% (light) / 72% (dark),
+ * keeping the foreground contrast valid.
+ *
+ * The default (no `data-accent` attribute) is "violet", matching the original
+ * :root values. The explicit `[data-accent="violet"]` block duplicates them
+ * so the boot script can always set the attribute without conditional logic.
+ *
+ * Names kept short on purpose (≤6 chars) to fit a swatch label and read well
+ * in the picker. §2.4 — clay accent ≤1 primary use per screen still applies.
+ * ============================================================================ */
+
+/* --- Violet (default) — electric violet ---------------------------------- */
+:root[data-accent="violet"] {
+  --accent-hue: 290;
+  --color-accent: #01f;
+  --color-accent-hover: #01f;
+  --color-accent-soft: #eef0ff;
+  --color-ring: rgb(0 17 255 / 0.55);
+}
+
+.dark[data-accent="violet"] {
+  --color-accent: #01f;
+  --color-accent-hover: #01f;
+  --color-accent-soft: #171b4a;
+  --color-ring: rgb(0 17 255 / 0.65);
+}
+
+/* --- Lagoon — cool teal --------------------------------------------------- */
+:root[data-accent="lagoon"] {
+  --accent-hue: 200;
+  --color-accent: oklch(58% 0.130 200);
+  --color-accent-hover: oklch(52% 0.140 200);
+  --color-accent-soft: oklch(94% 0.035 200);
+  --color-ring: oklch(58% 0.130 200 / 0.55);
+}
+
+.dark[data-accent="lagoon"] {
+  --color-accent: oklch(74% 0.130 200);
+  --color-accent-hover: oklch(80% 0.130 200);
+  --color-accent-soft: oklch(28% 0.060 200);
+  --color-ring: oklch(74% 0.130 200 / 0.50);
+}
+
+/* --- Ember — warm amber-red ---------------------------------------------- */
+:root[data-accent="ember"] {
+  --accent-hue: 40;
+  --color-accent: oklch(62% 0.170 40);
+  --color-accent-hover: oklch(56% 0.180 40);
+  --color-accent-soft: oklch(95% 0.040 40);
+  --color-ring: oklch(62% 0.170 40 / 0.55);
+}
+
+.dark[data-accent="ember"] {
+  --color-accent: oklch(74% 0.165 40);
+  --color-accent-hover: oklch(80% 0.165 40);
+  --color-accent-soft: oklch(28% 0.080 40);
+  --color-ring: oklch(74% 0.165 40 / 0.50);
+}
+
+/* --- Moss — calm sage green ---------------------------------------------- */
+:root[data-accent="moss"] {
+  --accent-hue: 145;
+  --color-accent: oklch(54% 0.125 145);
+  --color-accent-hover: oklch(48% 0.135 145);
+  --color-accent-soft: oklch(94% 0.040 145);
+  --color-ring: oklch(54% 0.125 145 / 0.55);
+}
+
+.dark[data-accent="moss"] {
+  --color-accent: oklch(72% 0.130 145);
+  --color-accent-hover: oklch(78% 0.130 145);
+  --color-accent-soft: oklch(28% 0.060 145);
+  --color-ring: oklch(72% 0.130 145 / 0.50);
+}
+
+/* --- Indigo — deep editorial blue ---------------------------------------- */
+:root[data-accent="indigo"] {
+  --accent-hue: 260;
+  --color-accent: oklch(54% 0.180 260);
+  --color-accent-hover: oklch(48% 0.190 260);
+  --color-accent-soft: oklch(94% 0.045 260);
+  --color-ring: oklch(54% 0.180 260 / 0.55);
+}
+
+.dark[data-accent="indigo"] {
+  --color-accent: oklch(72% 0.165 260);
+  --color-accent-hover: oklch(78% 0.165 260);
+  --color-accent-soft: oklch(28% 0.080 260);
+  --color-ring: oklch(72% 0.165 260 / 0.50);
+}
+
+/* --- Rose — soft magenta-pink -------------------------------------------- */
+:root[data-accent="rose"] {
+  --accent-hue: 5;
+  --color-accent: oklch(60% 0.180 5);
+  --color-accent-hover: oklch(54% 0.190 5);
+  --color-accent-soft: oklch(94% 0.045 5);
+  --color-ring: oklch(60% 0.180 5 / 0.55);
+}
+
+.dark[data-accent="rose"] {
+  --color-accent: oklch(74% 0.175 5);
+  --color-accent-hover: oklch(80% 0.175 5);
+  --color-accent-soft: oklch(28% 0.085 5);
+  --color-ring: oklch(74% 0.175 5 / 0.50);
+}
+
+/* --- Mono — true black & white -------------------------------------------
+ * A genuine grayscale theme: every surface, text, and border is chroma ZERO
+ * (pure neutral gray) — not just the accent. The other presets only re-tint the
+ * accent and let --accent-hue tint the neutrals; mono must override those
+ * neutrals too, otherwise the hue (270) leaks a violet cast into bg/border (most
+ * visible in dark mode where neutral chroma reaches 0.03+). Accent is near-black
+ * ink in light, near-white in dark. Never pure #000/#fff (§7). */
+:root[data-accent="mono"] {
+  --accent-hue: 270;
+  --color-accent: oklch(26% 0 0);
+  --color-accent-hover: oklch(20% 0 0);
+  --color-accent-soft: oklch(93% 0 0);
+  --color-ring: oklch(40% 0 0 / 0.55);
+  --color-tool-selection: color-mix(in oklch, var(--color-accent) 42%, white);
+  --color-tool-selection-hover: color-mix(in oklch, var(--color-accent) 50%, white);
+  --color-tool-selection-border: color-mix(in oklch, var(--color-accent) 18%, var(--color-border-subtle));
+
+  /* Neutral surfaces — chroma 0 (keep the base L values) */
+  --color-bg: oklch(98.4% 0 0);
+  --color-bg-muted: oklch(96.5% 0 0);
+  --color-surface: oklch(99.2% 0 0);
+  --color-surface-raised: oklch(99.6% 0 0);
+  --color-surface-sunken: oklch(95% 0 0);
+  --color-overlay: oklch(18% 0 0 / 0.42);
+
+  --color-fg: oklch(22% 0 0);
+  --color-fg-muted: oklch(44% 0 0);
+  --color-fg-subtle: oklch(58% 0 0);
+  --color-fg-faint: oklch(72% 0 0);
+  --color-fg-inverted: oklch(98.4% 0 0);
+
+  --color-border: oklch(89% 0 0);
+  --color-border-strong: oklch(80% 0 0);
+  --color-border-subtle: oklch(93% 0 0);
+  --color-divider: oklch(91% 0 0);
+
+  --color-user-bubble: #ebf5ff;
+  --color-user-bubble-border: oklch(88% 0 0);
+  --color-code-bg: oklch(96% 0 0);
+  --color-code-fg: oklch(30% 0 0);
+
+  /* Slightly grayer than --color-bg (98.4%) so the rail reads as its own
+     surface — 98.5% was LIGHTER than the canvas and indistinguishable. Keep
+     the gap subtle (~1.2 L): mono is deliberately quiet. */
+  --color-sidebar-bg: oklch(97.2% 0 0);
+  --color-sidebar-border: oklch(87% 0 0);
+}
+
+.dark[data-accent="mono"] {
+  --color-accent: oklch(96% 0 0);
+  --color-accent-hover: oklch(99% 0 0);
+  --color-accent-soft: oklch(30% 0 0);
+  --color-accent-fg: oklch(18% 0 0);
+  --color-ring: oklch(80% 0 0 / 0.50);
+
+  --color-bg: oklch(15% 0 0);
+  --color-bg-muted: oklch(18% 0 0);
+  --color-surface: oklch(20% 0 0);
+  --color-surface-raised: oklch(23% 0 0);
+  --color-surface-sunken: oklch(13% 0 0);
+  --color-overlay: oklch(8% 0 0 / 0.66);
+
+  --color-fg: oklch(95% 0 0);
+  --color-fg-muted: oklch(74% 0 0);
+  --color-fg-subtle: oklch(60% 0 0);
+  --color-fg-faint: oklch(44% 0 0);
+  --color-fg-inverted: oklch(22% 0 0);
+
+  --color-border: oklch(30% 0 0);
+  --color-border-strong: oklch(40% 0 0);
+  --color-border-subtle: oklch(25% 0 0);
+  --color-divider: oklch(28% 0 0);
+
+  --color-user-bubble: oklch(26% 0 0);
+  --color-user-bubble-border: oklch(34% 0 0);
+  --color-code-bg: oklch(16% 0 0);
+  --color-code-fg: oklch(90% 0 0);
+
+  --color-sidebar-bg: oklch(10.5% 0 0);
+  --color-sidebar-border: oklch(24% 0 0);
+}

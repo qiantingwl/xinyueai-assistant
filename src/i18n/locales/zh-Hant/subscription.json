@@ -1,0 +1,192 @@
+{
+  "back": "返回對話",
+  "title": "訂閱",
+  "catalog": {
+    "label": "訂閱內容",
+    "userGroups": "使用者組",
+    "creditPackages": "永久積分"
+  },
+  "billing": {
+    "label": "結算週期",
+    "monthly": "月付",
+    "yearly": "年付",
+    "perMonth": "/ 月",
+    "perYear": "/ 年",
+    "unavailable": "此付費週期暫不可購買"
+  },
+  "subtitle": "你所在的使用者組決定了你可以使用哪些模型以及多少額度。",
+  "currentPlan": "當前使用者組",
+  "free": "免費",
+  "allPlans": "全部使用者組",
+  "planCount": "{{count}} 個方案",
+  "credits": {
+    "sectionTitle": "積分餘額",
+    "timedTitle": "限時積分餘額",
+    "permanentTitle": "永久積分餘額",
+    "permanentHint": "購買的積分永不過期，會在限時積分用完後才扣除。",
+    "resetsOn": "{{date}} 刷新",
+    "loadFailed": "無法載入積分餘額。",
+    "topUp": "補充積分",
+    "topUpUnavailable": "暫不支援補充。"
+  },
+  "packages": {
+    "title": "永久積分方案",
+    "subtitle": "購買永久有效的積分，限時積分用完後再使用。",
+    "count": "{{count}} 個方案",
+    "credits": "永久積分",
+    "buy": "購買此方案",
+    "empty": "暫無可購買的永久積分方案。"
+  },
+  "current": "當前",
+  "permanentlyOwned": "永久擁有",
+  "alreadyOwned": "已永久擁有",
+  "youreOnThis": "你正在使用此使用者組",
+  "switchCta": "切換",
+  "upgradeCta": "升級",
+  "upgradeTitle": "切換到 {{name}}",
+  "upgradeBody": "使用者組的變更由管理員處理。如需切換到此使用者組，請聯絡工作區管理員。",
+  "priceFree": "免費",
+  "loadFailed": "載入使用者組失敗",
+  "loadPackagesFailed": "載入永久積分方案失敗",
+  "noGroups": "暫無可用的使用者組。",
+  "expiresOn": "有效期至 {{date}}",
+  "permanent": "永久",
+  "redeem": {
+    "title": "兌換碼",
+    "subtitle": "輸入兌換碼即可啟用或延長會員群組，或儲入永久積分。",
+    "inputLabel": "兌換碼",
+    "inputPlaceholder": "XXXX-XXXX-XXXX",
+    "submit": "兌換",
+    "redeeming": "兌換中…",
+    "success": "兌換成功",
+    "successBody": "你已加入 {{group}}。",
+    "successBodyUntil": "你已加入 {{group}}，有效期至 {{date}}。",
+    "override": {
+      "title": "確認切換方案？",
+      "body": "此兌換碼對應「{{granted}}」，與你目前的「{{current}}」不同。兌換後將立即覆蓋目前方案，並從現在開始重新計算有效期，而不是在原方案上續期。",
+      "bodyUntil": "此兌換碼對應「{{granted}}」，與你目前的「{{current}}」不同。兌換後將立即覆蓋目前方案，並從現在開始重新計算有效期（有效期至 {{date}}），而不是在原方案上續期。",
+      "confirm": "立即切換"
+    },
+    "errors": {
+      "empty": "請輸入兌換碼",
+      "invalid": "該兌換碼無效。",
+      "alreadyUsed": "該兌換碼已被使用。",
+      "expired": "該兌換碼已過期。",
+      "disabled": "該兌換碼已被管理員作廢。",
+      "alreadyOwned": "你已兌換過此碼。",
+      "generic": "兌換失敗，請稍後再試。"
+    },
+    "successCredits": "積分已入帳",
+    "successBodyCredits": "{{count}} 積分已儲入你的永久積分餘額。"
+  },
+  "payment": {
+    "title": "選擇付款方式",
+    "description": "選擇購買「{{name}}」的付款方式。",
+    "loading": "正在載入付款方式…",
+    "loadError": "無法載入付款方式，請重試。",
+    "retry": "重新載入",
+    "invalidUrl": "付款連結無效，請聯絡管理員。",
+    "checkoutError": "無法發起付款，請重試。",
+    "checkoutTimeout": "付款服務回應逾時，請重試。",
+    "errors": {
+      "methodUnavailable": "此付款方式暫不可用，請選擇其他方式。",
+      "productUnavailable": "此商品已下架或價格已變更，請重新整理頁面後再試。",
+      "checkoutUnavailable": "付款服務暫不可用，請稍後重試。",
+      "checkoutExpired": "此次結帳工作階段已過期，請重新整理訂單記錄後再試。",
+      "checkoutNotResumable": "此筆付款已無法繼續，請重新整理訂單記錄以查看最新狀態。",
+      "orderAlreadyPaid": "此訂單已付款，請重新整理訂單記錄以更新付款狀態。",
+      "resumeUnavailable": "目前無法繼續此筆付款，請先在支付服務商核實訂單後再試。",
+      "orderStateChanged": "此訂單的狀態已變更，請重新整理訂單記錄後再試。",
+      "checkoutStateUnknown": "支付服務商無法確認此次結帳是否可繼續，請先在支付服務商核實訂單後再試。",
+      "waffoProductCurrencyUnsupported": "此 Waffo 商品不支援目前的支付幣別，請聯絡管理員檢查商品價格或支付渠道設定。",
+      "userGroupAlreadyPermanent": "你已永久擁有此使用者組，無需重複購買。",
+      "userGroupNotPurchasable": "此使用者組暫時無法購買，請稍後再試。"
+    },
+    "or": "或",
+    "cardPurchase": "卡密購買",
+    "empty": "暫無可用的付款方式",
+    "emptyHint": "請聯絡管理員設定付款渠道或卡密購買連結。",
+    "return": {
+      "checking": "正在確認付款狀態…",
+      "paid": "付款成功",
+      "paidHint": "你的帳戶權益已更新。",
+      "failed": "付款失敗",
+      "cancelled": "已取消付款。",
+      "expired": "付款訂單已過期，請重新購買。",
+      "statusError": "暫時無法確認付款狀態，請重新整理頁面後再試。",
+      "pending": "付款仍在處理中，請稍後重新整理頁面查看。"
+    }
+  },
+  "history": {
+    "title": "付款記錄",
+    "description": "查看你最近購買永久積分和使用者組的記錄。",
+    "columns": {
+      "name": "名稱",
+      "time": "時間",
+      "amount": "金額",
+      "method": "付款方式",
+      "status": "狀態",
+      "details": "詳情"
+    },
+    "target": {
+      "credit_package": "永久積分",
+      "user_group": "使用者組"
+    },
+    "status": {
+      "pending": "待付款",
+      "processing": "處理中",
+      "paid": "已付款",
+      "failed": "付款失敗",
+      "expired": "已過期"
+    },
+    "actions": {
+      "continue": "繼續付款",
+      "retry": "重新發起付款"
+    },
+    "retryConfirm": {
+      "title": "確認重新發起付款？",
+      "description": "系統將為「{{name}}」建立新的付款請求。",
+      "warning": "舊付款工作階段不會自動關閉。請僅在確認舊付款尚未完成時繼續；同時支付舊工作階段與新工作階段可能造成重複扣款。",
+      "confirm": "確認重新發起"
+    },
+    "details": {
+      "action": "詳情",
+      "title": "訂單詳情",
+      "description": "訂單 {{id}}",
+      "loading": "正在載入訂單詳情…",
+      "loadError": "無法載入訂單詳情。",
+      "retry": "重新載入詳情",
+      "notAvailable": "—",
+      "fields": {
+        "orderId": "訂單號",
+        "product": "商品",
+        "targetType": "商品類型",
+        "billingCycle": "計費週期",
+        "status": "狀態",
+        "amount": "訂單金額",
+        "tax": "稅費",
+        "currency": "幣別",
+        "paymentMethod": "付款方式",
+        "provider": "付款服務商",
+        "methodType": "付款方式類型",
+        "createdAt": "建立時間",
+        "paidAt": "付款時間",
+        "fulfilledAt": "到帳時間",
+        "checkoutExpiresAt": "付款工作階段到期時間",
+        "failureReason": "失敗原因"
+      }
+    },
+    "empty": "暫無付款記錄。",
+    "loadError": "無法載入付款記錄。",
+    "resumeError": "無法繼續此筆付款，請重新整理訂單記錄後再試。",
+    "retry": "重試",
+    "previous": "上一頁",
+    "next": "下一頁",
+    "page": "第 {{current}} / {{total}} 頁"
+  },
+  "buyCta": "購買",
+  "renewCta": "續費",
+  "purchaseUnavailable": "暫時無法購買",
+  "recommended": "推薦",
+  "cycleFee": "當前週期費用"
+}

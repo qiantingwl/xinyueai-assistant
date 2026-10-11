@@ -1,0 +1,328 @@
+import { type ComponentType, useEffect, useId, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  Lightbulb,
+  Search,
+  Globe,
+  Terminal,
+  BookOpen,
+  Image as ImageIcon,
+  Sparkles,
+  ChevronRight,
+  Check,
+  Download,
+  AlertTriangle,
+} from 'lucide-react'
+import type { ReasoningItem, ToolCall } from '@/types/chat'
+import { normalizeThinkingMarkdown } from '@/lib/markdown'
+import { resolveLucideIcon } from '@/lib/lucide-icons'
+import { Markdown } from './markdown'
+import { ModelIcon } from './model-icon'
+import { cn } from '@/lib/utils'
+import {
+  createReasoningDisclosure,
+  syncReasoningDisclosure,
+  toggleReasoningDisclosure,
+} from './reasoning-disclosure'
+
+interface ReasoningTraceProps {
+  /** Ordered, interleaved trace — thinking runs + tool rounds in the exact
+   *  order they happened (§7.1-4). */
+  reasoning?: ReasoningItem[]
+  /** Total observable model reasoning time in milliseconds, once the turn settles. */
+  thinkingMs?: number
+  /** True while the assistant message is still streaming. */
+  streaming?: boolean
+  /** True once the visible answer text has started — the reasoning phase has
+   *  given way to the final answer, so the panel auto-collapses. */
+  settled?: boolean
+}
+
+const TOOL_ICON: Record<string, ComponentType<{ size?: number; className?: string }>> = {
+  web_search: Search,
+  aivory_web_search: Search,
+  web_fetch: Globe,
+  fetch_image: Download,
+  python_execute: Terminal,
+  use_skill: BookOpen,
+  image_generate: ImageIcon,
+  save_memory: Sparkles,
+}
+
+// Keep the live reasoning DOM bounded. Some reasoning-capable providers can
+// emit a very large chain of thought at high frequency; rendering the complete
+// growing string on every delta can block layout/scrolling even when parsing is
+// skipped. The full text remains in the message and is rendered after settle.
+const LIVE_REASONING_PREVIEW_LIMIT = 12_000
+
+/**
+ * ReasoningTrace — the unified "thinking" panel (§1.1 / §7.1-4). It folds the
+ * model's extended-thinking text AND its tool rounds (web_search, aivory_web_search, python_execute,
+ * image_generate, …) into ONE collapsible trace instead
+ * of a separate thinking block + a stack of tool cards.
+ *
+ * Live feedback (the user's ask): while streaming, the panel is open, and every
+ * running tool shows a pulsing status dot plus a
+ * per-second elapsed counter — so a long search / sandbox run never looks like
+ * a frozen blank. No spinning loaders (CLAUDE.md §7 — shimmer/pulse only). Once
+ * the answer text starts, the panel collapses to a one-line summary the user
+ * can reopen.
+ */
+export function ReasoningTrace({ reasoning, thinkingMs, streaming = false, settled = false }: ReasoningTraceProps) {
+  const { t } = useTranslation(['chat', 'common'])
+  const items = reasoning ?? []
+
+  // Active = the reasoning phase is live (streaming and the answer hasn't
+  // started). Drives the pulse + auto-expand.
+  const active = streaming && !settled
+
+  const [disclosure, setDisclosure] = useState(() => createReasoningDisclosure(active))
+  useEffect(() => {
+    // Synchronise only when the reasoning phase changes. Token/tool updates in
+    // the same phase keep the user's manual open/closed choice intact.
+    setDisclosure((current) => syncReasoningDisclosure(current, active))
+  }, [active])
+  const expanded = disclosure.expanded
+  const contentId = useId()
+
+  if (items.length === 0) return null
+
+  const roundedThinkingSeconds = thinkingMs && thinkingMs > 0 ? Math.max(1, Math.round(thinkingMs / 1000)) : 0
+  const thinkingDuration =
+    roundedThinkingSeconds < 60
+      ? t('reasoning.durationSeconds', { count: roundedThinkingSeconds })
+      : t('reasoning.durationMinutesSeconds', {
+          minutes: Math.floor(roundedThinkingSeconds / 60),
+          seconds: roundedThinkingSeconds % 60,
+        })
+  const headline = active
+    ? t('thinking')
+    : roundedThinkingSeconds > 0
+      ? t('reasoning.thoughtFor', { duration: thinkingDuration })
+      : t('reasoning.title')
+
+  return (
+    <div className="mb-3 w-full min-w-0 max-w-full">
+      {/* Minimal, box-free disclosure — just an icon + reasoning label + caret. */}
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        onClick={() => setDisclosure(toggleReasoningDisclosure)}
+        className="-ml-1 flex max-w-full min-w-0 items-center gap-1.5 rounded-[6px] px-1 py-0.5 text-left text-[var(--color-fg-subtle)] interactive hover:text-[var(--color-fg-muted)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]"
+      >
+        <Lightbulb
+          size={13}
+          aria-hidden
+          className="shrink-0 text-[var(--color-fg-muted)]"
+        />
+        <span className="min-w-0 truncate text-[12.5px]">{headline}</span>
+        <ChevronRight
+          size={12}
+          aria-hidden
+          className={cn('shrink-0 transition-transform duration-150', expanded && 'rotate-90')}
+        />
+      </button>
+
+      {/* grid 0fr→1fr animates height without measuring; the global
+          prefers-reduced-motion rule neutralises the transition automatically. */}
+      <div
+        id={contentId}
+        className={cn(
+          'grid transition-[grid-template-rows] duration-300 ease-[var(--ease-out)]',
+          expanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]',
+        )}
+      >
+        <div className="min-h-0 min-w-0 max-w-full overflow-clip" aria-hidden={!expanded} inert={!expanded}>
+          <div className="ml-[6px] mt-1.5 min-w-0 max-w-full space-y-2 border-l border-[var(--color-divider)] pl-3.5">
+            {items.map((it) => {
+              if (it.kind === 'thinking' || it.kind === 'narration') {
+                // Render the model's chain-of-thought / narration as full
+                // markdown + LaTeX (reusing the answer renderer) — kept visually
+                // quieter than the final answer: smaller type, muted tone, and a
+                // tighter prose rhythm so it still reads as an aside.
+                // During a high-throughput reasoning stream, however, parsing an
+                // ever-growing markdown/LaTeX buffer on every delta can monopolize
+                // the browser main thread (scrolling becomes unresponsive). Keep
+                // the live path deliberately cheap and do the rich parse once the
+                // turn settles.
+                if (streaming) {
+                  const liveText =
+                    it.text.length > LIVE_REASONING_PREVIEW_LIMIT
+                      ? `…${it.text.slice(-LIVE_REASONING_PREVIEW_LIMIT)}`
+                      : it.text
+                  return (
+                    <div
+                      key={it.id}
+                      className={cn(
+                        'whitespace-pre-wrap break-words text-[12.5px] !leading-relaxed text-[var(--color-fg-muted)]',
+                      )}
+                    >
+                      {liveText}
+                    </div>
+                  )
+                }
+                return (
+                  <Markdown
+                    key={it.id}
+                    content={normalizeThinkingMarkdown(it.text)}
+                    live={false}
+                    breaks
+                    className={cn(
+                      '!max-w-none text-[12.5px] !leading-relaxed text-[var(--color-fg-muted)]',
+                      '[&_p]:!mt-1.5 [&_>*+*]:!mt-1.5 [&_p]:text-[var(--color-fg-muted)]',
+                      '[&_li]:text-[var(--color-fg-muted)] [&_h1]:!text-base [&_h2]:!text-[15px] [&_h3]:!text-sm',
+                      '[&_h1]:!mt-2.5 [&_h2]:!mt-2.5 [&_h3]:!mt-2',
+                    )}
+                  />
+                )
+              }
+              return <ToolStep key={it.id} toolCall={it.tool} />
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ToolStep({ toolCall }: { toolCall: ToolCall }) {
+  const { t } = useTranslation(['chat', 'common'])
+  const { status, label, name, icon, input, output } = toolCall
+  const [expanded, setExpanded] = useState(false)
+  const elapsed = useElapsed(toolCall)
+  const timingKnown = elapsed !== null
+  const displayName = label || t(`tools.${name}`, { defaultValue: name })
+  const subtitle = pickSubtitle(name, input)
+  const code =
+    name === 'python_execute' && typeof (input as Record<string, unknown>)?.code === 'string'
+      ? ((input as Record<string, unknown>).code as string)
+      : null
+  const isPython = name === 'python_execute'
+  const hasBody = Boolean(output || code)
+
+  return (
+    // Box-free: each tool step is a flat row (no border/surface card), matching
+    // the rest of the trace. A subtle rounded hover affords the expand toggle;
+    // expanded code/output drop into a calm rounded well, no dividing borders.
+    <div className="min-w-0 max-w-full">
+      <button
+        type="button"
+        onClick={() => hasBody && setExpanded((v) => !v)}
+        title={subtitle ?? undefined}
+        className={cn(
+          'grid w-full min-w-0 max-w-full items-center gap-x-2 gap-y-0.5 overflow-hidden rounded-[7px] px-1.5 py-1 text-left',
+          timingKnown
+            ? 'grid-cols-[auto_auto_minmax(0,1fr)_auto_auto]'
+            : 'grid-cols-[auto_auto_minmax(0,1fr)_auto]',
+          hasBody ? 'interactive cursor-pointer hover:bg-[var(--color-bg-muted)]/60' : 'cursor-default',
+        )}
+      >
+        <StatusDot status={status} />
+        <ToolStepIcon name={name} icon={icon} />
+        <span className="min-w-0 truncate text-[12.5px] font-medium text-[var(--color-fg)]">{displayName}</span>
+        {timingKnown ? (
+          <span className="col-start-4 row-start-1 shrink-0 tabular-nums text-[10.5px] text-[var(--color-fg-subtle)]">
+            {elapsed}
+          </span>
+        ) : null}
+        {hasBody ? (
+          <ChevronRight
+            size={12}
+            aria-hidden
+            className={cn(
+              'row-start-1 shrink-0 text-[var(--color-fg-subtle)] transition-transform duration-150',
+              timingKnown ? 'col-start-5' : 'col-start-4',
+              expanded && 'rotate-90',
+            )}
+          />
+        ) : null}
+        {subtitle ? (
+          <span className="col-start-3 col-end-[-1] row-start-2 min-w-0 max-w-full line-clamp-2 break-words [overflow-wrap:anywhere] font-mono text-[11.5px] leading-[1.45] text-[var(--color-fg-muted)]">
+            {subtitle}
+          </span>
+        ) : null}
+      </button>
+      {expanded && code ? (
+        <pre className="mt-1 max-h-[300px] min-w-0 max-w-full overflow-auto rounded-[10px] bg-[var(--color-code-bg)] px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere] text-[var(--color-code-fg)]">
+          {code}
+        </pre>
+      ) : null}
+      {expanded && output ? (
+        <div
+          className={cn(
+            'mt-1 min-w-0 max-w-full break-words whitespace-pre-wrap [overflow-wrap:anywhere] text-[11.5px] leading-relaxed',
+            isPython
+              ? 'max-h-[320px] overflow-auto rounded-[10px] bg-[var(--color-code-bg)] px-3 py-2.5 font-mono whitespace-pre-wrap text-[var(--color-code-fg)]'
+              : 'px-1.5 text-[var(--color-fg-muted)]',
+          )}
+        >
+          {output}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function ToolStepIcon({ name, icon }: { name: string; icon?: string }) {
+  const ConfiguredIcon = icon ? resolveLucideIcon(icon) : null
+  if (ConfiguredIcon) {
+    return <ConfiguredIcon size={12} className="shrink-0 text-[var(--color-fg-subtle)]" />
+  }
+  if (icon) {
+    return <ModelIcon icon={icon} size={12} className="text-[var(--color-fg-subtle)]" />
+  }
+  const FallbackIcon = TOOL_ICON[name] ?? Sparkles
+  return <FallbackIcon size={12} className="shrink-0 text-[var(--color-fg-subtle)]" />
+}
+
+function StatusDot({ status }: { status: ToolCall['status'] }) {
+  if (status === 'running') {
+    return (
+      <span
+        aria-hidden
+        className="inline-block size-2 shrink-0 rounded-full bg-[var(--color-secondary)] animate-[streaming-pulse_1600ms_ease-in-out_infinite]"
+      />
+    )
+  }
+  if (status === 'complete') {
+    return <Check size={13} aria-hidden className="shrink-0 text-[var(--color-success)]" />
+  }
+  return <AlertTriangle size={12} aria-hidden className="shrink-0 text-[var(--color-danger)]" />
+}
+
+/**
+ * useElapsed returns a live "3s" / "1m05s" counter. While the tool runs it
+ * ticks once per second (the key "we're still working" signal); once finished
+ * it freezes at the total duration.
+ */
+function useElapsed(tc: ToolCall): string | null {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (tc.status !== 'running') return
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [tc.status])
+  if (tc.timingKnown === false) return null
+  const end = tc.status === 'running' ? now : tc.endedAt ?? tc.startedAt
+  return formatElapsed(Math.max(0, end - tc.startedAt))
+}
+
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m${String(s % 60).padStart(2, '0')}s`
+}
+
+function pickSubtitle(name: string, input: ToolCall['input']): string | null {
+  const inp = (input ?? {}) as Record<string, unknown>
+  if ((name === 'web_search' || name === 'aivory_web_search') && typeof inp.query === 'string') {
+    return inp.query
+  }
+  if (name === 'web_fetch' && typeof inp.url === 'string') return inp.url
+  if (name === 'use_skill' && typeof inp.name === 'string') return inp.name
+  if (name === 'image_generate' && typeof inp.prompt === 'string') return inp.prompt
+  return null
+}

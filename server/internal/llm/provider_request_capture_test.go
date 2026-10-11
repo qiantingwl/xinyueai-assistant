@@ -1,0 +1,199 @@
+package llm
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func TestProviderRequestRecorderSanitizesHeadersBodyAndURL(t *testing.T) {
+	rec := newProviderRequestRecorder()
+	ctx := contextWithProviderRequestRecorder(context.Background(), rec)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://user:pass@api.example/v1/chat?api_key=secret&trace=ok", bytes.NewReader([]byte(`{
+		"model": "gpt-x",
+		"api_key": "body-secret",
+		"messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+	}`)))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.Header.Set("authorization", "Bearer secret")
+	req.Header.Set("content-type", "application/json")
+
+	recordProviderRequest(ctx, req)
+	got := rec.snapshot()
+	if got.Method != "POST" {
+		t.Fatalf("method = %q", got.Method)
+	}
+	if strings.Contains(got.URL, "secret") || strings.Contains(got.URL, "user:pass") || !strings.Contains(got.URL, "api_key=%5Bredacted%5D") {
+		t.Fatalf("url not sanitized: %s", got.URL)
+	}
+	if strings.Contains(got.Header, "Bearer secret") || !strings.Contains(got.Header, "[redacted]") {
+		t.Fatalf("headers not sanitized: %s", got.Header)
+	}
+	if strings.Contains(got.Body, "body-secret") || !strings.Contains(got.Body, `"api_key": "[redacted]"`) {
+		t.Fatalf("body secret not sanitized: %s", got.Body)
+	}
+	if strings.Contains(got.Body, "AAAA") || !strings.Contains(got.Body, "[redacted base64") {
+		t.Fatalf("body media not redacted: %s", got.Body)
+	}
+	if got.EstimatedInputTokens <= 0 {
+		t.Fatalf("input estimate = %d, want positive", got.EstimatedInputTokens)
+	}
+}
+
+func TestProviderRequestRecorderDoesNotRedactTokenCounts(t *testing.T) {
+	rec := newProviderRequestRecorder()
+	ctx := contextWithProviderRequestRecorder(context.Background(), rec)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.example/v1/messages", bytes.NewReader([]byte(`{
+		"max_tokens": 4096,
+		"max_completion_tokens": 8192,
+		"thinking": {"type": "enabled", "budget_tokens": 2048},
+		"access_token": "secret"
+	}`)))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+
+	recordProviderRequest(ctx, req)
+	got := rec.snapshot().Body
+	for _, want := range []string{`"max_tokens": 4096`, `"max_completion_tokens": 8192`, `"budget_tokens": 2048`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("token count %s was not preserved: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "secret") || !strings.Contains(got, `"access_token": "[redacted]"`) {
+		t.Fatalf("access_token was not redacted: %s", got)
+	}
+}
+
+func TestProviderRequestRecorderContextTokensFollowProviderCacheSemantics(t *testing.T) {
+	usage := Usage{InputTokens: 100, CacheReadTokens: 40, CacheWriteTokens: 20}
+	for _, tc := range []struct {
+		name, provider string
+		want           int
+	}{
+		{name: "anthropic", provider: "anthropic", want: 160},
+		{name: "anthropic alias", provider: "claude", want: 160},
+		{name: "openai cached details already included", provider: "openai", want: 100},
+		{name: "google prompt total already included", provider: "gemini", want: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := newProviderRequestRecorder(tc.provider)
+			rec.record(mustHTTPRequest(t, "https://api.example/v1/chat", `{"messages":[]}`))
+			rec.attachUsage(usage)
+			if got := rec.maxContextTokens(); got != tc.want {
+				t.Fatalf("context tokens = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProviderRequestBillingSnapshotsEstimateOnlyOutputProducingFailures(t *testing.T) {
+	snapshots := []providerRequestSnapshot{
+		// A sent request that failed before emitting any output remains a free
+		// diagnostic row.
+		{Attempt: 1, EstimatedInputTokens: 80, Error: "http 503"},
+		// A stream that emitted output but never delivered terminal usage is
+		// conservatively billable on its own channel.
+		{Attempt: 2, EstimatedInputTokens: 120, EstimatedOutputTokens: 9, Error: "unexpected EOF"},
+		// A completed request's provider usage wins over the rough estimator.
+		{Attempt: 3, EstimatedInputTokens: 200, EstimatedOutputTokens: 90,
+			Usage: Usage{InputTokens: 7, OutputTokens: 3}, HasUsage: true},
+	}
+	got := providerRequestBillingSnapshots(snapshots)
+	if len(got) != 2 {
+		t.Fatalf("billable snapshots = %d, want output-producing failure + completed request", len(got))
+	}
+	if got[0].Attempt != 2 || got[0].Usage.InputTokens != 120 || got[0].Usage.OutputTokens != 9 || got[0].Error != "" {
+		t.Fatalf("estimated snapshot = %+v, want 120/9 with cleared error", got[0])
+	}
+	if got[1].Attempt != 3 || got[1].Usage != (Usage{InputTokens: 7, OutputTokens: 3}) {
+		t.Fatalf("terminal usage was overwritten: %+v", got[1])
+	}
+	total := providerRequestUsageTotal(snapshots)
+	if total.InputTokens != 127 || total.OutputTokens != 12 {
+		t.Fatalf("usage total = %+v, want 127/12", total)
+	}
+}
+
+func TestMergeProviderRequestUsagePrefersFallbackSnapshotSumAfterError(t *testing.T) {
+	snapshots := []providerRequestSnapshot{
+		{Attempt: 1, Usage: Usage{InputTokens: 2, OutputTokens: 20}, HasUsage: true, Error: "primary parse failure"},
+		{Attempt: 2, Usage: Usage{InputTokens: 100, OutputTokens: 1}, HasUsage: true, Fallback: true},
+	}
+	got := mergeProviderRequestUsage(Usage{InputTokens: 100, OutputTokens: 1}, snapshots)
+	if got != (Usage{InputTokens: 102, OutputTokens: 21}) {
+		t.Fatalf("merged usage = %+v, want primary+fallback 102/21", got)
+	}
+}
+
+func TestMergeProviderRequestUsagePrefersFailedPrimaryEstimateWhenFallbackUsageIsLarger(t *testing.T) {
+	snapshots := []providerRequestSnapshot{
+		{Attempt: 1, EstimatedInputTokens: 4, EstimatedOutputTokens: 2, Error: "primary parse failure"},
+		{Attempt: 2, Usage: Usage{InputTokens: 100, OutputTokens: 20}, HasUsage: true, Fallback: true},
+	}
+	got := mergeProviderRequestUsage(Usage{InputTokens: 100, OutputTokens: 20}, snapshots)
+	if got.InputTokens != 104 || got.OutputTokens != 22 {
+		t.Fatalf("merged usage = %+v, want estimated primary + fallback 104/22", got)
+	}
+}
+
+func TestMergeProviderRequestUsageKeepsProviderResidualWithoutError(t *testing.T) {
+	snapshots := []providerRequestSnapshot{
+		{Attempt: 1, Usage: Usage{InputTokens: 5, OutputTokens: 2}, HasUsage: true},
+	}
+	got := mergeProviderRequestUsage(Usage{InputTokens: 8, OutputTokens: 4}, snapshots)
+	if got != (Usage{InputTokens: 8, OutputTokens: 4}) {
+		t.Fatalf("merged usage = %+v, want provider residual 8/4", got)
+	}
+}
+
+func TestProviderRequestRecorderRedactsLargeJSONBeforeTruncating(t *testing.T) {
+	rec := newProviderRequestRecorder()
+	ctx := contextWithProviderRequestRecorder(context.Background(), rec)
+	largeBase64 := strings.Repeat("A", providerRequestBodyMaxBytes+2048)
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.example/v1/chat", bytes.NewReader([]byte(`{"image":"data:image/png;base64,`+largeBase64+`"}`)))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	recordProviderRequest(ctx, req)
+	got := rec.snapshot()
+	if strings.Contains(got.Body, strings.Repeat("A", 256)) {
+		t.Fatalf("large base64 leaked into stored body")
+	}
+	if !strings.Contains(got.Body, "[redacted base64") {
+		t.Fatalf("large base64 was not redacted: %s", got.Body)
+	}
+}
+
+func TestDoProviderRequestRecorderKeepsBodyReadable(t *testing.T) {
+	rec := newProviderRequestRecorder()
+	ctx := contextWithProviderRequestRecorder(context.Background(), rec)
+	seen := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(r.Body)
+		seen <- buf.String()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	resp, err := doProviderRequest(ctx, ModelInfo{BaseURL: srv.URL, APIKey: "k"}, new(atomic.Bool), func(baseURL, apiKey string) (*http.Request, error) {
+		return http.NewRequestWithContext(ctx, "POST", baseURL+"/v1/chat", bytes.NewReader([]byte(`{"hello":"world"}`)))
+	})
+	if err != nil {
+		t.Fatalf("doProviderRequest: %v", err)
+	}
+	resp.Body.Close()
+	if got := <-seen; got != `{"hello":"world"}` {
+		t.Fatalf("provider saw body %q", got)
+	}
+	if got := rec.snapshot().Body; !strings.Contains(got, `"hello": "world"`) {
+		t.Fatalf("request body not captured: %s", got)
+	}
+}

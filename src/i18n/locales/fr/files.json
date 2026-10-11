@@ -1,0 +1,117 @@
+{
+  "title": "Fichiers",
+  "searchPlaceholder": "Rechercher un nom de fichier",
+  "total": "{{count}} fichier(s)",
+  "view": "Voir",
+  "deleted": "Fichier supprimé",
+  "previewFailed": "Échec de l'aperçu",
+  "noInlinePreview": "Pas d'aperçu intégré pour ce type de fichier.",
+  "confirmTitle": "Supprimer ce fichier ?",
+  "confirmBody": "« {{name}} » sera supprimé partout — le fichier lui-même, ses enregistrements et son index de recherche. Irréversible.",
+  "origin": {
+    "all": "Toutes les sources",
+    "conversation": "Conversation",
+    "kb": "Base de connaissances"
+  },
+  "sort": {
+    "newest": "Plus récents d'abord",
+    "oldest": "Plus anciens d'abord",
+    "largest": "Plus gros d'abord",
+    "smallest": "Plus petits d'abord"
+  },
+  "filters": {
+    "title": "Filtres et tri",
+    "typeLabel": "Type de fichier",
+    "originLabel": "Source",
+    "sortLabel": "Trier par"
+  },
+  "types": {
+    "all": "Tous les types",
+    "pdf": "PDF",
+    "document": "Documents",
+    "presentation": "Présentations",
+    "spreadsheet": "Feuilles de calcul",
+    "image": "Images",
+    "text": "Texte",
+    "other": "Autres"
+  },
+  "preview": {
+    "selectTitle": "Sélectionnez un fichier",
+    "selectBody": "Choisissez un fichier dans la liste pour le prévisualiser ici.",
+    "loading": "Chargement de l'aperçu…",
+    "download": "Télécharger",
+    "delete": "Supprimer",
+    "backToList": "Retour aux fichiers",
+    "unsupported": "Ce type de fichier ne peut pas être prévisualisé.",
+    "tooLarge": "Ce fichier est trop volumineux pour être prévisualisé.",
+    "failed": "Impossible de charger l'aperçu.",
+    "metadata": "{{type}} · {{size}}"
+  },
+  "pdf": {
+    "previousPage": "Page précédente",
+    "nextPage": "Page suivante",
+    "page": "Page {{page}}",
+    "of": "sur {{total}}",
+    "zoomOut": "Réduire",
+    "zoomIn": "Agrandir",
+    "fitWidth": "Ajuster à la largeur",
+    "renderFailed": "Impossible d'afficher ce PDF."
+  },
+  "docx": {
+    "loading": "Chargement du document…",
+    "tooLarge": "Ce document est trop volumineux pour être prévisualisé.",
+    "failed": "Impossible de prévisualiser ce document."
+  },
+  "pptx": {
+    "loading": "Chargement de la présentation…",
+    "tooLarge": "Cette présentation est trop volumineuse pour être prévisualisée.",
+    "failed": "Impossible de prévisualiser cette présentation."
+  },
+  "spreadsheet": {
+    "loading": "Chargement de la feuille de calcul…",
+    "tooLarge": "Cette feuille de calcul est trop volumineuse pour être prévisualisée.",
+    "failed": "Impossible de prévisualiser cette feuille de calcul.",
+    "sheet": "Feuille",
+    "row": "Ligne",
+    "column": "Colonne",
+    "truncated": "Affichage limité aux {{rows}} premières lignes et aux {{columns}} premières colonnes.",
+    "empty": "Cette feuille est vide."
+  },
+  "list": {
+    "title": "Liste des fichiers",
+    "loading": "Chargement des fichiers…",
+    "emptyFilteredTitle": "Aucun fichier correspondant",
+    "emptyFilteredBody": "Essayez une autre recherche ou un autre type de fichier.",
+    "resultCount": "{{count}} fichier(s)"
+  },
+  "selection": {
+    "selected": "Sélectionné",
+    "selectFile": "Sélectionner {{name}}",
+    "clear": "Effacer la sélection"
+  },
+  "accessibility": {
+    "fileList": "Liste des fichiers",
+    "previewPane": "Aperçu du fichier",
+    "searchFiles": "Rechercher des fichiers",
+    "filterByType": "Filtrer les fichiers par type",
+    "selectedFile": "Fichier sélectionné : {{name}}"
+  },
+  "table": {
+    "filename": "Nom",
+    "type": "Type",
+    "origin": "Source",
+    "size": "Taille",
+    "uploaded": "Téléversé",
+    "actions": "Actions"
+  },
+  "storage": {
+    "title": "Stockage",
+    "usedOf": "{{used}} sur {{quota}} utilisés",
+    "usedUnlimited": "{{used}} utilisés · sans limite",
+    "note": "Les documents et autres fichiers comptent dans votre stockage ; pas les images."
+  },
+  "empty": {
+    "title": "Aucun fichier",
+    "body": "Les fichiers téléversés dans vos conversations ou bases de connaissances apparaîtront ici."
+  }
+}

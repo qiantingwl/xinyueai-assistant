@@ -1,0 +1,67 @@
+{
+  "setPassword": {
+    "title": "設定密碼",
+    "subtitle": "你是透過第三方帳號登入的，目前還沒有密碼。請現在設定一個密碼以保護帳戶——之後修改設定或直接登入都會用到。",
+    "newLabel": "新密碼",
+    "confirmLabel": "確認密碼",
+    "hint": "至少 8 個字元。",
+    "mismatch": "兩次輸入的密碼不一致。",
+    "tooShort": "密碼至少需要 8 個字元。",
+    "submit": "設定密碼並繼續",
+    "saved": "密碼已設定。",
+    "failed": "設定密碼失敗，請重試。"
+  },
+  "ready": {
+    "title": "一切就緒",
+    "body": "{{siteName}} 已準備就緒。現在可以開始第一次對話了。",
+    "cta": "開始探索"
+  },
+  "intro": {
+    "eyebrow": "歡迎來到 {{siteName}}",
+    "title": "更安靜的思考空間。",
+    "subtitle": "花幾秒完成 {{siteName}} 的基本設定，之後也可以隨時修改。",
+    "points": {
+      "write": "與你一同思考的寫作",
+      "research": "基於真實來源的檢索",
+      "own": "對話歸你所有，掌控權始終在你手中"
+    }
+  },
+  "config": {
+    "title": "個性化設定",
+    "subtitle": "設定幾項偏好，或直接跳過開始使用。"
+  },
+  "fields": {
+    "language": "語言",
+    "theme": "外觀",
+    "accent": "強調色",
+    "layout": "聊天寬度",
+    "chatStyle": "回覆風格",
+    "chatStyleBody": "預設回答的詳細程度。",
+    "memory": "記憶",
+    "memoryBody": "讓 {{siteName}} 跨對話記住有用的資訊。"
+  },
+  "theme": {
+    "light": "淺色",
+    "dark": "深色",
+    "system": "跟隨系統"
+  },
+  "chatStyle": {
+    "concise": "簡潔",
+    "balanced": "均衡",
+    "detailed": "詳細"
+  },
+  "actions": {
+    "skip": "暫時跳過",
+    "start": "開始使用",
+    "back": "上一步",
+    "next": "下一步"
+  },
+  "stepHints": {
+    "language": "選擇介面語言。",
+    "theme": "淺色、深色，或跟隨系統。",
+    "accent": "選擇應用的強調色。",
+    "layout": "聊天內容置中，或佔滿整個寬度。",
+    "style": "預設回覆的詳細程度。",
+    "memory": "讓 {{siteName}} 跨對話記住有用的資訊。"
+  }
+}

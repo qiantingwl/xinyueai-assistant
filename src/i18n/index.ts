@@ -1,0 +1,213 @@
+import i18n from 'i18next'
+import LanguageDetector from 'i18next-browser-languagedetector'
+import { initReactI18next } from 'react-i18next'
+
+// English bundles
+import enCommon from './locales/en/common.json'
+import enNav from './locales/en/nav.json'
+import enChat from './locales/en/chat.json'
+import enAuth from './locales/en/auth.json'
+import enSettings from './locales/en/settings.json'
+import enErrors from './locales/en/errors.json'
+import enProjects from './locales/en/projects.json'
+import enAdmin from './locales/en/admin.json'
+import enKb from './locales/en/kb.json'
+import enFiles from './locales/en/files.json'
+import enMemory from './locales/en/memory.json'
+import enSubscription from './locales/en/subscription.json'
+import enWelcome from './locales/en/welcome.json'
+import enLibrary from './locales/en/library.json'
+import enCanvas from './locales/en/canvas.json'
+
+// Chinese bundles
+import zhCommon from './locales/zh/common.json'
+import zhNav from './locales/zh/nav.json'
+import zhChat from './locales/zh/chat.json'
+import zhAuth from './locales/zh/auth.json'
+import zhSettings from './locales/zh/settings.json'
+import zhErrors from './locales/zh/errors.json'
+import zhProjects from './locales/zh/projects.json'
+import zhAdmin from './locales/zh/admin.json'
+import zhKb from './locales/zh/kb.json'
+import zhFiles from './locales/zh/files.json'
+import zhMemory from './locales/zh/memory.json'
+import zhSubscription from './locales/zh/subscription.json'
+import zhWelcome from './locales/zh/welcome.json'
+import zhLibrary from './locales/zh/library.json'
+import zhCanvas from './locales/zh/canvas.json'
+
+// Traditional Chinese bundles (generated from zh via OpenCC s2twp)
+import zhHantCommon from './locales/zh-Hant/common.json'
+import zhHantNav from './locales/zh-Hant/nav.json'
+import zhHantChat from './locales/zh-Hant/chat.json'
+import zhHantAuth from './locales/zh-Hant/auth.json'
+import zhHantSettings from './locales/zh-Hant/settings.json'
+import zhHantErrors from './locales/zh-Hant/errors.json'
+import zhHantProjects from './locales/zh-Hant/projects.json'
+import zhHantAdmin from './locales/zh-Hant/admin.json'
+import zhHantKb from './locales/zh-Hant/kb.json'
+import zhHantFiles from './locales/zh-Hant/files.json'
+import zhHantMemory from './locales/zh-Hant/memory.json'
+import zhHantSubscription from './locales/zh-Hant/subscription.json'
+import zhHantWelcome from './locales/zh-Hant/welcome.json'
+import zhHantLibrary from './locales/zh-Hant/library.json'
+import zhHantCanvas from './locales/zh-Hant/canvas.json'
+
+// Japanese bundles
+import jaCommon from './locales/ja/common.json'
+import jaNav from './locales/ja/nav.json'
+import jaChat from './locales/ja/chat.json'
+import jaAuth from './locales/ja/auth.json'
+import jaSettings from './locales/ja/settings.json'
+import jaErrors from './locales/ja/errors.json'
+import jaProjects from './locales/ja/projects.json'
+import jaAdmin from './locales/ja/admin.json'
+import jaKb from './locales/ja/kb.json'
+import jaFiles from './locales/ja/files.json'
+import jaMemory from './locales/ja/memory.json'
+import jaSubscription from './locales/ja/subscription.json'
+import jaWelcome from './locales/ja/welcome.json'
+import jaLibrary from './locales/ja/library.json'
+import jaCanvas from './locales/ja/canvas.json'
+
+// French bundles
+import frCommon from './locales/fr/common.json'
+import frNav from './locales/fr/nav.json'
+import frChat from './locales/fr/chat.json'
+import frAuth from './locales/fr/auth.json'
+import frSettings from './locales/fr/settings.json'
+import frErrors from './locales/fr/errors.json'
+import frProjects from './locales/fr/projects.json'
+import frAdmin from './locales/fr/admin.json'
+import frKb from './locales/fr/kb.json'
+import frFiles from './locales/fr/files.json'
+import frMemory from './locales/fr/memory.json'
+import frSubscription from './locales/fr/subscription.json'
+import frWelcome from './locales/fr/welcome.json'
+import frLibrary from './locales/fr/library.json'
+import frCanvas from './locales/fr/canvas.json'
+
+export const SUPPORTED_LANGUAGES = [
+  { code: 'en', label: 'English', short: 'EN' },
+  { code: 'zh', label: '简体中文', short: '简' },
+  { code: 'zh-Hant', label: '繁體中文', short: '繁' },
+  { code: 'ja', label: '日本語', short: '日' },
+  { code: 'fr', label: 'Français', short: 'FR' },
+] as const
+
+export type LanguageCode = (typeof SUPPORTED_LANGUAGES)[number]['code']
+
+export const DEFAULT_NS = 'common'
+export const NAMESPACES = ['common', 'nav', 'chat', 'auth', 'settings', 'errors', 'projects', 'admin', 'kb', 'files', 'memory', 'subscription', 'welcome', 'library', 'canvas'] as const
+
+const resources = {
+  en: {
+    common: enCommon,
+    nav: enNav,
+    chat: enChat,
+    auth: enAuth,
+    settings: enSettings,
+    errors: enErrors,
+    projects: enProjects,
+    admin: enAdmin,
+    kb: enKb,
+      files: enFiles,
+    memory: enMemory,
+    subscription: enSubscription,
+    welcome: enWelcome,
+    library: enLibrary,
+    canvas: enCanvas,
+  },
+  zh: {
+    common: zhCommon,
+    nav: zhNav,
+    chat: zhChat,
+    auth: zhAuth,
+    settings: zhSettings,
+    errors: zhErrors,
+    projects: zhProjects,
+    admin: zhAdmin,
+    kb: zhKb,
+      files: zhFiles,
+    memory: zhMemory,
+    subscription: zhSubscription,
+    welcome: zhWelcome,
+    library: zhLibrary,
+    canvas: zhCanvas,
+  },
+  'zh-Hant': {
+    common: zhHantCommon,
+    nav: zhHantNav,
+    chat: zhHantChat,
+    auth: zhHantAuth,
+    settings: zhHantSettings,
+    errors: zhHantErrors,
+    projects: zhHantProjects,
+    admin: zhHantAdmin,
+    kb: zhHantKb,
+      files: zhHantFiles,
+    memory: zhHantMemory,
+    subscription: zhHantSubscription,
+    welcome: zhHantWelcome,
+    library: zhHantLibrary,
+    canvas: zhHantCanvas,
+  },
+  ja: {
+    common: jaCommon,
+    nav: jaNav,
+    chat: jaChat,
+    auth: jaAuth,
+    settings: jaSettings,
+    errors: jaErrors,
+    projects: jaProjects,
+    admin: jaAdmin,
+    kb: jaKb,
+      files: jaFiles,
+    memory: jaMemory,
+    subscription: jaSubscription,
+    welcome: jaWelcome,
+    library: jaLibrary,
+    canvas: jaCanvas,
+  },
+  fr: {
+    common: frCommon,
+    nav: frNav,
+    chat: frChat,
+    auth: frAuth,
+    settings: frSettings,
+    errors: frErrors,
+    projects: frProjects,
+    admin: frAdmin,
+    kb: frKb,
+      files: frFiles,
+    memory: frMemory,
+    subscription: frSubscription,
+    welcome: frWelcome,
+    library: frLibrary,
+    canvas: frCanvas,
+  },
+} as const
+
+void i18n
+  .use(LanguageDetector)
+  .use(initReactI18next)
+  .init({
+    resources,
+    // Simplified Chinese is the product default. A user's explicit choice is
+    // restored from localStorage by the detector below.
+    lng: 'zh',
+    fallbackLng: 'en',
+    supportedLngs: SUPPORTED_LANGUAGES.map((l) => l.code),
+    ns: NAMESPACES as unknown as string[],
+    defaultNS: DEFAULT_NS,
+    interpolation: { escapeValue: false }, // React already escapes
+    detection: {
+      order: ['localStorage'],
+      lookupLocalStorage: 'aivory.lang',
+      caches: [],
+    },
+    returnNull: false,
+    showSupportNotice: false,
+  })
+
+export default i18n

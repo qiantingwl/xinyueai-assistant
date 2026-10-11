@@ -1,0 +1,192 @@
+{
+  "back": "チャットに戻る",
+  "title": "サブスクリプション",
+  "catalog": {
+    "label": "サブスクリプション一覧",
+    "userGroups": "ユーザーグループ",
+    "creditPackages": "永久クレジット"
+  },
+  "billing": {
+    "label": "請求期間",
+    "monthly": "月払い",
+    "yearly": "年払い",
+    "perMonth": "/ 月",
+    "perYear": "/ 年",
+    "unavailable": "この請求期間では購入できません"
+  },
+  "subtitle": "所属するメンバーシップグループによって、利用できるモデルとその利用量が決まります。",
+  "currentPlan": "現在のグループ",
+  "free": "無料",
+  "allPlans": "すべてのグループ",
+  "planCount": "{{count}} 件のプラン",
+  "credits": {
+    "sectionTitle": "クレジット残高",
+    "timedTitle": "期間限定クレジット残高",
+    "permanentTitle": "永久クレジット残高",
+    "permanentHint": "購入したクレジットは失効せず、期間限定クレジットを使い切った後に消費されます。",
+    "resetsOn": "{{date}} に更新",
+    "loadFailed": "クレジット残高を読み込めませんでした。",
+    "topUp": "クレジットを補充",
+    "topUpUnavailable": "現在、補充はご利用いただけません。"
+  },
+  "packages": {
+    "title": "永久クレジットパッケージ",
+    "subtitle": "期限がなく、期間限定クレジットの後に使われるクレジットを購入できます。",
+    "count": "{{count}} 件のパッケージ",
+    "credits": "永久クレジット",
+    "buy": "パッケージを購入",
+    "empty": "購入できる永久クレジットパッケージはありません。"
+  },
+  "current": "現在",
+  "permanentlyOwned": "永久利用可能",
+  "alreadyOwned": "永久利用できます",
+  "youreOnThis": "現在このグループです",
+  "switchCta": "切り替える",
+  "upgradeCta": "アップグレード",
+  "upgradeTitle": "{{name}} に切り替え",
+  "upgradeBody": "グループの変更は管理者が行います。このグループに移るには、ワークスペースの管理者にお問い合わせください。",
+  "priceFree": "無料",
+  "loadFailed": "グループを読み込めませんでした",
+  "loadPackagesFailed": "永久クレジットパッケージを読み込めませんでした",
+  "noGroups": "利用できるユーザーグループはありません。",
+  "expiresOn": "{{date}} まで有効",
+  "permanent": "永続",
+  "redeem": {
+    "title": "コードを引き換える",
+    "subtitle": "コードを入力すると、メンバーシップの有効化・延長、または永久クレジットの追加ができます。",
+    "inputLabel": "コード",
+    "inputPlaceholder": "XXXX-XXXX-XXXX",
+    "submit": "引き換える",
+    "redeeming": "引き換え中…",
+    "success": "引き換え完了",
+    "successBody": "{{group}} に加入しました。",
+    "successBodyUntil": "{{group}} に加入しました — {{date}} まで有効です。",
+    "override": {
+      "title": "プランを切り替えますか？",
+      "body": "このコードは「{{granted}}」用で、現在の「{{current}}」とは異なります。引き換えると現在のプランを直ちに上書きし、有効期間を今から再計算します（更新ではありません）。",
+      "bodyUntil": "このコードは「{{granted}}」用で、現在の「{{current}}」とは異なります。引き換えると現在のプランを直ちに上書きし、有効期間を今から再計算します（{{date}} まで有効。更新ではありません）。",
+      "confirm": "今すぐ切り替える"
+    },
+    "errors": {
+      "empty": "コードを入力してください",
+      "invalid": "このコードは無効です。",
+      "alreadyUsed": "このコードは既に使用されています。",
+      "expired": "このコードは期限切れです。",
+      "disabled": "このコードは管理者によって無効化されました。",
+      "alreadyOwned": "このコードは既に引き換え済みです。",
+      "generic": "このコードを引き換えられませんでした。"
+    },
+    "successCredits": "クレジットを追加しました",
+    "successBodyCredits": "{{count}} クレジットが永久残高に追加されました。"
+  },
+  "payment": {
+    "title": "お支払い方法を選択",
+    "description": "「{{name}}」のお支払い方法を選択してください。",
+    "loading": "お支払い方法を読み込み中…",
+    "loadError": "お支払い方法を読み込めませんでした。もう一度お試しください。",
+    "retry": "再読み込み",
+    "invalidUrl": "お支払いリンクが無効です。管理者にお問い合わせください。",
+    "checkoutError": "お支払いを開始できませんでした。もう一度お試しください。",
+    "checkoutTimeout": "決済サービスからの応答がタイムアウトしました。もう一度お試しください。",
+    "errors": {
+      "methodUnavailable": "このお支払い方法は現在利用できません。別の方法を選択してください。",
+      "productUnavailable": "この商品は販売終了、または価格が変更されています。ページを再読み込みしてもう一度お試しください。",
+      "checkoutUnavailable": "決済サービスは一時的に利用できません。しばらくしてからもう一度お試しください。",
+      "checkoutExpired": "この決済セッションは期限切れです。注文履歴を更新して、もう一度お試しください。",
+      "checkoutNotResumable": "この支払いは続行できません。注文履歴を更新して最新の状態を確認してください。",
+      "orderAlreadyPaid": "この注文はすでに支払い済みです。注文履歴を更新して支払い状態を確認してください。",
+      "resumeUnavailable": "現在この支払いを再開できません。再試行する前に決済事業者側の注文を確認してください。",
+      "orderStateChanged": "表示中に注文の状態が変更されました。注文履歴を更新して、もう一度お試しください。",
+      "checkoutStateUnknown": "決済事業者がこの支払いを続行できるか確認できませんでした。再試行する前に決済事業者側の注文を確認してください。",
+      "waffoProductCurrencyUnsupported": "この Waffo 商品は選択した決済通貨に対応していません。商品価格または決済チャネル設定を管理者に確認してください。",
+      "userGroupAlreadyPermanent": "このユーザーグループはすでに永久利用できるため、再度購入する必要はありません。",
+      "userGroupNotPurchasable": "このユーザーグループは現在一時的に購入できません。しばらくしてからもう一度お試しください。"
+    },
+    "or": "または",
+    "cardPurchase": "プリペイドコードを購入",
+    "empty": "利用できるお支払い方法がありません",
+    "emptyHint": "管理者に、支払いチャネルまたはプリペイドコード購入リンクの設定を依頼してください。",
+    "return": {
+      "checking": "お支払い状況を確認しています…",
+      "paid": "お支払いが完了しました",
+      "paidHint": "アカウントの権限を更新しました。",
+      "failed": "お支払いに失敗しました",
+      "cancelled": "お支払いをキャンセルしました。",
+      "expired": "この支払い注文は期限切れです。もう一度購入してください。",
+      "statusError": "お支払い状況を確認できません。ページを再読み込みして、もう一度お試しください。",
+      "pending": "お支払いはまだ処理中です。しばらくしてからページを再読み込みしてください。"
+    }
+  },
+  "history": {
+    "title": "お支払い履歴",
+    "description": "永久クレジットとユーザーグループの最近の購入履歴を確認できます。",
+    "columns": {
+      "name": "名称",
+      "time": "日時",
+      "amount": "金額",
+      "method": "お支払い方法",
+      "status": "状態",
+      "details": "詳細"
+    },
+    "target": {
+      "credit_package": "永久クレジット",
+      "user_group": "ユーザーグループ"
+    },
+    "status": {
+      "pending": "お支払い待ち",
+      "processing": "処理中",
+      "paid": "お支払い済み",
+      "failed": "お支払い失敗",
+      "expired": "期限切れ"
+    },
+    "actions": {
+      "continue": "支払いを続ける",
+      "retry": "支払いをやり直す"
+    },
+    "retryConfirm": {
+      "title": "支払いをやり直しますか？",
+      "description": "「{{name}}」の新しい決済リクエストを作成します。",
+      "warning": "以前の決済セッションは自動的に閉じられません。以前の支払いが完了していないことを確認した場合のみ続行してください。両方のセッションで支払うと、二重に請求される可能性があります。",
+      "confirm": "支払いをやり直す"
+    },
+    "details": {
+      "action": "詳細",
+      "title": "注文の詳細",
+      "description": "注文 {{id}}",
+      "loading": "注文の詳細を読み込んでいます…",
+      "loadError": "注文の詳細を読み込めませんでした。",
+      "retry": "詳細を再読み込み",
+      "notAvailable": "—",
+      "fields": {
+        "orderId": "注文 ID",
+        "product": "商品",
+        "targetType": "商品タイプ",
+        "billingCycle": "請求サイクル",
+        "status": "状態",
+        "amount": "注文金額",
+        "tax": "税額",
+        "currency": "通貨",
+        "paymentMethod": "お支払い方法",
+        "provider": "決済サービス",
+        "methodType": "支払い方法の種類",
+        "createdAt": "作成日時",
+        "paidAt": "支払日時",
+        "fulfilledAt": "付与日時",
+        "checkoutExpiresAt": "決済の有効期限",
+        "failureReason": "失敗理由"
+      }
+    },
+    "empty": "お支払い履歴はまだありません。",
+    "loadError": "お支払い履歴を読み込めませんでした。",
+    "resumeError": "この支払いを再開できませんでした。注文履歴を更新して、もう一度お試しください。",
+    "retry": "再試行",
+    "previous": "前のページ",
+    "next": "次のページ",
+    "page": "{{total}} ページ中 {{current}} ページ"
+  },
+  "buyCta": "購入",
+  "renewCta": "更新",
+  "purchaseUnavailable": "現在購入できません",
+  "recommended": "おすすめ",
+  "cycleFee": "現在の周期料金"
+}

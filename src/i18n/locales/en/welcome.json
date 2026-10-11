@@ -1,0 +1,67 @@
+{
+  "setPassword": {
+    "title": "Set a password",
+    "subtitle": "You signed in with a third-party account, so it has no password yet. Set one now to secure your account — you'll need it to change settings or sign in directly.",
+    "newLabel": "New password",
+    "confirmLabel": "Confirm password",
+    "hint": "At least 8 characters.",
+    "mismatch": "The two passwords don't match.",
+    "tooShort": "Password must be at least 8 characters.",
+    "submit": "Set password & continue",
+    "saved": "Password set.",
+    "failed": "Couldn't set your password. Please try again."
+  },
+  "ready": {
+    "title": "You're all set",
+    "body": "{{siteName}} is ready. Start your first conversation whenever you like.",
+    "cta": "Start exploring"
+  },
+  "intro": {
+    "eyebrow": "Welcome to {{siteName}}",
+    "title": "A calmer place to think.",
+    "subtitle": "Take a moment to finish the basic setup for {{siteName}}. You can change it later in Settings.",
+    "points": {
+      "write": "Writing that thinks with you",
+      "research": "Research grounded in real sources",
+      "own": "Your conversation — you stay in control"
+    }
+  },
+  "config": {
+    "title": "Make it yours",
+    "subtitle": "Set a few preferences, or skip and dive straight in."
+  },
+  "fields": {
+    "language": "Language",
+    "theme": "Appearance",
+    "accent": "Accent color",
+    "layout": "Chat width",
+    "chatStyle": "Reply style",
+    "chatStyleBody": "How detailed should answers be by default?",
+    "memory": "Memory",
+    "memoryBody": "Let {{siteName}} remember useful details across your chats."
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "chatStyle": {
+    "concise": "Concise",
+    "balanced": "Balanced",
+    "detailed": "Detailed"
+  },
+  "actions": {
+    "skip": "Skip for now",
+    "start": "Get started",
+    "back": "Back",
+    "next": "Next"
+  },
+  "stepHints": {
+    "language": "Choose your interface language.",
+    "theme": "Light, dark, or follow your system.",
+    "accent": "Pick an accent color for the app.",
+    "layout": "Center the chat or use the full width.",
+    "style": "How detailed should replies be by default?",
+    "memory": "Let {{siteName}} remember useful details across your chats."
+  }
+}

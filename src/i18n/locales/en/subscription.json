@@ -1,0 +1,192 @@
+{
+  "back": "Back to chat",
+  "title": "Subscription",
+  "catalog": {
+    "label": "Subscription catalog",
+    "userGroups": "User groups",
+    "creditPackages": "Permanent credits"
+  },
+  "billing": {
+    "label": "Billing period",
+    "monthly": "Monthly",
+    "yearly": "Yearly",
+    "perMonth": "/ month",
+    "perYear": "/ year",
+    "unavailable": "Unavailable for this billing period"
+  },
+  "subtitle": "Your membership group determines which models you can use and how much.",
+  "currentPlan": "Current group",
+  "free": "Free",
+  "allPlans": "All groups",
+  "planCount": "{{count}} plans",
+  "credits": {
+    "sectionTitle": "Credit balance",
+    "timedTitle": "Timed credit balance",
+    "permanentTitle": "Permanent credit balance",
+    "permanentHint": "Purchased credits never expire and are used after your timed credits run out.",
+    "resetsOn": "Refreshes on {{date}}",
+    "loadFailed": "Couldn’t load your credit balance.",
+    "topUp": "Top up credits",
+    "topUpUnavailable": "Top-up isn’t available right now."
+  },
+  "packages": {
+    "title": "Permanent credit packages",
+    "subtitle": "Purchase credits that do not expire and are used after timed credits.",
+    "count": "{{count}} packages",
+    "credits": "Permanent credits",
+    "buy": "Purchase package",
+    "empty": "No permanent credit packages are available."
+  },
+  "current": "Current",
+  "permanentlyOwned": "Permanently owned",
+  "alreadyOwned": "Already owned",
+  "youreOnThis": "You’re on this group",
+  "switchCta": "Switch",
+  "upgradeCta": "Upgrade",
+  "upgradeTitle": "Switch to {{name}}",
+  "upgradeBody": "Group changes are handled by an administrator. Contact your workspace admin to move to this group.",
+  "priceFree": "Free",
+  "loadFailed": "Couldn’t load groups",
+  "loadPackagesFailed": "Couldn’t load permanent credit packages",
+  "noGroups": "No user groups are available.",
+  "expiresOn": "Until {{date}}",
+  "permanent": "Permanent",
+  "redeem": {
+    "title": "Redeem a code",
+    "subtitle": "Enter a code to activate or extend a membership group, or to add permanent credits.",
+    "inputLabel": "Code",
+    "inputPlaceholder": "XXXX-XXXX-XXXX",
+    "submit": "Redeem",
+    "redeeming": "Redeeming…",
+    "success": "Code redeemed",
+    "successBody": "You're now on {{group}}.",
+    "successBodyUntil": "You're now on {{group}} — valid until {{date}}.",
+    "override": {
+      "title": "Switch your plan?",
+      "body": "This code is for {{granted}}, which is different from your current {{current}}. Redeeming replaces your current plan immediately and starts a fresh term from now — it does not extend your existing one.",
+      "bodyUntil": "This code is for {{granted}}, which is different from your current {{current}}. Redeeming replaces your current plan immediately and starts a fresh term from now (valid until {{date}}) — it does not extend your existing one.",
+      "confirm": "Switch now"
+    },
+    "errors": {
+      "empty": "Enter a code",
+      "invalid": "This code isn't valid.",
+      "alreadyUsed": "This code has already been redeemed.",
+      "expired": "This code has expired.",
+      "disabled": "This code has been revoked by an admin.",
+      "alreadyOwned": "You've already redeemed this code.",
+      "generic": "Couldn't redeem this code."
+    },
+    "successCredits": "Credits added",
+    "successBodyCredits": "{{count}} credits have been added to your permanent balance."
+  },
+  "payment": {
+    "title": "Choose a payment method",
+    "description": "Choose how you’d like to pay for \"{{name}}\".",
+    "loading": "Loading payment methods…",
+    "loadError": "Couldn’t load payment methods. Try again.",
+    "retry": "Reload",
+    "invalidUrl": "The payment link is invalid. Contact an administrator.",
+    "checkoutError": "Couldn’t start checkout. Try again.",
+    "checkoutTimeout": "The payment service took too long to respond. Try again.",
+    "errors": {
+      "methodUnavailable": "This payment method is unavailable. Choose another method.",
+      "productUnavailable": "This item is no longer available or its price changed. Refresh the page and try again.",
+      "checkoutUnavailable": "The payment service is temporarily unavailable. Try again later.",
+      "checkoutExpired": "This checkout session has expired. Refresh the order list and try again.",
+      "checkoutNotResumable": "This payment can no longer be continued. Refresh the order list to see its latest status.",
+      "orderAlreadyPaid": "This order has already been paid. Refresh the order list to update your payment status.",
+      "resumeUnavailable": "This payment cannot be resumed right now. Check the payment provider’s order before trying again.",
+      "orderStateChanged": "This order changed while you were viewing it. Refresh the order list and try again.",
+      "checkoutStateUnknown": "The payment provider could not confirm whether this checkout can continue. Check the provider order before trying again.",
+      "waffoProductCurrencyUnsupported": "This Waffo product does not support the selected payment currency. Ask an administrator to check the product price or payment-channel settings.",
+      "userGroupAlreadyPermanent": "You already own this user group permanently, so it doesn’t need to be purchased again.",
+      "userGroupNotPurchasable": "This user group is temporarily unavailable for purchase. Try again later."
+    },
+    "or": "or",
+    "cardPurchase": "Purchase a prepaid code",
+    "empty": "No payment methods are available",
+    "emptyHint": "Ask an administrator to configure a payment channel or prepaid-code purchase link.",
+    "return": {
+      "checking": "Confirming payment status…",
+      "paid": "Payment successful",
+      "paidHint": "Your account benefits have been updated.",
+      "failed": "Payment failed",
+      "cancelled": "Payment cancelled.",
+      "expired": "This payment order has expired. Please try again.",
+      "statusError": "We couldn’t confirm the payment status. Refresh the page to try again.",
+      "pending": "The payment is still processing. Refresh the page in a moment to check again."
+    }
+  },
+  "history": {
+    "title": "Payment history",
+    "description": "Review your recent permanent-credit and user-group purchases.",
+    "columns": {
+      "name": "Name",
+      "time": "Time",
+      "amount": "Amount",
+      "method": "Payment method",
+      "status": "Status",
+      "details": "Details"
+    },
+    "target": {
+      "credit_package": "Permanent credits",
+      "user_group": "User group"
+    },
+    "status": {
+      "pending": "Pending payment",
+      "processing": "Processing",
+      "paid": "Paid",
+      "failed": "Payment failed",
+      "expired": "Expired"
+    },
+    "actions": {
+      "continue": "Continue payment",
+      "retry": "Start payment again"
+    },
+    "retryConfirm": {
+      "title": "Start this payment again?",
+      "description": "A new payment request will be created for \"{{name}}\".",
+      "warning": "The previous checkout will not close automatically. Continue only after confirming that the earlier payment was not completed; paying both checkouts may result in duplicate charges.",
+      "confirm": "Start payment again"
+    },
+    "details": {
+      "action": "Details",
+      "title": "Order details",
+      "description": "Order {{id}}",
+      "loading": "Loading order details…",
+      "loadError": "Couldn’t load the order details.",
+      "retry": "Reload details",
+      "notAvailable": "—",
+      "fields": {
+        "orderId": "Order ID",
+        "product": "Product",
+        "targetType": "Product type",
+        "billingCycle": "Billing cycle",
+        "status": "Status",
+        "amount": "Order amount",
+        "tax": "Tax",
+        "currency": "Currency",
+        "paymentMethod": "Payment method",
+        "provider": "Payment provider",
+        "methodType": "Payment method type",
+        "createdAt": "Created at",
+        "paidAt": "Paid at",
+        "fulfilledAt": "Benefits fulfilled at",
+        "checkoutExpiresAt": "Checkout expires at",
+        "failureReason": "Failure reason"
+      }
+    },
+    "empty": "No payment history yet.",
+    "loadError": "Couldn’t load your payment history.",
+    "resumeError": "Couldn’t continue this payment. Refresh the order list and try again.",
+    "retry": "Try again",
+    "previous": "Previous page",
+    "next": "Next page",
+    "page": "Page {{current}} of {{total}}"
+  },
+  "buyCta": "Purchase",
+  "renewCta": "Renew",
+  "purchaseUnavailable": "Temporarily unavailable",
+  "recommended": "Recommended",
+  "cycleFee": "Current cycle fee"
+}

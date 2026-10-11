@@ -1,0 +1,650 @@
+package tools
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	"aivory/server/internal/llm"
+	"aivory/server/internal/store"
+)
+
+type imageRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn imageRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func useImageTestHTTPClient(t *testing.T, fn imageRoundTripFunc) {
+	t.Helper()
+	previous := toolHTTPClient
+	toolHTTPClient = &http.Client{Transport: fn}
+	t.Cleanup(func() { toolHTTPClient = previous })
+}
+
+func useGeneratedImageFetcher(t *testing.T, fn func(context.Context, string) ([]byte, string)) {
+	t.Helper()
+	previous := fetchGeneratedImage
+	fetchGeneratedImage = fn
+	t.Cleanup(func() { fetchGeneratedImage = previous })
+}
+
+func imageSuccessResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestAPIMartImageGenerationPollsTaskAndDownloadsImage(t *testing.T) {
+	input := sizedPNG(t, 16, 9)
+	output := sizedPNG(t, 9, 16)
+	requests := 0
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			if req.Method != http.MethodPost || req.URL.Path != "/v1/images/generations" {
+				t.Fatalf("submit request = %s %s", req.Method, req.URL.Path)
+			}
+			if got := req.Header.Get("authorization"); got != "Bearer server-secret" {
+				t.Fatalf("submit authorization = %q", got)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if got := body["size"]; got != "3:4" {
+				t.Fatalf("size = %#v, want 3:4", got)
+			}
+			if got := body["resolution"]; got != "2k" {
+				t.Fatalf("resolution = %#v, want 2k", got)
+			}
+			references, _ := body["image_urls"].([]any)
+			if len(references) != 1 || !strings.HasPrefix(references[0].(string), "data:image/png;base64,") {
+				t.Fatalf("image_urls = %#v", body["image_urls"])
+			}
+			return imageSuccessResponse(`{"code":200,"data":[{"status":"submitted","task_id":"task_1"}]}`), nil
+		case 2:
+			if req.Method != http.MethodGet || req.URL.Path != "/v1/tasks/task_1" {
+				t.Fatalf("task request = %s %s", req.Method, req.URL.Path)
+			}
+			return imageSuccessResponse(`{"code":200,"data":{"status":"completed","result":{"images":[{"url":["https://upload.apimart.ai/generated.png"]}]}}}`), nil
+		case 3:
+			if req.Method != http.MethodGet || req.URL.Host != "upload.apimart.ai" {
+				t.Fatalf("provider image request = %s %s", req.Method, req.URL.String())
+			}
+			return imageSuccessResponse(string(output)), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})
+	useGeneratedImageFetcher(t, func(_ context.Context, rawURL string) ([]byte, string) {
+		if rawURL != "https://upload.apimart.ai/generated.png" {
+			t.Fatalf("generated URL = %q", rawURL)
+		}
+		return output, "image/png"
+	})
+
+	images, err := apiMartGenerateImages(context.Background(), "https://api.apimart.ai/v1", "server-secret", "gpt-image-2", imgInput{
+		Prompt: "把图片改成竖版海报", UserPrompt: "把图片调整为 3:4 竖版", N: 1,
+	}, []imageBytes{{data: input, mime: "image/png"}}, map[string]any{"resolution": "2k", "response_format": "b64_json"})
+	if err != nil {
+		t.Fatalf("apiMartGenerateImages: %v", err)
+	}
+	if requests != 3 || len(images) != 1 || string(images[0].data) != string(output) || images[0].mime != "image/png" {
+		t.Fatalf("requests=%d images=%#v", requests, images)
+	}
+}
+
+func TestAPIMartImageGenerationReportsTaskFailure(t *testing.T) {
+	requests := 0
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return imageSuccessResponse(`{"code":200,"data":[{"status":"submitted","task_id":"task_fail"}]}`), nil
+		case 2:
+			return imageSuccessResponse(`{"code":200,"data":{"status":"failed","error":{"message":"余额不足"}}}`), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})
+
+	_, err := apiMartGenerateImages(context.Background(), "https://api.apimart.ai/v1", "server-secret", "gpt-image-2", imgInput{Prompt: "draw", N: 1}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "余额不足") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestAPIMartImageGenerationFallsBackToProviderOwnedImageDownload(t *testing.T) {
+	output := sizedPNG(t, 9, 16)
+	requests := 0
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		requests++
+		switch requests {
+		case 1:
+			return imageSuccessResponse(`{"code":200,"data":[{"status":"submitted","task_id":"task_download"}]}`), nil
+		case 2:
+			return imageSuccessResponse(`{"code":200,"data":{"status":"completed","result":{"images":[{"url":["https://getapib.org/f/image/result.png"]}]}}}`), nil
+		case 3:
+			if req.Method != http.MethodGet || req.URL.Host != "getapib.org" {
+				t.Fatalf("provider image request = %s %s, want getapib.org", req.Method, req.URL.String())
+			}
+			return imageSuccessResponse(string(output)), nil
+		default:
+			t.Fatalf("unexpected request %d", requests)
+			return nil, nil
+		}
+	})
+	useGeneratedImageFetcher(t, func(context.Context, string) ([]byte, string) {
+		return nil, ""
+	})
+
+	images, err := apiMartGenerateImages(context.Background(), "https://api.apimart.ai/v1", "server-secret", "gpt-image-2", imgInput{
+		Prompt: "draw", N: 1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("apiMartGenerateImages: %v", err)
+	}
+	if requests != 3 || len(images) != 1 || string(images[0].data) != string(output) {
+		t.Fatalf("requests=%d images=%#v", requests, images)
+	}
+}
+
+type recordingImageBiller struct {
+	checkedN   int
+	payCredits bool
+	timed      float64
+	total      float64
+}
+
+func (b *recordingImageBiller) ReserveImageBilling(_ context.Context, _ string, _ *store.Model, n int, _ string) (*llm.ImageBillingReservation, bool, string, error) {
+	b.checkedN = n
+	return &llm.ImageBillingReservation{}, true, "", nil
+}
+
+func (b *recordingImageBiller) SettleImageBilling(context.Context, *llm.ImageBillingReservation, int, float64) (float64, float64, error) {
+	if !b.payCredits {
+		return 0, 0, nil
+	}
+	return b.timed, b.total, nil
+}
+
+func (b *recordingImageBiller) ReleaseImageBilling(context.Context, *llm.ImageBillingReservation) error {
+	return nil
+}
+
+func TestImageGenerateToolUsesOneClampedCountForQuotaRequestAndUsage(t *testing.T) {
+	db := openToolsTestDB(t)
+	for _, query := range []string{
+		`INSERT INTO users(id,email,password_hash,name) VALUES('u_image','image@example.test','hash','Image User')`,
+		`INSERT INTO channels(id,name,type,base_url,api_key) VALUES('ch_image','Image Channel','openai','https://images.example.test','server-secret')`,
+		`INSERT INTO models(id,channel_id,kind,request_id,label,price_per_image) VALUES('m_image','ch_image','image','gpt-image-1','Image Model',0.25)`,
+		`INSERT INTO conversations(id,user_id,title,model_id) VALUES('c_image','u_image','Image','m_image')`,
+		`INSERT INTO messages(id,conversation_id,role,model_id,author_id,status) VALUES('msg_image','c_image','assistant','m_image','u_image','streaming')`,
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatalf("seed %q: %v", query, err)
+		}
+	}
+
+	controls := json.RawMessage(`[
+		{
+			"key":"render",
+			"type":"select",
+			"options":[{"value":"studio"}],
+			"map":{"studio":{"n":999,"size":"1536x1024","quality":"high"}}
+		}
+	]`)
+	requestParams := llm.MergeParamControls(nil, controls, map[string]any{
+		"render":  "studio",
+		"unknown": "attacker",
+	})
+	clampedN := llm.ClampImageGenerationCount(999)
+
+	var captured map[string]any
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		// A provider can misbehave and return more candidates than requested. The
+		// server must retain only the clamped, preflighted batch.
+		data := make([]map[string]string, clampedN+2)
+		for i := range data {
+			data[i] = map[string]string{"b64_json": base64.StdEncoding.EncodeToString([]byte("image"))}
+		}
+		body, _ := json.Marshal(map[string]any{"data": data})
+		return imageSuccessResponse(string(body)), nil
+	})
+
+	biller := &recordingImageBiller{payCredits: true, timed: 1, total: 2}
+	tool := &imageGenerateTool{db: db, artifactDir: t.TempDir()}
+	output, _, err := tool.Execute(context.Background(), []byte(`{"prompt":"draw","action":"generate","base_image":"none","n":999,"size":"1024x1024"}`), &llm.ToolContext{
+		UserID:             "u_image",
+		ConvID:             "c_image",
+		MessageID:          "msg_image",
+		ImageModelID:       "m_image",
+		ImageBilling:       biller,
+		ImageRequestParams: requestParams,
+		DB:                 db,
+	})
+	if err != nil {
+		t.Fatalf("image_generate Execute: %v", err)
+	}
+	if biller.checkedN != clampedN {
+		t.Fatalf("quota checked n=%d, want %d", biller.checkedN, clampedN)
+	}
+	if captured["n"] != float64(clampedN) {
+		t.Fatalf("upstream n=%#v, want %d", captured["n"], clampedN)
+	}
+	if captured["size"] != "1536x1024" || captured["quality"] != "high" {
+		t.Fatalf("mapped image params missing upstream: %#v", captured)
+	}
+	if !strings.Contains(output, "Generated "+strconv.Itoa(clampedN)+" image(s)") {
+		t.Fatalf("output = %q", output)
+	}
+	var loggedCount int
+	var loggedCredits float64
+	if err := db.QueryRow(`SELECT images_count, credits FROM usage_logs WHERE user_id='u_image' AND model_id='m_image' AND purpose='image'`).Scan(&loggedCount, &loggedCredits); err != nil {
+		t.Fatalf("read image usage: %v", err)
+	}
+	if loggedCount != clampedN {
+		t.Fatalf("usage images_count=%d, want %d", loggedCount, clampedN)
+	}
+	if loggedCredits != biller.total {
+		t.Fatalf("usage credits=%v, want full charge %v (not timed-only %v)", loggedCredits, biller.total, biller.timed)
+	}
+}
+
+func TestImageGenerateToolFaithfullyEditsCurrentAttachmentWithModelDefaults(t *testing.T) {
+	db := openToolsTestDB(t)
+	controls := `[{"key":"render","type":"select","default":"faithful","options":[{"value":"faithful"}],"map":{"faithful":{"quality":"high","background":"opaque","input_fidelity":"low"}}}]`
+	for _, query := range []string{
+		`INSERT INTO user_groups(id,name,is_default) VALUES('ug_edit','Image Edit',0)`,
+		`INSERT INTO users(id,email,password_hash,name,group_id) VALUES('u_edit','edit@example.test','hash','Edit User','ug_edit')`,
+		`INSERT INTO channels(id,name,type,base_url,api_key) VALUES('ch_edit','Edit Channel','openai','https://images.example.test','server-secret')`,
+	} {
+		if _, err := db.Exec(query); err != nil {
+			t.Fatalf("seed %q: %v", query, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO models(id,channel_id,kind,request_id,label,param_controls) VALUES('m_edit','ch_edit','image','gpt-image-2','GPT Image 2',?)`, controls); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO model_group_quotas(model_id,group_id,period_seconds,limit_type,limit_value) VALUES('m_edit','ug_edit',604800,'count',0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO conversations(id,user_id,title,model_id) VALUES('c_edit','u_edit','Edit','m_edit')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages(id,conversation_id,role,model_id,author_id,status) VALUES('msg_edit','c_edit','assistant','m_edit','u_edit','streaming')`); err != nil {
+		t.Fatal(err)
+	}
+
+	inputData := sizedPNG(t, 1600, 900)
+	inputRoot := t.TempDir()
+	inputPath := filepath.Join(inputRoot, "terminal.png")
+	if err := os.WriteFile(inputPath, inputData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateFile(context.Background(), db, store.File{
+		ID: "f_terminal", UserID: "u_edit", ConversationID: "c_edit", Filename: "terminal.png",
+		MimeType: "image/png", Kind: "image", SizeBytes: int64(len(inputData)), StoragePath: inputPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const exactInstruction = "把所有 07 点改成 09 点，08 点改成 10 点，其他内容一律不变"
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://images.example.test/v1/images/edits" {
+			t.Fatalf("request URL = %q", got)
+		}
+		if err := req.ParseMultipartForm(4 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		if got := req.FormValue("quality"); got != "high" {
+			t.Fatalf("quality = %q, want selected image-model default", got)
+		}
+		if got := req.FormValue("background"); got != "opaque" {
+			t.Fatalf("background = %q, want selected image-model default", got)
+		}
+		if got := req.FormValue("input_fidelity"); got != "" {
+			t.Fatalf("GPT Image 2 must omit unsupported input_fidelity, got %q", got)
+		}
+		if got := req.FormValue("size"); got != "2048x1152" {
+			t.Fatalf("source-ratio size = %q, want default 2K 2048x1152", got)
+		}
+		prompt := req.FormValue("prompt")
+		if !strings.Contains(prompt, exactInstruction) || !strings.Contains(prompt, "Preserve every other detail") {
+			t.Fatalf("faithful edit prompt = %q", prompt)
+		}
+		if strings.Contains(prompt, "rewrite the whole terminal") {
+			t.Fatalf("chat-model paraphrase replaced exact user instruction: %q", prompt)
+		}
+		files := req.MultipartForm.File["image"]
+		if len(files) != 1 {
+			t.Fatalf("bound current attachment count = %d, want 1", len(files))
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		gotImage, err := io.ReadAll(file)
+		if err != nil || string(gotImage) != string(inputData) {
+			t.Fatalf("bound current attachment changed, err=%v", err)
+		}
+		return imageSuccessResponse(`{"data":[{"b64_json":"ZWRpdGVk"}]}`), nil
+	})
+
+	tool := &imageGenerateTool{db: db, uploadDir: inputRoot, artifactDir: t.TempDir()}
+	_, _, err := tool.Execute(
+		context.Background(),
+		[]byte(`{"prompt":"rewrite the whole terminal","action":"edit","base_image":"current_attachment","base_image_index":1,"n":1}`),
+		&llm.ToolContext{
+			UserID: "u_edit", ConvID: "c_edit", MessageID: "msg_edit", ImageModelID: "m_edit", DB: db,
+			ImageInputIDs: []string{"f_terminal"}, ImageUserPrompt: exactInstruction,
+		},
+	)
+	if err != nil {
+		t.Fatalf("image_generate Execute: %v", err)
+	}
+}
+
+func TestOpenAIImageGenerationMergesAllowedJSONParamsAndProtectsNativeFields(t *testing.T) {
+	var captured map[string]any
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://images.example.test/v1/images/generations" {
+			t.Fatalf("request URL = %q", got)
+		}
+		if got := req.Header.Get("authorization"); got != "Bearer server-secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		return imageSuccessResponse(`{"data":[{"b64_json":"aW1hZ2U="}]}`), nil
+	})
+
+	params := map[string]any{
+		"quality":             "high",
+		"background":          "transparent",
+		"vendor":              map[string]any{"mode": "cinematic"},
+		"model":               "attacker-model",
+		"prompt":              "attacker prompt",
+		"n":                   1000,
+		"contents":            []any{"attacker content"},
+		"input_images":        []any{"attacker image"},
+		"response_modalities": []any{"TEXT"},
+		"api_key":             "attacker-secret",
+		"base_url":            "https://attacker.invalid",
+		"url":                 "https://attacker.invalid/collect",
+		"headers":             map[string]any{"authorization": "attacker"},
+	}
+	images, err := openaiGenerateImages(
+		context.Background(),
+		"https://images.example.test",
+		"server-secret",
+		"gpt-image-1",
+		imgInput{Prompt: "server prompt", N: 999, Size: "1536x1024"},
+		nil,
+		params,
+	)
+	if err != nil {
+		t.Fatalf("openaiGenerateImages: %v", err)
+	}
+	if len(images) != 1 || string(images[0].data) != "image" {
+		t.Fatalf("images = %#v", images)
+	}
+
+	if captured["model"] != "gpt-image-1" || captured["prompt"] != "server prompt" {
+		t.Fatalf("native identity/content overwritten: %#v", captured)
+	}
+	if captured["n"] != float64(llm.ClampImageGenerationCount(999)) {
+		t.Fatalf("n = %#v, want shared clamp", captured["n"])
+	}
+	if captured["size"] != "1536x1024" || captured["quality"] != "high" || captured["background"] != "transparent" {
+		t.Fatalf("allowed image params missing: %#v", captured)
+	}
+	vendor, ok := captured["vendor"].(map[string]any)
+	if !ok || vendor["mode"] != "cinematic" {
+		t.Fatalf("provider-specific object missing: %#v", captured["vendor"])
+	}
+	for _, forbidden := range []string{"contents", "input_images", "response_modalities", "api_key", "base_url", "url", "headers"} {
+		if _, exists := captured[forbidden]; exists {
+			t.Fatalf("forbidden field %q reached OpenAI body: %#v", forbidden, captured)
+		}
+	}
+}
+
+func TestOpenAIImageEditMergesAllowedMultipartParamsAndProtectsInputImage(t *testing.T) {
+	inputData := []byte("trusted-input-image")
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://images.example.test/v1/images/edits" {
+			t.Fatalf("request URL = %q", got)
+		}
+		if got := req.Header.Get("authorization"); got != "Bearer server-secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if err := req.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatalf("parse multipart: %v", err)
+		}
+		wantFields := map[string]string{
+			"model":           "dall-e-3",
+			"prompt":          "server edit prompt",
+			"n":               "2",
+			"size":            "1024x1792",
+			"quality":         "hd",
+			"background":      "transparent",
+			"response_format": "b64_json",
+		}
+		for key, want := range wantFields {
+			if got := req.FormValue(key); got != want {
+				t.Fatalf("multipart %s = %q, want %q", key, got, want)
+			}
+		}
+		for _, forbidden := range []string{"api_key", "base_url", "url", "contents", "input_images", "headers", "nested"} {
+			if got := req.FormValue(forbidden); got != "" {
+				t.Fatalf("forbidden multipart field %s = %q", forbidden, got)
+			}
+		}
+		files := req.MultipartForm.File["image"]
+		if len(files) != 1 {
+			t.Fatalf("image file count = %d, want 1", len(files))
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			t.Fatalf("open multipart image: %v", err)
+		}
+		defer file.Close()
+		gotImage, err := io.ReadAll(file)
+		if err != nil || string(gotImage) != string(inputData) {
+			t.Fatalf("multipart image = %q, err=%v", gotImage, err)
+		}
+		return imageSuccessResponse(`{"data":[{"b64_json":"ZWRpdGVk"}]}`), nil
+	})
+
+	params := map[string]any{
+		"quality":      "hd",
+		"background":   "transparent",
+		"nested":       map[string]any{"not": "representable in multipart"},
+		"model":        "attacker-model",
+		"prompt":       "attacker prompt",
+		"n":            999,
+		"image":        "attacker image",
+		"input_images": []any{"attacker image"},
+		"contents":     []any{"attacker content"},
+		"api_key":      "attacker-secret",
+		"base_url":     "https://attacker.invalid",
+		"url":          "https://attacker.invalid/collect",
+		"headers":      map[string]any{"authorization": "attacker"},
+	}
+	images, err := openaiGenerateImages(
+		context.Background(),
+		"https://images.example.test",
+		"server-secret",
+		"dall-e-3",
+		imgInput{Prompt: "server edit prompt", N: 2, Size: "1024x1792"},
+		[]imageBytes{{data: inputData, mime: "image/png"}},
+		params,
+	)
+	if err != nil {
+		t.Fatalf("openaiGenerateImages edit: %v", err)
+	}
+	if len(images) != 1 || string(images[0].data) != "edited" {
+		t.Fatalf("images = %#v", images)
+	}
+}
+
+func TestGeminiImageGenerationMergesAspectParamsAndProtectsNativeFields(t *testing.T) {
+	inputData := []byte("trusted-reference")
+	var captured map[string]any
+	useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.Scheme + "://" + req.URL.Host + req.URL.Path; got != "https://gemini.example.test/v1beta/models/gemini-image:generateContent" {
+			t.Fatalf("request URL = %q", req.URL.String())
+		}
+		if got := req.URL.Query().Get("key"); got != "server-secret" {
+			t.Fatalf("API key query = %q", got)
+		}
+		if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		encoded := base64.StdEncoding.EncodeToString([]byte("gemini-image"))
+		return imageSuccessResponse(`{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/webp","data":"` + encoded + `"}}]}}]}`), nil
+	})
+
+	params := map[string]any{
+		"generationConfig": map[string]any{
+			"temperature":        0.4,
+			"candidateCount":     999,
+			"responseModalities": []any{"TEXT"},
+			"imageConfig": map[string]any{
+				"aspectRatio": "16:9",
+				"imageSize":   "2K",
+			},
+		},
+		"contents":            []any{map[string]any{"role": "attacker"}},
+		"response_modalities": []any{"TEXT"},
+		"model":               "attacker-model",
+		"prompt":              "attacker prompt",
+		"input_images":        []any{"attacker image"},
+		"api_key":             "attacker-secret",
+		"base_url":            "https://attacker.invalid",
+		"url":                 "https://attacker.invalid/collect",
+	}
+	images, err := geminiGenerateImages(
+		context.Background(),
+		"https://gemini.example.test",
+		"server-secret",
+		"gemini-image",
+		imgInput{Prompt: "server prompt", N: 999, Size: "1024x1024"},
+		[]imageBytes{{data: inputData, mime: "image/png"}},
+		params,
+	)
+	if err != nil {
+		t.Fatalf("geminiGenerateImages: %v", err)
+	}
+	if len(images) != 1 || string(images[0].data) != "gemini-image" || images[0].mime != "image/webp" {
+		t.Fatalf("images = %#v", images)
+	}
+
+	config, ok := captured["generationConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("generationConfig = %#v", captured["generationConfig"])
+	}
+	modalities, ok := config["responseModalities"].([]any)
+	if !ok || len(modalities) != 1 || modalities[0] != "IMAGE" {
+		t.Fatalf("native responseModalities overwritten: %#v", config["responseModalities"])
+	}
+	if config["candidateCount"] != float64(llm.ClampImageGenerationCount(999)) {
+		t.Fatalf("candidateCount = %#v, want shared clamp", config["candidateCount"])
+	}
+	imageConfig, ok := config["imageConfig"].(map[string]any)
+	if !ok || imageConfig["aspectRatio"] != "16:9" || imageConfig["imageSize"] != "2K" {
+		t.Fatalf("Gemini image controls missing: %#v", config)
+	}
+	if config["temperature"] != 0.4 {
+		t.Fatalf("provider-specific generation option missing: %#v", config)
+	}
+	contents, ok := captured["contents"].([]any)
+	if !ok || len(contents) != 1 {
+		t.Fatalf("native contents missing: %#v", captured["contents"])
+	}
+	content, _ := contents[0].(map[string]any)
+	parts, _ := content["parts"].([]any)
+	if len(parts) != 2 {
+		t.Fatalf("native reference/prompt parts = %#v", parts)
+	}
+	inline, _ := parts[0].(map[string]any)
+	inlineData, _ := inline["inlineData"].(map[string]any)
+	if inlineData["data"] != base64.StdEncoding.EncodeToString(inputData) {
+		t.Fatalf("reference image was overwritten: %#v", inlineData)
+	}
+	textPart, _ := parts[1].(map[string]any)
+	if textPart["text"] != "server prompt" {
+		t.Fatalf("prompt was overwritten: %#v", textPart)
+	}
+	for _, forbidden := range []string{"model", "prompt", "input_images", "response_modalities", "api_key", "base_url", "url"} {
+		if _, exists := captured[forbidden]; exists {
+			t.Fatalf("forbidden field %q reached Gemini body: %#v", forbidden, captured)
+		}
+	}
+}
+
+func TestGeminiImageGenerationDefaultsKnownModelsTo2K(t *testing.T) {
+	tests := []struct {
+		name   string
+		model  string
+		params map[string]any
+		want   string
+	}{
+		{name: "gemini 3 pro", model: "gemini-3-pro-image-preview", want: "2K"},
+		{name: "gemini 3.1 flash", model: "gemini-3.1-flash-image-preview", want: "2K"},
+		{name: "nano banana pro alias", model: "nano-banana-pro-preview", want: "2K"},
+		{name: "admin override", model: "gemini-3-pro-image-preview", params: map[string]any{
+			"generationConfig": map[string]any{"imageConfig": map[string]any{"imageSize": "4K"}},
+		}, want: "4K"},
+		{name: "older fixed resolution model", model: "gemini-2.5-flash-image"},
+		{name: "unknown compatible model", model: "provider-gemini-image-alias"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var captured map[string]any
+			useImageTestHTTPClient(t, func(req *http.Request) (*http.Response, error) {
+				if err := json.NewDecoder(req.Body).Decode(&captured); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				return imageSuccessResponse(`{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1hZ2U="}}]}}]}`), nil
+			})
+
+			if _, err := geminiGenerateImages(
+				context.Background(),
+				"https://gemini.example.test",
+				"server-secret",
+				tt.model,
+				imgInput{Prompt: "server prompt", N: 1},
+				nil,
+				tt.params,
+			); err != nil {
+				t.Fatalf("geminiGenerateImages: %v", err)
+			}
+			generationConfig, _ := captured["generationConfig"].(map[string]any)
+			imageConfig, _ := generationConfig["imageConfig"].(map[string]any)
+			got, _ := imageConfig["imageSize"].(string)
+			if got != tt.want {
+				t.Fatalf("imageSize = %q, want %q; body=%#v", got, tt.want, captured)
+			}
+		})
+	}
+}

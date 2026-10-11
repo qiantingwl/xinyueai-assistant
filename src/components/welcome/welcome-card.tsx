@@ -1,0 +1,397 @@
+import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { Pencil, BookOpen, ShieldCheck } from 'lucide-react'
+import { authApi } from '@/api'
+import { useAuth } from '@/store/auth'
+import { useLanguage } from '@/store/language'
+import { useTheme } from '@/store/theme'
+import { useSettings } from '@/store/settings'
+import { useSiteConfig } from '@/store/site-config'
+import { toast } from '@/hooks/use-toast'
+import { SUPPORTED_LANGUAGES, type LanguageCode } from '@/i18n'
+import { type ChatWidthPref, type ThemePref } from '@/types/settings'
+import { Aurora } from '@/components/landing/fx/aurora'
+import { BlurText } from '@/components/landing/fx/blur-text'
+import { GradientText } from '@/components/landing/fx/gradient-text'
+import { ShinyText } from '@/components/landing/fx/shiny-text'
+import { SplitText } from '@/components/landing/fx/split-text'
+import { StarBorder } from '@/components/landing/fx/star-border'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogTitle } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { cn } from '@/lib/utils'
+import { userCan } from '@/lib/user-permissions'
+
+type StepKey = 'language' | 'theme' | 'layout' | 'memory'
+const STEPS: StepKey[] = ['language', 'theme', 'layout', 'memory']
+const CHAT_WIDTH_OPTS: ChatWidthPref[] = ['comfortable', 'full']
+const THEME_OPTS: ThemePref[] = ['light', 'dark', 'system']
+
+/**
+ * First-login welcome — a small wizard (one choice per page). Shows once per
+ * account (gated on a server-side `onboarded` flag in user settings). The left
+ * panel is an editorial intro with a slow accent-tinted aurora; the right steps
+ * through language, appearance, layout, and optional memory. Choices
+ * preview live, Skip restores them, and Get started persists them.
+ */
+export function WelcomeCard() {
+  const { t } = useTranslation(['welcome', 'settings', 'common'])
+  const user = useAuth((s) => s.user)
+  const status = useAuth((s) => s.status)
+  const setUser = useAuth((s) => s.setUser)
+  const authPolicy = useAuth((s) => s.authPolicy)
+  const siteName = useSiteConfig((s) => s.title)
+  // Skip the memory onboarding step when the global admin master switch is off.
+  const memoryAvailable = user?.memory_available !== false && userCan(user, 'allow_memory')
+
+  const lang = useLanguage((s) => s.lang)
+  const setLang = useLanguage((s) => s.setLang)
+  const themePref = useTheme((s) => s.pref)
+  const setPref = useTheme((s) => s.setPref)
+  const memory = useSettings((s) => s.privacy.memoriesEnabled)
+  const setPrivacy = useSettings((s) => s.setPrivacy)
+  const chatWidth = useSettings((s) => s.appearance.chatWidth)
+  const setAppearance = useSettings((s) => s.setAppearance)
+
+  const onboarded = Boolean((user?.settings as Record<string, unknown> | undefined)?.onboarded)
+  // OAuth accounts must set a password first (SetPasswordGate); hold the wizard
+  // back until they have, so the two mandatory dialogs don't stack.
+  const passwordPolicy = user?.oauth_initial_password_policy ?? authPolicy.oauth_initial_password_policy
+  const needsPassword = user?.has_password === false && passwordPolicy === 'required'
+  const eligible = status === 'authenticated' && Boolean(user) && !onboarded && !needsPassword
+
+  const [mounted, setMounted] = useState(false)
+  const [open, setOpen] = useState(false)
+  // After "Get started" the wizard hands off to a short celebratory welcome
+  // dialog before the user lands in the app.
+  const [welcomeOpen, setWelcomeOpen] = useState(false)
+  const [step, setStep] = useState(0)
+  const [saving, setSaving] = useState(false)
+  const initial = useRef<{
+    lang: LanguageCode
+    theme: ThemePref
+    chatWidth: ChatWidthPref
+    memory: boolean
+  } | null>(null)
+
+  // Open once when first eligible, snapshotting the current prefs so Skip can
+  // undo any live previews the user made. `mounted` keeps the dialog in the tree
+  // through its exit animation even after `open` flips false.
+  useEffect(() => {
+    if (eligible && !mounted && initial.current === null) {
+      initial.current = { lang, theme: themePref, chatWidth, memory }
+      setMounted(true)
+      setOpen(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligible])
+
+  if (!mounted) return null
+
+  const steps = memoryAvailable ? STEPS : STEPS.filter((s) => s !== 'memory')
+  const last = steps.length - 1
+  const current = steps[step]
+
+  async function markOnboarded(extra: Record<string, unknown>) {
+    const patch = { onboarded: true, ...extra }
+    const updated = await authApi.updateSettings(patch)
+    if (user) setUser({ ...user, settings: { ...(user.settings ?? {}), ...updated } })
+  }
+
+  // Close with the exit animation: flip `open` (Radix plays the zoom-into-app
+  // close), then unmount after it finishes.
+  function close() {
+    setOpen(false)
+    window.setTimeout(() => setMounted(false), 360)
+  }
+
+  async function handleStart() {
+    if (!open || saving) return
+    setSaving(true)
+    try {
+      // Deliberately NOT writing response_length: new accounts stay at the
+      // neutral default until the user picks a preference in Settings.
+      await markOnboarded({
+        language: lang,
+        theme: themePref,
+        chat_width: chatWidth,
+        memory_enabled: memoryAvailable ? memory : false,
+      })
+      // Close the wizard (plays the zoom-out), then hand off to the welcome
+      // dialog once the exit animation finishes.
+      setOpen(false)
+      window.setTimeout(() => setWelcomeOpen(true), 360)
+    } catch (e) {
+      toast.error(t('common:common.error'), e instanceof Error ? e.message : undefined)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // Dismiss the welcome dialog and unmount the whole flow.
+  function finishWelcome() {
+    setWelcomeOpen(false)
+    window.setTimeout(() => setMounted(false), 200)
+  }
+
+  async function handleSkip() {
+    if (!open || saving) return
+    setSaving(true)
+    const init = initial.current
+    if (init) {
+      if (lang !== init.lang) setLang(init.lang)
+      if (themePref !== init.theme) setPref(init.theme)
+      if (chatWidth !== init.chatWidth) setAppearance({ chatWidth: init.chatWidth })
+      if (memory !== init.memory) setPrivacy({ memoriesEnabled: init.memory })
+    }
+    try {
+      await markOnboarded({})
+      close()
+    } catch (e) {
+      toast.error(t('common:common.error'), e instanceof Error ? e.message : undefined)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function renderControl(key: StepKey) {
+    switch (key) {
+      case 'language':
+        return (
+          <Select value={lang} onValueChange={(v) => setLang(v as LanguageCode)}>
+            <SelectTrigger className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SUPPORTED_LANGUAGES.map((l) => (
+                <SelectItem key={l.code} value={l.code}>
+                  {l.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )
+      case 'theme':
+        return (
+          <div className="flex items-center gap-2">
+            {THEME_OPTS.map((opt) => (
+              <Seg key={opt} active={themePref === opt} onClick={() => setPref(opt)}>
+                {t(`welcome:theme.${opt}`)}
+              </Seg>
+            ))}
+          </div>
+        )
+      case 'layout':
+        return (
+          <div className="flex items-center gap-2">
+            {CHAT_WIDTH_OPTS.map((opt) => (
+              <Seg key={opt} active={chatWidth === opt} onClick={() => setAppearance({ chatWidth: opt })}>
+                {t(`settings:appearance.chatWidth.${opt}`)}
+              </Seg>
+            ))}
+          </div>
+        )
+      case 'memory':
+        return (
+          <label className="flex items-center justify-between gap-4 rounded-[12px] border border-[var(--color-border)] bg-[var(--color-bg-muted)] px-4 py-3.5">
+            <span className="text-sm text-[var(--color-fg)]">{t('welcome:fields.memory')}</span>
+            <Switch checked={memory} onCheckedChange={(v) => setPrivacy({ memoriesEnabled: v })} />
+          </label>
+        )
+    }
+  }
+
+  return (
+    <>
+    <Dialog open={open} onOpenChange={(o) => { if (!o) void handleSkip() }}>
+      <DialogContent
+        size="xl"
+        showClose={false}
+        className="p-0 overflow-hidden data-[state=closed]:animate-[welcome-exit_340ms_var(--ease-in)]"
+      >
+        {/* a11y: one stable title/description for the dialog as a whole. */}
+        <DialogTitle className="sr-only">{t('welcome:config.title')}</DialogTitle>
+        <DialogDescription className="sr-only">{t('welcome:config.subtitle')}</DialogDescription>
+
+        <div className="flex flex-col md:flex-row min-h-0 flex-1">
+          {/* Editorial intro with the same ambient curtain as the auth surfaces;
+              it falls back to the static muted panel under reduced motion. */}
+          <aside className="relative hidden md:flex md:w-[42%] flex-col justify-between gap-10 overflow-hidden p-8 bg-[var(--color-bg-muted)] border-r border-[var(--color-divider)]">
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-0"
+              style={{
+                maskImage: 'linear-gradient(to bottom, #000 0%, #000 40%, transparent 90%)',
+                WebkitMaskImage: 'linear-gradient(to bottom, #000 0%, #000 40%, transparent 90%)',
+              }}
+            >
+              <Aurora
+                className="opacity-45"
+                colorStops={[
+                  'color-mix(in oklch, var(--color-accent) 58%, var(--color-bg))',
+                  'color-mix(in oklch, var(--color-accent) 26%, var(--color-bg))',
+                  'color-mix(in oklch, var(--color-accent) 58%, var(--color-bg))',
+                ]}
+                amplitude={1.0}
+                blend={0.6}
+                speed={0.45}
+                intensity={1.1}
+              />
+            </div>
+
+            <div className="relative z-10 font-serif text-2xl tracking-normal text-[var(--color-fg)]">
+              {siteName}
+            </div>
+            <div className="relative z-10">
+              <div className="text-[12px] uppercase tracking-[0.1em]">
+                <ShinyText text={t('welcome:intro.eyebrow', { siteName })} baseColor="var(--color-fg-subtle)" speed={5} />
+              </div>
+              <h2 className="mt-3 overflow-hidden font-serif text-[2rem] leading-[1.1] tracking-[-0.01em] text-[var(--color-fg)]">
+                {/* Per-character masked rise — the landing headline language. */}
+                <SplitText
+                  text={t('welcome:intro.title')}
+                  splitType="chars"
+                  delay={24}
+                  duration={0.8}
+                  from={{ yPercent: 115 }}
+                  to={{ yPercent: 0 }}
+                  threshold={0}
+                  rootMargin="0px"
+                  className="block pb-[0.08em] -mb-[0.08em]"
+                />
+              </h2>
+              <p className="mt-3 text-sm leading-relaxed text-[var(--color-fg-muted)]">
+                {t('welcome:intro.subtitle', { siteName })}
+              </p>
+            </div>
+            <ul className="relative z-10 flex flex-col gap-3.5">
+              {[
+                { icon: Pencil, key: 'write' },
+                { icon: BookOpen, key: 'research' },
+                { icon: ShieldCheck, key: 'own' },
+              ].map(({ icon: Icon, key }) => (
+                <li key={key} className="flex items-center gap-3 text-sm text-[var(--color-fg)]">
+                  <span className="shrink-0 inline-flex items-center justify-center size-8 rounded-[9px] bg-[var(--color-surface)] border border-[var(--color-border)] text-[var(--color-secondary)]">
+                    <Icon size={15} aria-hidden />
+                  </span>
+                  {t(`welcome:intro.points.${key}`)}
+                </li>
+              ))}
+            </ul>
+          </aside>
+
+          {/* Step panel */}
+          <div className="flex-1 min-w-0 flex flex-col min-h-0">
+            <div className="flex-1 overflow-y-auto px-6 sm:px-8 pt-7 pb-2">
+              {/* Progress */}
+              <div className="flex items-center gap-1.5">
+                {steps.map((_, i) => (
+                  <span
+                    key={i}
+                    className={cn(
+                      'h-1.5 rounded-full transition-all duration-300',
+                      i === step
+                        ? 'w-6 bg-[var(--color-accent)]'
+                        : i < step
+                          ? 'w-1.5 bg-[var(--color-fg-muted)]'
+                          : 'w-1.5 bg-[var(--color-border)]',
+                    )}
+                  />
+                ))}
+                <span className="ml-auto text-[12px] tabular-nums text-[var(--color-fg-subtle)]">
+                  {step + 1} / {steps.length}
+                </span>
+              </div>
+
+              {/* Step content — re-keyed so it animates in on each change; the
+                  step title drifts into focus with it (BlurText replays per key). */}
+              <div key={step} className="mt-7 animate-[welcome-step_300ms_var(--ease-out)]">
+                <h3 className="font-serif text-xl tracking-normal text-[var(--color-fg)]">
+                  <BlurText text={t(`welcome:fields.${current}`)} delay={90} />
+                </h3>
+                <p className="mt-1.5 text-sm text-[var(--color-fg-muted)] leading-relaxed">
+                  {t(`welcome:stepHints.${current}`, { siteName })}
+                </p>
+                <div className="mt-6">{renderControl(current)}</div>
+              </div>
+            </div>
+
+            {/* Footer nav */}
+            <DialogFooter className="justify-between px-6 sm:px-8">
+              <Button variant="ghost" onClick={() => void handleSkip()} loading={saving}>
+                {t('welcome:actions.skip')}
+              </Button>
+              <div className="flex items-center gap-2">
+                {step > 0 ? (
+                  <Button variant="ghost" onClick={() => setStep((s) => s - 1)}>
+                    {t('welcome:actions.back')}
+                  </Button>
+                ) : null}
+                {step < last ? (
+                  <Button onClick={() => setStep((s) => s + 1)}>{t('welcome:actions.next')}</Button>
+                ) : (
+                  <Button onClick={() => void handleStart()} loading={saving}>
+                    {t('welcome:actions.start')}
+                  </Button>
+                )}
+              </div>
+            </DialogFooter>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    {/* Celebratory welcome shown right after the wizard completes. */}
+    <Dialog open={welcomeOpen} onOpenChange={(o) => { if (!o) finishWelcome() }}>
+      <DialogContent size="sm" showClose={false} className="overflow-hidden text-center">
+        <div aria-hidden className="pointer-events-none absolute inset-x-0 top-0 h-28 opacity-[0.18] blur-2xl"
+          style={{ background: 'radial-gradient(60% 80% at 50% 0%, var(--color-accent), transparent 70%)' }}
+        />
+        <div className="relative flex flex-col items-center gap-4 px-6 pt-8 pb-6 sm:px-8">
+          <div className="font-serif text-2xl tracking-normal text-[var(--color-fg)]">{siteName}</div>
+          <div>
+            <DialogTitle>
+              {/* One warm clay glint pans through the celebration line. */}
+              <GradientText
+                colors={['var(--color-fg)', 'var(--color-accent)', 'var(--color-fg)']}
+                animationSpeed={7}
+              >
+                {t('welcome:ready.title')}
+              </GradientText>
+            </DialogTitle>
+            <DialogDescription className="mt-2 text-sm leading-relaxed text-[var(--color-fg-muted)] max-w-[34ch]">
+              {t('welcome:ready.body', { siteName })}
+            </DialogDescription>
+          </div>
+          {/* The "enter the studio" moment gets the orbiting glow. */}
+          <StarBorder as="span" className="mt-2 w-full rounded-[12px]" speed="7s" thickness={2}>
+            <Button variant="contrast" className="w-full" onClick={finishWelcome}>
+              {t('welcome:ready.cta')}
+            </Button>
+          </StarBorder>
+        </div>
+      </DialogContent>
+    </Dialog>
+    </>
+  )
+}
+
+function Seg({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'px-3.5 h-9 rounded-[9px] text-sm font-medium transition-colors interactive',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+        active
+          ? 'bg-[var(--color-fg)] text-[var(--color-fg-inverted)]'
+          : 'border border-[var(--color-border)] text-[var(--color-fg-muted)] hover:text-[var(--color-fg)] hover:bg-[var(--color-bg-muted)]',
+      )}
+    >
+      {children}
+    </button>
+  )
+}

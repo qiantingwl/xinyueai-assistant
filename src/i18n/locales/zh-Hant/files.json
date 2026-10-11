@@ -1,0 +1,117 @@
+{
+  "title": "檔案",
+  "searchPlaceholder": "搜尋檔名",
+  "total": "共 {{count}} 個檔案",
+  "view": "檢視",
+  "deleted": "檔案已刪除",
+  "previewFailed": "預覽失敗",
+  "noInlinePreview": "該檔案類型不支援線上預覽。",
+  "confirmTitle": "刪除該檔案?",
+  "confirmBody": "「{{name}}」將被徹底刪除——檔案本體、資料庫記錄與檢索索引都會移除,無法復原。",
+  "origin": {
+    "all": "全部來源",
+    "conversation": "對話",
+    "kb": "知識庫"
+  },
+  "sort": {
+    "newest": "最新在前",
+    "oldest": "最早在前",
+    "largest": "最大在前",
+    "smallest": "最小在前"
+  },
+  "filters": {
+    "title": "篩選與排序",
+    "typeLabel": "檔案類型",
+    "originLabel": "來源",
+    "sortLabel": "排序方式"
+  },
+  "types": {
+    "all": "全部類型",
+    "pdf": "PDF",
+    "document": "文件",
+    "presentation": "簡報",
+    "spreadsheet": "試算表",
+    "image": "圖片",
+    "text": "文字",
+    "other": "其他"
+  },
+  "preview": {
+    "selectTitle": "選擇檔案",
+    "selectBody": "從左側清單中選擇要預覽的檔案。",
+    "loading": "正在載入預覽…",
+    "download": "下載",
+    "delete": "刪除",
+    "backToList": "返回檔案清單",
+    "unsupported": "此檔案類型目前不支援預覽。",
+    "tooLarge": "檔案過大，無法預覽。",
+    "failed": "無法載入預覽。",
+    "metadata": "{{type}} · {{size}}"
+  },
+  "pdf": {
+    "previousPage": "上一頁",
+    "nextPage": "下一頁",
+    "page": "第 {{page}} 頁",
+    "of": "共 {{total}} 頁",
+    "zoomOut": "縮小",
+    "zoomIn": "放大",
+    "fitWidth": "符合寬度",
+    "renderFailed": "無法呈現此 PDF。"
+  },
+  "docx": {
+    "loading": "正在載入文件…",
+    "tooLarge": "文件過大，無法預覽。",
+    "failed": "無法預覽此文件。"
+  },
+  "pptx": {
+    "loading": "正在載入簡報…",
+    "tooLarge": "簡報過大，無法預覽。",
+    "failed": "無法預覽此簡報。"
+  },
+  "spreadsheet": {
+    "loading": "正在載入試算表…",
+    "tooLarge": "試算表過大，無法預覽。",
+    "failed": "無法預覽此試算表。",
+    "sheet": "工作表",
+    "row": "列",
+    "column": "欄",
+    "truncated": "僅顯示前 {{rows}} 列和前 {{columns}} 欄。",
+    "empty": "此工作表為空。"
+  },
+  "list": {
+    "title": "檔案清單",
+    "loading": "正在載入檔案…",
+    "emptyFilteredTitle": "沒有符合的檔案",
+    "emptyFilteredBody": "請嘗試其他搜尋詞或檔案類型。",
+    "resultCount": "共 {{count}} 個檔案"
+  },
+  "selection": {
+    "selected": "已選取",
+    "selectFile": "選取 {{name}}",
+    "clear": "取消選取"
+  },
+  "accessibility": {
+    "fileList": "檔案清單",
+    "previewPane": "檔案預覽",
+    "searchFiles": "搜尋檔案",
+    "filterByType": "依類型篩選檔案",
+    "selectedFile": "已選取檔案：{{name}}"
+  },
+  "table": {
+    "filename": "檔名",
+    "type": "類型",
+    "origin": "來源",
+    "size": "大小",
+    "uploaded": "上傳時間",
+    "actions": "操作"
+  },
+  "storage": {
+    "title": "儲存空間",
+    "usedOf": "已用 {{used}} / 共 {{quota}}",
+    "usedUnlimited": "已用 {{used}} · 無限制",
+    "note": "文件等檔案計入儲存空間;圖片不計入。"
+  },
+  "empty": {
+    "title": "還沒有檔案",
+    "body": "你在對話或知識庫中上傳的檔案會顯示在這裡。"
+  }
+}

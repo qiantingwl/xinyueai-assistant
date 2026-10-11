@@ -1,0 +1,3418 @@
+/**
+ * Conversations store — backed by the Go backend. Exposes the same surface
+ * the existing UI uses so we don't have to rewrite every consumer:
+ *
+ *   - `conversations` is the in-memory cache; `load()` hydrates from the
+ *     backend, `loadMessages(id)` loads the active-path messages.
+ *   - `createConversation()` / `deleteConversation()` / etc round-trip to
+ *     the backend.
+ *   - `consumeStream()` and `abortStream()` drive a real SSE session.
+ *
+ * The local shape we expose matches what most chat components want:
+ * `Conversation { id, title, modelId, projectId, messages, ... }`.
+ * Inside the store we map ApiMessage / ApiConversation into these shapes.
+ */
+import { createWithEqualityFn } from 'zustand/traditional'
+import { ApiError, conversationsApi, streamSSE, streamSSEGet } from '@/api'
+import type {
+  ApiAttachment,
+  ApiConversation,
+  ApiMessage,
+  ApiSseEvent,
+} from '@/api/types'
+import type {
+  Attachment,
+  Citation,
+  Conversation,
+  MessageFeedbackInput,
+  Message,
+  ReasoningItem,
+  ResearchSource,
+  ResearchState,
+  ResearchTask,
+  ToolCall,
+  VerifyFinding,
+  VerifyResult,
+} from '@/types/chat'
+import { applyMessageFeedback, feedbackInvalidationTargetsAfterEdit } from '@/lib/message-feedback'
+import { GENERATION_INTERRUPTED_ERROR_CODE } from '@/types/chat'
+import { uid } from '@/lib/utils'
+import { isKnownLocalMessageId, persistedMessageReference } from '@/lib/message-ids'
+import { envNum } from '@/lib/env-config'
+import { markConversationsDeleted, unmarkConversationsDeleted } from '@/lib/sync-guards'
+import { toast } from '@/hooks/use-toast'
+import { activeWorkspaceId, useWorkspaces } from '@/store/workspaces'
+import { useAuth } from '@/store/auth'
+import { useComposerPrefs, type ComposerMode } from '@/store/composer-prefs'
+import { useModels } from '@/store/models'
+import type { ToolMode } from '@/lib/tool-mode'
+import i18n from '@/i18n'
+import { mathContentToPlainText } from '@/lib/math-content'
+import { normalizeSelectedUserSkillIds } from '@/lib/composer-commands'
+import { resolveNewConversationFastMode } from '@/lib/chat-defaults'
+import { initialConversationTitle } from '@/lib/chat-message-input'
+import { ragInjectionFromEvent } from '@/lib/rag-injection'
+import { markFileCommitted } from '@/lib/committed-files'
+import { sanitizeToolErrorOutput, sanitizeUserVisibleError } from '@/lib/user-visible-error'
+
+// resolveArmedTurnFlags snapshots the CURRENT composer feature toggles for turns
+// started OUTSIDE the composer's own submit — regenerate, edit-and-resend, and
+// home suggestion cards — so an armed feature (deep research / verify / tool
+// policy / forced web search) applies consistently no matter how the turn is
+// triggered, instead of silently reverting to defaults. verify is gated on
+// availability. Deep Research is normalized to enabled because its pipeline
+// always needs tools and must bypass the automatic classifier.
+export function resolveArmedTurnFlags(_modelId?: string): {
+  mode?: ComposerMode
+  verify?: boolean
+  toolMode: ToolMode
+  webSearch?: boolean
+  selectedToolIds?: string[]
+  optimizeImagePrompt: boolean
+} {
+  const p = useComposerPrefs.getState()
+  const mode = p.mode !== 'default' ? p.mode : undefined
+  const toolMode = resolveTurnToolMode(p.toolMode, { mode })
+  return {
+    mode,
+    verify: p.verify && useModels.getState().verifyAvailable ? true : undefined,
+    toolMode,
+    webSearch: toolMode === 'disabled' && p.forceWebSearch ? true : undefined,
+    selectedToolIds: _modelId ? p.selectedToolIdsByModel[_modelId] : undefined,
+    optimizeImagePrompt: p.optimizeImagePrompt,
+  }
+}
+
+/**
+ * Returns the policy that must be sent on the wire for a concrete turn. Fast
+ * mode keeps its existing fixed tool behavior, and Deep Research always needs
+ * tools; both therefore skip automatic task classification.
+ */
+export function resolveTurnToolMode(
+  toolMode: ToolMode | undefined,
+  options: { fast?: boolean; mode?: ComposerMode } = {},
+): ToolMode {
+  if (options.fast || options.mode === 'deep-research') return 'enabled'
+  return toolMode ?? 'auto'
+}
+
+/** Pure wire-policy resolver shared by normal sends and regeneration. */
+export function resolveToolRequestFlags(
+  toolMode: ToolMode | undefined,
+  options: { fast?: boolean; mode?: ComposerMode; webSearch?: boolean } = {},
+): { toolMode: ToolMode; webSearch?: true } {
+  const resolved = resolveTurnToolMode(toolMode, options)
+  return {
+    toolMode: resolved,
+    webSearch: resolved === 'disabled' && options.webSearch ? true : undefined,
+  }
+}
+
+// The user's current UI language, sent with each turn so the backend can anchor
+// the reply-language instruction (§ reply language). Falls back to 'en'.
+function currentLocale(): string {
+  return i18n.language || 'en'
+}
+
+// Sidebar conversation page size. Kept at the server default so users with ≤200
+// conversations load everything up front (no behaviour change); heavier users
+// page in older conversations on scroll via loadMore().
+const CONV_PAGE = envNum('VITE_AIVORY_CONV_PAGE', 200)
+
+// Server-side pagination cursor for the sidebar list. Tracked separately from the
+// cache size so that conversations PREPENDED out-of-order (loadOne of an old chat
+// opened by URL/search, createConversation, fork) can't corrupt the offset and
+// make loadMore skip a real server row. Only ever advances by the number of rows
+// the paged list endpoint actually returned.
+let convServerOffset = 0
+// Monotonic token identifying which space the in-flight list requests belong to.
+let convLoadEpoch = 0
+
+interface KnowledgeBaseSelectionSync {
+  tail: Promise<void>
+  committed: string[]
+  revision: number
+  pending: boolean
+}
+
+export interface KnowledgeBaseSelectionRequestGuard {
+  revision: number
+  pending: boolean
+}
+
+// KB selection is persisted by a separate conversation PATCH. Keep changes for
+// one conversation in click order so a slow earlier request cannot overwrite a
+// later selection. `committed` is the last server-confirmed value and is used for
+// a field-only rollback; restoring an old whole-store snapshot could otherwise
+// erase messages that were appended while the PATCH was in flight.
+const knowledgeBaseSelectionSync = new Map<string, KnowledgeBaseSelectionSync>()
+
+export function captureKnowledgeBaseSelectionGuard(
+  conversationId: string,
+): KnowledgeBaseSelectionRequestGuard {
+  const sync = knowledgeBaseSelectionSync.get(conversationId)
+  return { revision: sync?.revision ?? 0, pending: sync?.pending ?? false }
+}
+
+function captureKnowledgeBaseSelectionGuards(
+  conversations: Conversation[],
+): Map<string, KnowledgeBaseSelectionRequestGuard> {
+  return new Map(
+    conversations.map((conversation) => [
+      conversation.id,
+      captureKnowledgeBaseSelectionGuard(conversation.id),
+    ]),
+  )
+}
+
+// Exported for realtime/list reconciliation. A response that was issued before
+// the user's latest KB click must not overwrite the optimistic selection while
+// its ordered PATCH queue is still active.
+export function preservePendingKnowledgeBaseSelection(
+  incoming: Conversation,
+  current: Conversation | undefined,
+  requestGuard?: KnowledgeBaseSelectionRequestGuard,
+): Conversation {
+  const sync = knowledgeBaseSelectionSync.get(incoming.id)
+  const requestPredatesSelection = Boolean(
+    requestGuard &&
+      (requestGuard.pending || (sync?.revision ?? 0) !== requestGuard.revision),
+  )
+  if (!current || (!sync?.pending && !requestPredatesSelection)) return incoming
+  return { ...incoming, kbIds: [...(current.kbIds ?? [])] }
+}
+
+// Realtime notifications are intentionally best-effort. A title task can finish
+// after the answer stream and its thin conversation.updated event can be missed
+// during a reconnect, leaving the optimistic first-message title on screen until
+// refresh. Reconcile only while that deterministic fallback is still visible;
+// the staggered attempts stop immediately once realtime (or a manual rename) has
+// already supplied a different server-authoritative title.
+const TITLE_RECONCILE_DELAYS_MS = [1000, 2000, 4000, 8000, 15000]
+const titleReconcileGeneration = new Map<string, number>()
+
+function deterministicServerTitle(text: string): string {
+  return Array.from(mathContentToPlainText(text).replace(/\s+/g, ' ').trim()).slice(0, 28).join('')
+}
+
+function scheduleGeneratedTitleReconcile(
+  conversationId: string,
+  fallbackTitle: string,
+  optimisticTitle: string,
+): void {
+  if (!conversationId || !fallbackTitle) return
+  const pendingTitles = new Set(
+    [fallbackTitle, optimisticTitle].map((title) => title.trim()).filter(Boolean),
+  )
+  const generation = (titleReconcileGeneration.get(conversationId) ?? 0) + 1
+  titleReconcileGeneration.set(conversationId, generation)
+  let attemptIndex = 0
+
+  const stop = () => {
+    if (titleReconcileGeneration.get(conversationId) === generation) {
+      titleReconcileGeneration.delete(conversationId)
+    }
+  }
+
+  const scheduleNext = () => {
+    if (attemptIndex >= TITLE_RECONCILE_DELAYS_MS.length) {
+      stop()
+      return
+    }
+    const delay = TITLE_RECONCILE_DELAYS_MS[attemptIndex]
+    attemptIndex += 1
+    setTimeout(() => void attempt(), delay)
+  }
+
+  const attempt = async () => {
+    if (titleReconcileGeneration.get(conversationId) !== generation) return
+    const current = useConversations.getState().conversations.find((c) => c.id === conversationId)
+    if (!current) {
+      stop()
+      return
+    }
+    // Realtime already landed the generated title, or the user renamed it.
+    if (current.title.trim() && !pendingTitles.has(current.title.trim())) {
+      stop()
+      return
+    }
+    try {
+      const resp = await conversationsApi.get(conversationId, { limit: 1 })
+      if (titleReconcileGeneration.get(conversationId) !== generation) return
+      const title = resp.conversation.title.trim()
+      const generated = Boolean(title && !pendingTitles.has(title))
+      const finalAttempt = attemptIndex >= TITLE_RECONCILE_DELAYS_MS.length
+      if (generated || (finalAttempt && title)) {
+        useConversations.setState((state) => ({
+          conversations: state.conversations.map((conversation) =>
+            conversation.id === conversationId ? { ...conversation, title } : conversation,
+          ),
+        }))
+      }
+      if (generated || finalAttempt) {
+        stop()
+        return
+      }
+    } catch {
+      // A transient fetch failure should not defeat later reconciliation. A
+      // deleted conversation disappears from local state and stops on next pass.
+    }
+    scheduleNext()
+  }
+
+  scheduleNext()
+}
+
+// Messages per page when opening a conversation. A bit above the render window
+// (INITIAL_WINDOW=24) so the first screen is full with a little buffer; older
+// pages are fetched on scroll-up via loadOlderMessages().
+export const MSG_PAGE = envNum('VITE_AIVORY_MSG_PAGE', 40)
+
+interface ConversationStore {
+  conversations: Conversation[]
+  loaded: boolean
+  loading: boolean
+  /** True while a loadMore() page is in flight. */
+  loadingMore: boolean
+  /** True when the server reported more conversations beyond what's loaded. */
+  hasMore: boolean
+  error: string | null
+
+  load: () => Promise<void>
+  /** Append the next page of (older) conversations — sidebar infinite scroll. */
+  loadMore: () => Promise<void>
+  /** Load active conversation summaries for one project and merge them into the
+   * shared cache without replacing the ordinary sidebar page or hydrated
+   * transcripts. Project conversations are intentionally excluded from load(). */
+  loadProjectConversations: (projectId: string) => Promise<boolean>
+  /** Load a conversation. By default only the latest page of messages is
+   *  fetched (older loaded on scroll); pass {full:true} to load the whole active
+   *  path up front (used when jumping to a specific message). */
+  loadOne: (id: string, opts?: { full?: boolean }) => Promise<Conversation | undefined>
+  /** Prepend the next older page of messages to a conversation (scroll-up). */
+  loadOlderMessages: (id: string) => Promise<void>
+
+  createConversation: (modelId?: string, projectId?: string, fast?: boolean) => Promise<Conversation>
+  /** Insert a conversation created OUTSIDE the store (the home page's
+   *  attachment-scoped draft, kept off the sidebar until first send). */
+  adoptConversation: (row: ApiConversation) => Conversation
+  deleteConversation: (id: string) => Promise<void>
+  renameConversation: (id: string, title: string) => Promise<boolean>
+  /** Change a workspace conversation's creator-controlled visibility. */
+  setConversationPublic: (id: string, isPublic: boolean) => Promise<boolean>
+  togglePin: (id: string) => Promise<void>
+  toggleStar: (id: string) => Promise<void>
+  archiveConversation: (id: string) => Promise<void>
+  unarchiveConversation: (id: string) => Promise<void>
+  /** Fetch the user's archived conversations (NOT merged into the active cache). */
+  loadArchived: () => Promise<Conversation[]>
+  setProject: (id: string, projectId: string | undefined) => Promise<void>
+  setActiveLeaf: (id: string, leafId: string) => Promise<void>
+  fork: (id: string, leafId?: string, title?: string) => Promise<Conversation | null>
+  /** Fetch the inline (text-selection) sub-conversations anchored to a source
+   *  conversation and merge them into the cache (flagged `inline`, hidden from
+   *  the sidebar). Drives the inline-thread markers on messages. */
+  loadInlineThreads: (sourceConvId: string) => Promise<void>
+  /** Create a new inline sub-conversation anchored to a quoted excerpt of a
+   *  message, returning the child conversation (already in the cache). */
+  createInlineThread: (sourceConvId: string, messageId: string, quote: string) => Promise<Conversation | undefined>
+  /** Re-fetch the canonical active-path (enriched with sibling metadata) and
+   *  swap it into the cache. Called after a stream completes so branch pickers
+   *  appear and optimistic flat-append siblings collapse into the tree (§4.15). */
+  reloadActivePath: (id: string) => Promise<void>
+  setModel: (id: string, modelId: string) => Promise<void>
+  /** §fast-mode: toggle the 快速/进阶 selection for a conversation. */
+  setFast: (id: string, fast: boolean) => Promise<void>
+  /** Bind knowledge bases to the conversation (§7.2-7 composer 📚 selector). */
+  setKBs: (id: string, kbIds: string[]) => Promise<void>
+
+  // Streaming
+  sendMessage: (input: {
+    conversationId: string
+    text: string
+    modelId?: string
+    attachments?: Attachment[]
+    parentId?: string
+    params?: Record<string, unknown>
+    /** True when this message opens a NEW branch (edit-a-past-question, §4.15).
+     *  The optimistic update then truncates the visible path to `parentId`
+     *  before appending, instead of stacking onto the active leaf. */
+    branch?: boolean
+    /** Alternate turn pipeline: 'deep-research' runs the research engine. */
+    mode?: 'default' | 'deep-research' | 'canvas'
+    /** §4.20 image mode: selected style id, sent for an image-model turn. */
+    imageStyleId?: string
+    /** Direct image-model turns only: whether to run the prompt optimizer. */
+    optimizeImagePrompt?: boolean
+    /** §verify: enable Verify mode for this turn (a second model audits the answer). */
+    verify?: boolean
+    /** Per-turn tool policy. Missing legacy/internal callers normalize to auto;
+     *  the SSE request always serializes the resolved value explicitly. */
+    toolMode?: ToolMode
+    /** §4.4-B: forced non-tool web search (only meaningful in disabled mode). */
+    webSearch?: boolean
+    /** User-owned skill ids selected explicitly for this turn. */
+    selectedUserSkillIds?: string[]
+    /** Explicit candidate subset; undefined means every available tool. */
+    selectedToolIds?: string[]
+    /** §fast-mode: run this turn in fast mode (model resolved server-side + masked;
+     *  verify/DR forced off; fixed enabled policy, quartered budget, no Python). */
+    fast?: boolean
+    /** Home "instant send": the conversation is an OPTIMISTIC local placeholder
+     *  (temp id) — create the real one server-side FIRST, re-key the cache to
+     *  its id, then stream. Lets the home page navigate to the thread the moment
+     *  the user hits send instead of waiting on the create round-trip. */
+    createFirst?: boolean
+    /** Default model for a newly-created conversation when this turn deliberately
+     *  uses a different one, e.g. one-off image editing. */
+    conversationModelId?: string
+    /** One-off turn model must not replace the conversation's default model. */
+    preserveConversationModel?: boolean
+    /** Optional server conversation already reserved by the home composer for
+     *  attachment ownership. It is awaited only after the optimistic turn is
+     *  visible; undefined falls back to the normal create request. */
+    preparedConversation?: Promise<ApiConversation | undefined>
+    /** Fires with the real conversation id once `createFirst` has created it, so
+     *  the caller can swap the temp id in the URL (navigate replace). */
+    onConversationId?: (realId: string) => void
+  }) => Promise<void>
+  /** Insert an OPTIMISTIC (client-only, temp id) conversation so the home page
+   *  can navigate to its thread instantly; the real one is created on send via
+   *  sendMessage({ createFirst }). Returns the temp id. */
+  beginOptimisticConversation: (
+    text: string,
+    modelId?: string,
+    fast?: boolean,
+    kbIds?: string[],
+  ) => string
+  regenerate: (conversationId: string, assistantId: string, modelId?: string) => Promise<void>
+  resumeStreamingMessages: (conversationId: string, opts?: { replaceExisting?: boolean }) => void
+  /** Edit a user question or assistant reply IN PLACE. User questions may be
+   *  regenerated by the caller; assistant replies are a plain Markdown overwrite. */
+  editMessageInPlace: (conversationId: string, messageId: string, text: string) => Promise<void>
+  setFeedback: (conversationId: string, messageId: string, input: MessageFeedbackInput) => Promise<void>
+  /** Delete the whole round (user message + all its assistant answers) that the
+   *  given message belongs to. Branch-safe: earlier/later turns and sibling
+   *  branches are preserved (§ message deletion). */
+  deleteMessage: (conversationId: string, messageId: string) => Promise<void>
+  abortStream: (assistantMessageId: string) => void
+
+  getConversation: (id: string) => Conversation | undefined
+}
+
+const streamControllers = new Map<string, AbortController>()
+// A live request starts with a client generation id so Stop works even before
+// message_start assigns a persisted assistant id. Keep aliases while re-keying;
+// replayed streams after refresh fall back to message_id targeting instead.
+const streamGenerationIds = new Map<string, string>()
+// Controller aliases can change at message_start. Keep the owning conversation
+// alongside each live alias so a click from a just-replaced row can still route
+// Stop to the real conversation during the React re-key window.
+const streamConversationIds = new Map<string, string>()
+// A replay takeover deliberately aborts an existing POST reader. Track that by
+// controller identity, not message-id aliases: id markers can survive a replay
+// takeover and incorrectly swallow a later, genuine user stop.
+const streamHandoffs = new WeakSet<AbortController>()
+// Exact ids generated for optimistic message rows. This is intentionally an
+// explicit registry rather than a prefix test: imported/server ids are opaque
+// and may legally resemble `uid('m')` output.
+const generatedLocalMessageIds = new Set<string>()
+// Home-first conversations exist only in the client until sendMessage's
+// createFirst path receives the server row. Conversation mutations made in
+// that window must stay local and be replayed after the temp id is re-keyed.
+const optimisticConversationIds = new Set<string>()
+
+// Exported for the composer: an optimistic new-chat temp id has NO server row
+// yet, so draft-file endpoints 404 for it. The draft restore must be skipped
+// while such a conversation is mounted (the real id is installed at send).
+export function isOptimisticConversationId(id: string): boolean {
+  return optimisticConversationIds.has(id)
+}
+
+// A POST generation is intentionally detached on the server so it can finish
+// after a phone changes network, locks the screen, or the browser drops the
+// response body. Once message_start has given us the persisted assistant id,
+// transfer a broken/ended POST reader to the replayable GET stream instead of
+// presenting a false generation failure while the backend is still working.
+function beginMessageStreamReplay(
+  set: (fn: (state: ConversationStore) => Partial<ConversationStore>) => void,
+  get: () => ConversationStore,
+  conversationId: string,
+  assistantId: string,
+  previousController: AbortController,
+): void {
+  const current = streamControllers.get(assistantId)
+  // A route hydration or another recovery path may already own the replay.
+  if (current && current !== previousController) return
+
+  const replayAbort = new AbortController()
+  streamControllers.set(assistantId, replayAbort)
+  streamConversationIds.set(assistantId, conversationId)
+  void consumeReplayStream(set, get, conversationId, assistantId, replayAbort).finally(() => {
+    if (streamControllers.get(assistantId) === replayAbort) {
+      streamControllers.delete(assistantId)
+    }
+    if (
+      !streamControllers.has(assistantId) &&
+      streamConversationIds.get(assistantId) === conversationId
+    ) {
+      streamConversationIds.delete(assistantId)
+    }
+  })
+}
+
+// An explicit stop can abort the POST reader before its `message_start` frame
+// reaches the browser even though the backend is still committing the stopped
+// turn. Keep one bounded canonical-path reconcile per conversation. A following
+// send waits for it, so no stale optimistic tree reference can escape on the
+// wire while the stop and persistence paths are converging.
+const stoppedPathReconciles = new Map<string, Promise<void>>()
+const stoppedPathReconcileEpochs = new Map<string, number>()
+const STOPPED_PATH_RETRY_DELAYS_MS = [0, 50, 125, 250, 500, 1000] as const
+
+interface StoppedPathBarrier {
+  promise: Promise<void>
+  resolve: () => void
+  pending: number
+}
+
+// Registered synchronously by abortStream, before AbortController dispatches
+// its event. This closes the microtask-sized race where the user could submit a
+// second turn before the first stream's catch installed its reconcile promise.
+const stoppedPathBarriers = new Map<string, StoppedPathBarrier>()
+
+function registerStoppedPathBarrier(conversationId: string): void {
+  const existing = stoppedPathBarriers.get(conversationId)
+  if (existing) {
+    existing.pending++
+    return
+  }
+  let resolve = () => {}
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  stoppedPathBarriers.set(conversationId, { promise, resolve, pending: 1 })
+}
+
+function finishStoppedPathBarrier(conversationId: string): void {
+  const barrier = stoppedPathBarriers.get(conversationId)
+  if (!barrier) return
+  barrier.pending--
+  if (barrier.pending > 0) return
+  stoppedPathBarriers.delete(conversationId)
+  barrier.resolve()
+}
+
+function moveStoppedPathBarrier(fromConversationId: string, toConversationId: string): void {
+  if (fromConversationId === toConversationId) return
+  const barrier = stoppedPathBarriers.get(fromConversationId)
+  if (!barrier) return
+  stoppedPathBarriers.delete(fromConversationId)
+  stoppedPathBarriers.set(toConversationId, barrier)
+}
+
+function pendingStoppedPathWork(conversationId: string): Promise<void> | undefined {
+  return stoppedPathBarriers.get(conversationId)?.promise ?? stoppedPathReconciles.get(conversationId)
+}
+
+function pruneGeneratedLocalMessageIds(conversations: Conversation[]): void {
+  const referenced = new Set<string>()
+  for (const conversation of conversations) {
+    for (const message of conversation.messages) {
+      if (message.localOnly) referenced.add(message.id)
+      for (const siblingId of message.siblings ?? []) referenced.add(siblingId)
+    }
+  }
+  for (const id of generatedLocalMessageIds) {
+    if (!referenced.has(id)) generatedLocalMessageIds.delete(id)
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function createGenerationId(): string {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  return `gen_${Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')}`
+}
+
+function previousPersistedLeaf(messages: readonly Message[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const id = persistedMessageReference(messages, messages[i].id, generatedLocalMessageIds)
+    if (id) return id
+  }
+  return undefined
+}
+
+// If every canonical fetch fails, remove the optimistic suffix instead of
+// leaving ids that can later become parent_id / leaf_id references. The server
+// remains authoritative and the next successful load restores the stopped turn.
+function withoutLocalOnlySuffix(messages: readonly Message[]): Message[] {
+  const firstLocal = messages.findIndex((message) => message.localOnly)
+  const kept = firstLocal >= 0 ? messages.slice(0, firstLocal) : messages.slice()
+  return kept.map((message) => ({ ...message, streaming: false, imageStatus: undefined }))
+}
+
+function scheduleStoppedPathReconcile(
+  set: (fn: (state: ConversationStore) => Partial<ConversationStore>) => void,
+  get: () => ConversationStore,
+  conversationId: string,
+  options: { previousLeaf?: string; expectedAssistantId?: string },
+): Promise<void> {
+  const epoch = (stoppedPathReconcileEpochs.get(conversationId) ?? 0) + 1
+  stoppedPathReconcileEpochs.set(conversationId, epoch)
+
+  const task = (async () => {
+    for (let attempt = 0; attempt < STOPPED_PATH_RETRY_DELAYS_MS.length; attempt++) {
+      const delay = STOPPED_PATH_RETRY_DELAYS_MS[attempt]
+      if (delay > 0) await sleep(delay)
+      if (stoppedPathReconcileEpochs.get(conversationId) !== epoch) return
+
+      const current = get().conversations.find((conversation) => conversation.id === conversationId)
+      if (!current) return
+      // A newer send/regeneration owns the visible path. Never let an older stop
+      // reconcile overwrite it; normal sends wait on this task before starting.
+      if (current.messages.some((message) => message.streaming)) return
+
+      try {
+        const resp = await conversationsApi.get(conversationId, { limit: MSG_PAGE })
+        if (stoppedPathReconcileEpochs.get(conversationId) !== epoch) return
+        const latest = get().conversations.find((conversation) => conversation.id === conversationId)
+        if (!latest || latest.messages.some((message) => message.streaming)) return
+
+        const serverStillStreaming = resp.messages.some((message) => message.status === 'streaming')
+        const messages = resp.messages.map((message) => ({
+          ...toLocalMessage(message),
+          streaming: false,
+          imageStatus: undefined,
+        }))
+        const responseLeaf = resp.conversation.active_leaf_id || messages[messages.length - 1]?.id
+        const stoppedTurnVisible = options.expectedAssistantId
+          ? messages.some((message) => message.id === options.expectedAssistantId)
+          : Boolean(responseLeaf && responseLeaf !== options.previousLeaf)
+
+        // A stop is terminal from the user's point of view. Until the server has
+        // both settled and returned the exact stopped turn, preserve the local
+        // stopped row. Applying an early `status=streaming` snapshot as
+        // `streaming:false` would recreate the empty, actionless bubble this
+        // reconciliation exists to eliminate; an old-leaf snapshot could remove
+        // the stopped turn altogether.
+        if (serverStillStreaming || !stoppedTurnVisible) continue
+
+        set((state) => ({
+          conversations: state.conversations.map((conversation) =>
+            conversation.id !== conversationId
+              ? conversation
+              : {
+                  ...conversation,
+                  title: resp.conversation.title || conversation.title,
+                  updatedAt: resp.conversation.updated_at
+                    ? resp.conversation.updated_at * 1000
+                    : conversation.updatedAt,
+                  messages,
+                  hasOlder: Boolean(resp.has_more),
+                  olderCursor: resp.next_before,
+                },
+          ),
+        }))
+        pruneGeneratedLocalMessageIds(get().conversations)
+        return
+      } catch {
+        // Stop reconciliation is best effort per attempt; the bounded loop below
+        // removes unsafe optimistic ids even if every network request fails.
+      }
+    }
+
+    // Even successful GETs can repeatedly return the pre-stop leaf while the
+    // detached handler is still settling. On exhaustion, unconditionally strip
+    // any remaining optimistic suffix so later actions cannot serialize it.
+    if (stoppedPathReconcileEpochs.get(conversationId) === epoch) {
+      set((state) => ({
+        conversations: state.conversations.map((conversation) =>
+          conversation.id === conversationId
+            ? { ...conversation, messages: withoutLocalOnlySuffix(conversation.messages) }
+            : conversation,
+        ),
+      }))
+      pruneGeneratedLocalMessageIds(get().conversations)
+    }
+  })()
+
+  stoppedPathReconciles.set(conversationId, task)
+  void task.finally(() => {
+    if (stoppedPathReconciles.get(conversationId) === task) {
+      stoppedPathReconciles.delete(conversationId)
+      if (stoppedPathReconcileEpochs.get(conversationId) === epoch) {
+        stoppedPathReconcileEpochs.delete(conversationId)
+      }
+    }
+  })
+  return task
+}
+
+// Stop every in-progress generation in a conversation: tell the backend to
+// halt (so partial output is persisted) and abort the local SSE readers. Used
+// when the user abandons the current branch — editing a past turn into a new
+// branch, or switching to a different branch — so the old stream can't keep
+// running invisibly and its late completion can't clobber the new active leaf.
+function stopConversationStreams(convId: string, messages: Message[]): void {
+  const live = messages.filter((m) => m.streaming)
+  if (live.length === 0) return
+  void conversationsApi.stop(convId).catch(() => {})
+  for (const m of live) {
+    streamControllers.get(m.id)?.abort()
+    streamControllers.get(m.id + '-regen')?.abort()
+  }
+}
+
+export const useConversations = createWithEqualityFn<ConversationStore>((set, get) => ({
+  conversations: [],
+  loaded: false,
+  loading: false,
+  loadingMore: false,
+  hasMore: false,
+  error: null,
+
+  async load() {
+    // §workspaces: every load belongs to the space it was ISSUED for. A switch
+    // mid-flight bumps the epoch, so (a) a fresh load is never silently dropped
+    // because a stale one is still in flight, and (b) a stale response can never
+    // overwrite the new space's list.
+    const ws = activeWorkspaceId()
+    const epoch = ++convLoadEpoch
+    const kbSelectionGuards = captureKnowledgeBaseSelectionGuards(get().conversations)
+    set({ loading: true, error: null })
+    try {
+      const { conversations: rows, has_more } = await conversationsApi.list(undefined, CONV_PAGE, 0, ws)
+      if (epoch !== convLoadEpoch) return // superseded by a workspace switch
+      const conversations = rows.map(toLocalConversation)
+      convServerOffset = rows.length
+      set((s) => ({
+        conversations: mergeStreamingSummaries(
+          s.conversations,
+          conversations,
+          kbSelectionGuards,
+        ),
+        loaded: true,
+        loading: false,
+        hasMore: has_more,
+      }))
+    } catch (e) {
+      if (epoch !== convLoadEpoch) return
+      set({ error: errorMessage(e, 'Failed to load conversations'), loading: false })
+    }
+  },
+
+  async loadMore() {
+    const { loading, loadingMore, hasMore } = get()
+    if (loading || loadingMore || !hasMore) return
+    const ws = activeWorkspaceId()
+    const epoch = convLoadEpoch
+    set({ loadingMore: true })
+    try {
+      // Page from the tracked server cursor (NOT the cache size), so out-of-order
+      // prepends can't skip a real row. Advance the cursor by the rows the server
+      // returned; the `seen` filter only de-dupes what we add to the cache.
+      const { conversations: rows, has_more } = await conversationsApi.list(undefined, CONV_PAGE, convServerOffset, ws)
+      if (epoch !== convLoadEpoch) {
+        // A workspace switch landed while this page was in flight — its rows
+        // belong to the OLD space; appending them would corrupt the new list.
+        set({ loadingMore: false })
+        return
+      }
+      convServerOffset += rows.length
+      set((s) => {
+        const seen = new Set(s.conversations.map((c) => c.id))
+        const fresh = rows.map(toLocalConversation).filter((c) => !seen.has(c.id))
+        return { conversations: [...s.conversations, ...fresh], loadingMore: false, hasMore: has_more }
+      })
+    } catch {
+      set({ loadingMore: false })
+    }
+  },
+
+  async loadProjectConversations(projectId) {
+    const normalizedProjectId = projectId.trim()
+    if (!normalizedProjectId) return false
+    const ws = activeWorkspaceId()
+    const kbSelectionGuards = captureKnowledgeBaseSelectionGuards(get().conversations)
+    try {
+      const { conversations: rows } = await conversationsApi.list(
+        normalizedProjectId,
+        envNum('VITE_AIVORY_PROJECT_CONVERSATIONS_API_LIST_LIMIT', 500),
+        0,
+        ws,
+      )
+      // A workspace switch can finish while this project request is in flight.
+      // Its rows must never leak into the newly active space.
+      if (activeWorkspaceId() !== ws) return false
+      const incoming = mergeStreamingSummaries(
+        get().conversations,
+        rows.map(toLocalConversation),
+        kbSelectionGuards,
+      )
+      set((state) => {
+        let conversations = state.conversations
+        // replaceOrPrepend prepends new rows; reverse iteration preserves the
+        // API's newest-first ordering before the sidebar applies its own sort.
+        for (const conversation of incoming.slice().reverse()) {
+          conversations = replaceOrPrepend(conversations, conversation)
+        }
+        return { conversations }
+      })
+      return true
+    } catch {
+      return false
+    }
+  },
+
+  async loadOne(id, opts) {
+    if (optimisticConversationIds.has(id)) {
+      return get().conversations.find((conversation) => conversation.id === id)
+    }
+    try {
+      const kbSelectionGuard = captureKnowledgeBaseSelectionGuard(id)
+      const hadStreaming = Boolean(
+        get()
+          .conversations.find((c) => c.id === id)
+          ?.messages.some((m) => m.streaming),
+      )
+      // Paginate by default (latest MSG_PAGE messages); load the whole path when
+      // a caller needs every message present up front (e.g. jump-to-message).
+      const resp = await conversationsApi.get(id, opts?.full ? undefined : { limit: MSG_PAGE })
+      const conv = toLocalConversation(resp.conversation)
+      conv.messages = resp.messages.map(toLocalMessage)
+      conv.hasOlder = !opts?.full && Boolean(resp.has_more)
+      conv.olderCursor = resp.next_before
+      set((s) => {
+        // Guard against a race where sendMessage already optimistically
+        // appended messages (including a streaming assistant placeholder)
+        // before loadOne's response arrives. If the local copy has any
+        // streaming message, keep the local messages — they're more
+        // up-to-date than what the backend returned.
+        const existing = s.conversations.find((c) => c.id === id)
+        // A newly opened thread can start loading while its first submit is
+        // still being persisted. If that turn fails quickly (especially an
+        // image-provider failure), its assistant placeholder becomes terminal
+        // before this stale empty response returns. Keep the locally observed
+        // messages whenever the response has fewer rows, rather than only while
+        // a message is still streaming, so the failure turn is not replaced by
+        // an apparently empty conversation.
+        if (
+          existing &&
+          existing.messages.length > 0 &&
+          (existing.messages.some((m) => m.streaming) || conv.messages.length < existing.messages.length)
+        ) {
+          // Merge metadata (title, modelId, etc.) but keep local messages +
+          // whatever pagination state the local copy already had.
+          const merged: Conversation = {
+            ...conv,
+            // Preserve the optimistic turn-start bump while a stream is live.
+            // A stale loadOne response can otherwise move the conversation back
+            // into an older sidebar date bucket until post-stream reconciliation.
+            updatedAt: Math.max(existing.updatedAt, conv.updatedAt),
+            // Keep the optimistic first-message title if the backend hasn't
+            // committed its own (clip/model) title yet — don't flash back to blank.
+            title: conv.title || existing.title,
+            messages: existing.messages,
+            lastParams: existing.lastParams,
+            hasOlder: existing.hasOlder,
+            olderCursor: existing.olderCursor,
+          }
+          return {
+            conversations: replaceOrPrepend(
+              s.conversations,
+              merged,
+              kbSelectionGuard,
+            ),
+          }
+        }
+        return {
+          conversations: replaceOrPrepend(s.conversations, conv, kbSelectionGuard),
+        }
+      })
+      if (!hadStreaming) get().resumeStreamingMessages(id)
+      return conv
+    } catch {
+      return undefined
+    }
+  },
+
+  async loadOlderMessages(id) {
+    const c = get().conversations.find((cv) => cv.id === id)
+    if (!c || !c.hasOlder || !c.olderCursor) return
+    try {
+      const resp = await conversationsApi.get(id, { limit: MSG_PAGE, before: c.olderCursor })
+      const older = resp.messages.map(toLocalMessage)
+      set((s) => ({
+        conversations: s.conversations.map((cv) => {
+          if (cv.id !== id) return cv
+          // Prepend, de-duping against what we already hold (a concurrent
+          // reconcile could have re-added some).
+          const seen = new Set(cv.messages.map((m) => m.id))
+          const fresh = older.filter((m) => !seen.has(m.id))
+          return {
+            ...cv,
+            messages: [...fresh, ...cv.messages],
+            hasOlder: Boolean(resp.has_more),
+            olderCursor: resp.next_before,
+          }
+        }),
+      }))
+    } catch {
+      /* non-fatal: older messages just stay unloaded */
+    }
+  },
+
+  async createConversation(modelId, projectId, fast) {
+    const models = useModels.getState()
+    const resolvedModelId = modelId || models.defaultId
+    const resolvedFast =
+      fast ??
+      (models.loaded
+        ? resolveNewConversationFastMode(
+            useAuth.getState().user?.settings,
+            models.fastAvailable,
+            Boolean(modelId),
+          )
+        : undefined)
+    try {
+      const created = await conversationsApi.create({
+        model_id: resolvedModelId || undefined,
+        project_id: projectId,
+        workspace_id: activeWorkspaceId(),
+        fast: resolvedFast,
+      })
+      const conv = toLocalConversation(created)
+      // replaceOrPrepend, not a raw prepend: a §23 background list sync may
+      // have inserted this row already (duplicate-id guard).
+      set((s) => ({ conversations: replaceOrPrepend(s.conversations, conv) }))
+      return conv
+    } catch (e) {
+      // Fall back to optimistic local conversation so the UI never blocks.
+      const now = Date.now()
+      const workspaceId = activeWorkspaceId()
+      const workspace = workspaceId
+        ? useWorkspaces.getState().workspaces.find((row) => row.id === workspaceId)
+        : undefined
+      const conv: Conversation = {
+        id: uid('c'),
+        title: 'New conversation',
+        createdAt: now,
+        updatedAt: now,
+        modelId: resolvedModelId,
+        fast: resolvedFast === true,
+        projectId,
+        workspaceId,
+        isPublic: workspaceId ? workspace?.can_private_conversations === false : false,
+        messages: [],
+      }
+      set((s) => ({ conversations: [conv, ...s.conversations], error: errorMessage(e) }))
+      return conv
+    }
+  },
+
+  adoptConversation(row) {
+    const conv = toLocalConversation(row)
+    set((s) => ({ conversations: replaceOrPrepend(s.conversations, conv) }))
+    return conv
+  },
+
+  beginOptimisticConversation(text, modelId, fast, kbIds) {
+    const id = uid('c')
+    optimisticConversationIds.add(id)
+    const now = Date.now()
+    const models = useModels.getState()
+    const resolvedFast =
+      fast ??
+      resolveNewConversationFastMode(
+        useAuth.getState().user?.settings,
+        models.fastAvailable,
+        Boolean(modelId),
+      )
+    const conv: Conversation = {
+      id,
+      // Seed the first-message title so the sidebar/header read right instantly;
+      // the backend's clip/title model overwrites it after the turn settles.
+      title: text.replace(/\s+/g, ' ').trim().slice(0, 60) || 'New conversation',
+      createdAt: now,
+      updatedAt: now,
+      modelId: modelId ?? '',
+      fast: resolvedFast,
+      kbIds: Array.from(new Set((kbIds ?? []).map((kbId) => kbId.trim()).filter(Boolean))),
+      // Tag the active space so the sidebar (which filters by workspace) shows
+      // the new chat immediately; the create + re-key confirms it server-side.
+      workspaceId: activeWorkspaceId() || undefined,
+      isPublic: (() => {
+        const workspaceId = activeWorkspaceId()
+        if (!workspaceId) return false
+        return useWorkspaces.getState().workspaces.find((row) => row.id === workspaceId)?.can_private_conversations === false
+      })(),
+      messages: [],
+    }
+    set((s) => ({ conversations: [conv, ...s.conversations] }))
+    return id
+  },
+
+  async deleteConversation(id) {
+    const prevConversations = get().conversations
+    // Remove the conversation and every inline sub-conversation transitively
+    // anchored to it, mirroring the backend cascade so markers/drawers for the
+    // doomed sub-threads vanish immediately. Tombstoning the ids keeps a §23
+    // background list sync that was already in flight (fetched pre-delete)
+    // from resurrecting the rows when its stale response merges.
+    const doomed = collectDoomedConversationIds(prevConversations, id)
+    markConversationsDeleted(doomed)
+    set((s) => ({ conversations: s.conversations.filter((c) => !doomed.has(c.id)) }))
+    try {
+      await conversationsApi.remove(id)
+    } catch (e) {
+      unmarkConversationsDeleted(doomed)
+      set({ conversations: prevConversations })
+      toast.error(errorMessage(e, 'Failed to delete conversation'))
+    }
+  },
+
+  async renameConversation(id, title) {
+    const prevConversations = get().conversations
+    set((s) => ({
+      conversations: s.conversations.map((c) =>
+        c.id === id ? { ...c, title: title.trim() || c.title, updatedAt: Date.now() } : c,
+      ),
+    }))
+    try {
+      const row = await conversationsApi.update(id, { title })
+      // Re-assert the committed value: a §23 background list sync fetched
+      // before this PATCH but merged after it may have clobbered the
+      // optimistic title, and the tab's own change event is echo-suppressed.
+      set((s) => ({
+        conversations: s.conversations.map((c) => (c.id === id ? { ...c, title: row.title || c.title } : c)),
+      }))
+      return true
+    } catch (e) {
+      set({ conversations: prevConversations })
+      toast.error(errorMessage(e, 'Failed to rename conversation'))
+      return false
+    }
+  },
+
+  async setConversationPublic(id, isPublic) {
+    try {
+      const row = await conversationsApi.update(id, { is_public: isPublic })
+      const committed = toLocalConversation(row)
+      set((s) => ({
+        conversations: s.conversations.map((conversation) =>
+          conversation.id === id
+            ? {
+                ...committed,
+                messages: conversation.messages,
+                lastParams: conversation.lastParams,
+                hasOlder: conversation.hasOlder,
+                olderCursor: conversation.olderCursor,
+              }
+            : conversation,
+        ),
+      }))
+      return true
+    } catch {
+      return false
+    }
+  },
+
+  async togglePin(id) {
+    const target = get().conversations.find((c) => c.id === id)
+    const next = !target?.pinned
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, pinned: next } : c)),
+    }))
+    try {
+      const row = await conversationsApi.update(id, { pinned: next })
+      set((s) => ({
+        conversations: s.conversations.map((c) => (c.id === id ? { ...c, pinned: row.pinned } : c)),
+      }))
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to update pin'))
+    }
+  },
+
+  async toggleStar(id) {
+    const target = get().conversations.find((c) => c.id === id)
+    const next = !target?.starred
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, starred: next } : c)),
+    }))
+    try {
+      const row = await conversationsApi.update(id, { starred: next })
+      set((s) => ({
+        conversations: s.conversations.map((c) => (c.id === id ? { ...c, starred: row.starred } : c)),
+      }))
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to update star'))
+    }
+  },
+
+  async archiveConversation(id) {
+    const prevConversations = get().conversations
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, archived: true } : c)),
+    }))
+    try {
+      const row = await conversationsApi.update(id, { archived: true })
+      set((s) => ({
+        conversations: s.conversations.map((c) => (c.id === id ? { ...c, archived: row.archived } : c)),
+      }))
+    } catch (e) {
+      set({ conversations: prevConversations })
+      toast.error(errorMessage(e, 'Failed to archive conversation'))
+    }
+  },
+
+  async unarchiveConversation(id) {
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, archived: false } : c)),
+    }))
+    try {
+      await conversationsApi.update(id, { archived: false })
+      // Re-pull the active list so the restored chat reappears in the sidebar.
+      await get().load()
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to unarchive conversation'))
+    }
+  },
+
+  async loadArchived() {
+    try {
+      const { conversations: rows } = await conversationsApi.listArchived()
+      return rows.map(toLocalConversation)
+    } catch {
+      return []
+    }
+  },
+
+  async setProject(id, projectId) {
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, projectId } : c)),
+    }))
+    try {
+      await conversationsApi.update(id, { project_id: projectId ?? '' })
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to update project'))
+    }
+  },
+
+  async setActiveLeaf(id, leafId) {
+    // §4.15 R4: switching branches must NOT interrupt a sibling that is still
+    // generating. The server-side generation is detached (context.WithoutCancel)
+    // and active_leaf is only written at message creation, so a switch can never
+    // clobber it — we deliberately do NOT publish a conversation-wide stop here.
+    // The off-path stream keeps running and is picked up when its branch reopens.
+    const messages = get().conversations.find((conversation) => conversation.id === id)?.messages ?? []
+    // Edit-resend and regenerate temporarily add client-only ids to `siblings`
+    // so the branch picker can render before the SSE `message_start`. The active
+    // leaf endpoint treats an unknown id as a valid leaf, which would persist a
+    // dangling active_leaf_id and make the next message's parent FK fail. Only
+    // block ids explicitly marked local; an unloaded persisted sibling remains
+    // valid even if its string happens to look like one of our generated ids.
+    if (isKnownLocalMessageId(messages, leafId, generatedLocalMessageIds)) return
+    try {
+      const resp = await conversationsApi.setActiveLeaf(id, leafId)
+      const conv = toLocalConversation(resp.conversation)
+      conv.messages = resp.messages.map(toLocalMessage)
+      set((s) => ({ conversations: replaceOrPrepend(s.conversations, conv) }))
+      pruneGeneratedLocalMessageIds(get().conversations)
+      get().resumeStreamingMessages(id, { replaceExisting: true })
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to switch branch'))
+    }
+  },
+
+  async deleteMessage(conversationId, messageId) {
+    // Deleting under a live stream would race the writer — stop it first.
+    const cur = get().conversations.find((c) => c.id === conversationId)
+    stopConversationStreams(conversationId, cur?.messages ?? [])
+    try {
+      const resp = await conversationsApi.deleteMessage(conversationId, messageId)
+      // The response carries the refreshed (full) active path; swap it in and
+      // clear pagination state since everything is loaded.
+      set((s) => ({
+        conversations: s.conversations.map((c) =>
+          c.id === conversationId
+            ? { ...c, messages: resp.messages.map(toLocalMessage), hasOlder: false, olderCursor: undefined }
+            : c,
+        ),
+      }))
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to delete message'))
+    }
+  },
+
+  async fork(id, leafId, title) {
+    try {
+      const created = await conversationsApi.fork(id, { leaf_id: leafId, title })
+      const conv = toLocalConversation(created)
+      set((s) => ({ conversations: [conv, ...s.conversations] }))
+      return conv
+    } catch {
+      return null
+    }
+  },
+
+  async loadInlineThreads(sourceConvId) {
+    if (optimisticConversationIds.has(sourceConvId)) return
+    try {
+      const rows = await conversationsApi.inlineThreads(sourceConvId)
+      const threads = rows.map(toLocalConversation)
+      set((s) => {
+        let list = s.conversations
+        for (const th of threads) {
+          // Preserve already-loaded messages if we have them (drawer may be open).
+          const existing = list.find((c) => c.id === th.id)
+          const merged = existing ? { ...th, messages: existing.messages } : th
+          list = replaceOrPrepend(list, merged)
+        }
+        return { conversations: list }
+      })
+    } catch {
+      // Non-fatal: markers just won't show.
+    }
+  },
+
+  async createInlineThread(sourceConvId, messageId, quote) {
+    try {
+      const created = await conversationsApi.createInlineThread(sourceConvId, {
+        message_id: messageId,
+        quote,
+      })
+      const conv = toLocalConversation(created)
+      set((s) => ({ conversations: [conv, ...s.conversations] }))
+      return conv
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to start sub-conversation'))
+      return undefined
+    }
+  },
+
+  async reloadActivePath(id) {
+    // Never clobber an in-flight stream — only reconcile once nothing in this
+    // conversation is still streaming.
+    const cur = get().conversations.find((c) => c.id === id)
+    if (!cur || cur.messages.some((m) => m.streaming)) return
+    try {
+      // Post-turn reconcile fetches only the LATEST page (the just-finished turn
+      // is at the tail), so the cost is bounded by MSG_PAGE rather than the whole
+      // thread length. Older messages are re-fetched on scroll-up if needed.
+      const resp = await conversationsApi.get(id, { limit: MSG_PAGE })
+      const messages = resp.messages.map(toLocalMessage)
+      set((s) => ({
+        conversations: s.conversations.map((c) =>
+          c.id !== id
+            ? c
+            : {
+                ...c,
+                title: resp.conversation.title || c.title,
+                // Adopt the server's fresh updated_at so a regenerated/edited
+                // conversation rises to the top of the sidebar (the optimistic
+                // path bumps it on send but NOT on regenerate).
+                updatedAt: resp.conversation.updated_at ? resp.conversation.updated_at * 1000 : c.updatedAt,
+                messages,
+                hasOlder: Boolean(resp.has_more),
+                olderCursor: resp.next_before,
+              },
+        ),
+      }))
+      pruneGeneratedLocalMessageIds(get().conversations)
+    } catch {
+      /* keep the optimistic copy if the reconcile fetch fails */
+    }
+  },
+
+  async setModel(id, modelId) {
+    // Picking an advanced model exits fast mode (§fast-mode): the 快速/进阶 picker
+    // is one axis, so choosing a concrete model means 进阶.
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, modelId, fast: false } : c)),
+    }))
+    try {
+      await conversationsApi.update(id, { model_id: modelId, fast: false })
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to update model'))
+    }
+  },
+
+  async setFast(id, fast) {
+    // §fast-mode: pick 快速 (fast=true) — keep the user's advanced modelId so it
+    // restores when they switch back to 进阶.
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, fast } : c)),
+    }))
+    try {
+      await conversationsApi.update(id, { fast })
+    } catch (e) {
+      toast.error(errorMessage(e, 'Failed to update mode'))
+    }
+  },
+
+  async setKBs(id, kbIds) {
+    const desired = Array.from(new Set(kbIds.map((kbId) => kbId.trim()).filter(Boolean)))
+    if (optimisticConversationIds.has(id)) {
+      set((state) => ({
+        conversations: state.conversations.map((conversation) =>
+          conversation.id === id ? { ...conversation, kbIds: desired } : conversation,
+        ),
+      }))
+      return
+    }
+    const current = get().conversations.find((conversation) => conversation.id === id)
+    let sync = knowledgeBaseSelectionSync.get(id)
+    if (!sync) {
+      sync = {
+        tail: Promise.resolve(),
+        committed: [...(current?.kbIds ?? [])],
+        revision: 0,
+        pending: false,
+      }
+      knowledgeBaseSelectionSync.set(id, sync)
+    } else if (!sync.pending) {
+      // A realtime update may have changed the committed selection since this
+      // tab's last mutation. Start a new queue from the value currently shown.
+      sync.committed = [...(current?.kbIds ?? [])]
+    }
+    const revision = ++sync.revision
+    sync.pending = true
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, kbIds: desired } : c)),
+    }))
+    const previous = sync.tail
+    const operation = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const updated = await conversationsApi.update(id, { kb_ids: desired })
+          sync!.committed = [...(updated.kb_ids ?? desired)]
+          if (sync!.revision === revision) {
+            set((state) => ({
+              conversations: state.conversations.map((conversation) =>
+                conversation.id === id
+                  ? { ...conversation, kbIds: [...sync!.committed] }
+                  : conversation,
+              ),
+            }))
+          }
+        } catch (e) {
+          if (sync!.revision === revision) {
+            set((state) => ({
+              conversations: state.conversations.map((conversation) =>
+                conversation.id === id
+                  ? { ...conversation, kbIds: [...sync!.committed] }
+                  : conversation,
+              ),
+            }))
+          }
+          toast.error(errorMessage(e, 'Failed to update knowledge bases'))
+        }
+      })
+      .finally(() => {
+        if (sync!.tail === operation) sync!.pending = false
+      })
+    sync.tail = operation
+    await operation
+  },
+
+  resumeStreamingMessages(conversationId, opts) {
+    const conv = get().conversations.find((c) => c.id === conversationId)
+    if (!conv) return
+    for (const msg of conv.messages) {
+      if (msg.role !== 'assistant' || !msg.streaming) continue
+      // A message still keyed by a known local optimistic id belongs to a send
+      // that started in THIS tab after the caller's snapshot. Its live POST owns
+      // it; a replay GET would 404 and kill the healthy stream. Do not infer this
+      // from an id prefix: imported/server ids are opaque and may legally be m_*.
+      if (isKnownLocalMessageId(conv.messages, msg.id, generatedLocalMessageIds)) continue
+      const existing = streamControllers.get(msg.id) ?? streamControllers.get(msg.id + '-regen')
+      const hasLocalOutput =
+        Boolean(msg.content?.trim()) ||
+        (msg.reasoning?.length ?? 0) > 0 ||
+        (msg.artifacts?.length ?? 0) > 0 ||
+        (msg.citations?.length ?? 0) > 0
+      if (existing) {
+        if (!opts?.replaceExisting && hasLocalOutput) continue
+        streamHandoffs.add(existing)
+        existing.abort()
+        streamControllers.delete(msg.id)
+        streamControllers.delete(msg.id + '-regen')
+      }
+      const abort = new AbortController()
+      streamControllers.set(msg.id, abort)
+      void consumeReplayStream(set, get, conversationId, msg.id, abort).finally(() => {
+        if (streamControllers.get(msg.id) === abort) {
+          streamControllers.delete(msg.id)
+        }
+      })
+    }
+  },
+
+  async sendMessage(input) {
+    for (const attachment of input.attachments ?? []) {
+      if (attachment.id) markFileCommitted(attachment.id)
+    }
+    // Capture selection before any stop/path reconciliation await. The request
+    // carries this exact turn snapshot, so a KB toggle made after Send belongs
+    // to the next turn and a slow conversation PATCH cannot invert the scope.
+    const turnKnowledgeBaseIds = [
+      ...(get().conversations.find((conversation) => conversation.id === input.conversationId)?.kbIds ?? []),
+    ]
+    // A stop may have closed the POST reader before its server ids arrived. Wait
+    // for the bounded canonical-path reconcile before reading the current leaf or
+    // creating another optimistic turn. The composer does not await this action,
+    // so this pauses persistence without blocking the UI thread.
+    const beforeReconcile = get().conversations.find((c) => c.id === input.conversationId)
+    const parentWasLocal = Boolean(
+      input.parentId &&
+        isKnownLocalMessageId(beforeReconcile?.messages ?? [], input.parentId, generatedLocalMessageIds),
+    )
+    const stoppedReconcile = pendingStoppedPathWork(input.conversationId)
+    if (stoppedReconcile) await stoppedReconcile
+
+    // §4.15: an edit-resend creates a sibling branch. Do not stop the existing
+    // branch's stream; stream frames are keyed by assistant message id and can be
+    // replayed when that branch is reopened.
+    const abort = new AbortController()
+    const conv0 = get().conversations.find((c) => c.id === input.conversationId)
+    const optimisticSeedTitle = initialConversationTitle(
+      input.text,
+      input.attachments,
+      i18n.t('chat:imageConversationTitle', { defaultValue: 'Image conversation' }),
+    )
+    const initialTitle = conv0?.title.trim() ?? ''
+    const expectsGeneratedTitle =
+      (conv0?.messages.length ?? 0) === 0 &&
+      (!initialTitle || initialTitle === 'New conversation' || initialTitle === '新对话' || initialTitle === optimisticSeedTitle)
+    const generatedTitleFallback = deterministicServerTitle(optimisticSeedTitle)
+    const requestParentId = persistedMessageReference(
+      conv0?.messages ?? [],
+      parentWasLocal ? undefined : input.parentId,
+      generatedLocalMessageIds,
+    )
+    const explicitParentIsLocal = parentWasLocal || Boolean(input.parentId && !requestParentId)
+    // Omitting a parent on a branch means "root sibling", so silently dropping a
+    // stale local parent would corrupt the tree even though it avoids the FK. Do
+    // not issue the request; the stop reconcile has already refreshed/removed the
+    // unsafe row and a retry will derive the parent from canonical state.
+    if (input.branch && explicitParentIsLocal) {
+      toast.info('Conversation is still syncing. Please try editing again.')
+      return
+    }
+    const persistedLeafBeforeTurn = previousPersistedLeaf(conv0?.messages ?? [])
+    const {
+      toolMode: requestToolMode,
+      webSearch: requestWebSearch,
+    } = resolveToolRequestFlags(input.toolMode, {
+      fast: input.fast,
+      mode: input.mode,
+      webSearch: input.webSearch,
+    })
+    const userId = uid('m')
+    generatedLocalMessageIds.add(userId)
+    const userMsg: Message = {
+      id: userId,
+      localOnly: true,
+      role: 'user',
+      content: input.text,
+      createdAt: Date.now(),
+      attachments: input.attachments,
+      // §workspaces: attribute the optimistic turn to the sender so the shared
+      // bubble renders own-right with the right name before the reconcile.
+      authorId: useAuth.getState().user?.id,
+      authorName: useAuth.getState().user?.name,
+      // Give the optimistic turn a real tree position so it is never parentless
+      // before the post-stream reconcile. A normal append hangs off the current
+      // active leaf (the last message on the visible path); an edit-branch uses
+      // the explicit parent. Closes the §4.15 merge bug at the source (an empty
+      // parentId on a later edit would re-root onto the first message).
+      parentId: input.branch
+        ? requestParentId
+        : persistedMessageReference(
+            conv0?.messages ?? [],
+            conv0?.messages[conv0.messages.length - 1]?.id,
+            generatedLocalMessageIds,
+          ),
+    }
+    const assistantId = uid('m')
+    const generationId = createGenerationId()
+    generatedLocalMessageIds.add(assistantId)
+    const assistantMsg: Message = {
+      id: assistantId,
+      localOnly: true,
+      role: 'assistant',
+      content: '',
+      createdAt: Date.now() + 1,
+      streaming: true,
+      parentId: userId,
+      // §fast-mode: never seed the real model on a fast turn's optimistic bubble
+      // (conv0.modelId is the user's advanced pick, not the hidden fast model) —
+      // mark it fast so the row renders "快速" from first paint.
+      modelId: input.fast ? undefined : input.modelId || conv0?.modelId,
+      fast: input.fast || undefined,
+      mode: input.mode,
+      // §verify: seed a "running" badge so the audit is visible the moment the
+      // answer settles, not only after verify_started arrives.
+      verify: input.verify ? { status: 'running', findings: [] } : undefined,
+    }
+    streamControllers.set(assistantId, abort)
+    streamGenerationIds.set(assistantId, generationId)
+    streamConversationIds.set(assistantId, input.conversationId)
+    // Optimistically update the local cache. For a normal turn we append to the
+    // active leaf; for an edit-branch (§4.15) we truncate the visible path to
+    // the edited message's parent first, so the new question REPLACES the old
+    // sub-tree on screen instead of stacking beneath it.
+    set((s) => ({
+      conversations: s.conversations.map((c) => {
+        if (c.id !== input.conversationId) return c
+        const base = input.branch ? truncateToParent(c.messages, requestParentId) : c.messages
+        // §4.15 R1: editing a past question opens a NEW sibling QUESTION under the
+        // same parent — so the `< n/m >` picker belongs on the USER bubble (the old
+        // question + the new one), NOT on the answer. Seed it optimistically so the
+        // switcher shows under the user bubble the instant we resend
+        // (reloadActivePath later swaps in server truth). The assistant reply is
+        // the SOLE child of the new question, so it gets NO branch metadata — its
+        // switcher must not appear.
+        let uMsg = userMsg
+        if (input.branch) {
+          const oldQs = c.messages.filter(
+            (m) => m.role === 'user' && (requestParentId ? m.parentId === requestParentId : !m.parentId),
+          )
+          const prevSiblings = oldQs.flatMap((q) => (q.siblings && q.siblings.length > 0 ? q.siblings : [q.id]))
+          const uniq = Array.from(new Set(prevSiblings))
+          const prevCount = Math.max(uniq.length, 1)
+          uMsg = {
+            ...userMsg,
+            branchCount: prevCount + 1,
+            branchIndex: prevCount,
+            siblings: [...uniq, userMsg.id],
+          }
+        }
+        return {
+          ...c,
+          messages: [...base, uMsg, assistantMsg],
+          updatedAt: Date.now(),
+          // Remember the param_controls selection so regenerate reuses it.
+          lastParams: input.params ?? c.lastParams,
+          // Give a brand-new conversation an immediate default title from the
+          // first message (first line, clipped) — so the sidebar/header never
+          // shows an empty title in the window before the title model (or the
+          // backend's deterministic clip) lands. Applies whenever there's no
+          // meaningful title yet: empty (the backend creates conversations with
+          // a blank title) OR the placeholder, regardless of locale.
+          title:
+            c.messages.length === 0 && (!c.title.trim() || c.title === 'New conversation')
+              ? optimisticSeedTitle || c.title
+              : c.title,
+        }
+      }),
+    }))
+    // Home "instant send": the seed above ran against an OPTIMISTIC conversation
+    // (temp id) so the thread could render immediately. Now create the REAL
+    // conversation server-side, re-key the cache to its id, and point the rest of
+    // this function (SSE URL + every updateAssistant/reload below) at it by
+    // mutating input.conversationId. Done BEFORE the stream starts so the id is
+    // stable for the whole SSE loop — no mid-stream re-key.
+    if (input.createFirst) {
+      let created: ApiConversation | undefined
+      let reusedPreparedConversation = false
+      try {
+        if (input.preparedConversation) {
+          created = await input.preparedConversation.catch(() => undefined)
+          reusedPreparedConversation = Boolean(created)
+        }
+        if (!created) {
+          created = await conversationsApi.create({
+            model_id: (input.conversationModelId ?? input.modelId) || undefined,
+            workspace_id: activeWorkspaceId(),
+            fast: input.fast === true,
+          })
+        }
+      } catch {
+        // Create failed — settle the optimistic turn as an error (the SSE would
+        // 404 against the temp id anyway) and stop. The user keeps their message
+        // with a retry affordance.
+        updateAssistant(set, input.conversationId, assistantId, (m) => ({
+          ...m,
+          streaming: false,
+          error: 'Could not start the conversation. Please try again.',
+        }))
+        streamControllers.delete(assistantId)
+        streamGenerationIds.delete(assistantId)
+        streamConversationIds.delete(assistantId)
+        if (abort.signal.aborted) finishStoppedPathBarrier(input.conversationId)
+        return
+      }
+      const tempId = input.conversationId
+      const realId = created.id
+      const latestKnowledgeBaseIds = [
+        ...(get().conversations.find((conversation) => conversation.id === tempId)?.kbIds ?? []),
+      ]
+      // Re-key the cache entry to the real id AND fold in the server row's
+      // metadata (workspace_id, project_id, model, …) — keeping the optimistic
+      // messages + first-message title — so the sidebar filter (workspace) and
+      // header read right immediately, without waiting on the remount's loadOne.
+      const meta = toLocalConversation(created)
+      set((s) => ({
+        conversations: s.conversations
+          // A §23 background list sync can insert the committed row before this
+          // re-key lands — drop it first or the map below would leave TWO rows
+          // with the same real id (duplicate React keys, double-patched state).
+          .filter((c) => c.id !== realId)
+          .map((c) =>
+            c.id === tempId
+              ? {
+                  ...meta,
+                  messages: c.messages,
+                  title: c.title || meta.title,
+                  updatedAt: Math.max(c.updatedAt, meta.updatedAt),
+                  modelId: c.modelId || meta.modelId,
+                  fast: c.fast,
+                  archived: c.archived ?? meta.archived,
+                  kbIds: [...(c.kbIds ?? [])],
+                  lastParams: c.lastParams,
+                }
+              : c,
+          ),
+      }))
+      optimisticConversationIds.delete(tempId)
+      moveStoppedPathBarrier(tempId, realId)
+      input.conversationId = realId
+      if (reusedPreparedConversation) {
+        // An attachment draft may have been reserved before the user changed
+        // model/mode. Keep its server metadata aligned with the picker while the
+        // first request itself continues to use the explicit turn snapshot.
+        if (input.fast === true && created.fast !== true) {
+          void get().setFast(realId, true)
+        } else if (input.fast !== true && input.modelId && (created.model_id !== input.modelId || created.fast === true)) {
+          void get().setModel(realId, input.modelId)
+        } else if (input.fast !== true && created.fast === true) {
+          void get().setFast(realId, false)
+        }
+      }
+      if (reusedPreparedConversation || latestKnowledgeBaseIds.length > 0) {
+        // The create endpoint intentionally starts with no optional KBs. Persist
+        // the latest optimistic selection against the real id. A reused draft is
+        // updated even when the selection is empty so stale draft metadata cannot
+        // leak into this turn. The first turn still uses its captured snapshot.
+        void get().setKBs(realId, latestKnowledgeBaseIds)
+      }
+      if (streamConversationIds.get(assistantId) === tempId) {
+        streamConversationIds.set(assistantId, realId)
+      }
+      // Swap the temp id in the URL for the real one (navigate replace), so a
+      // refresh/share resolves and the thread keeps rendering (it re-keyed too).
+      input.onConversationId?.(realId)
+    }
+    // If Stop was clicked while an optimistic first conversation was still
+    // being created, its first request targeted a temporary conversation id and
+    // the logical controller is already aborted. Use a short-lived transport
+    // controller to persist the turn, then stop it by the server message id as
+    // soon as message_start proves the placeholder exists.
+    const stoppedDuringFirstCreate = Boolean(input.createFirst && abort.signal.aborted)
+    const transportAbort = stoppedDuringFirstCreate ? new AbortController() : abort
+    // Hoisted out of the try so the catch below targets the message by its
+    // CURRENT id: after `message_start` the message is re-keyed to the backend
+    // id, and a mid-stream network drop must patch THAT id (else streaming:true
+    // never clears and the spinner spins forever). Falls back to the local id
+    // for a failure before message_start (§ stream-error E7).
+    let serverAssistantId = assistantId
+    let assistantStarted = false
+    // When the turn errors we keep the optimistic message (with its error flag +
+    // retry button) and SKIP the tree reconcile — otherwise reloadActivePath
+    // would replace it with the server's empty/partial row and the error (a
+    // client-only field) would vanish, leaving a blank reply with no retry.
+    let errored = false
+    try {
+      let lastCitations: Citation[] = []
+      const toolCallsById = new Map<string, ToolCall>()
+      const toolInputBuffers = new Map<string, string>()
+      // DeepSeek V4 Flash can emit reasoning deltas far faster than the browser
+      // can render. Coalesce them before touching the Zustand message tree; the
+      // final flush below preserves every character and ordering guarantee.
+      let pendingThinking = ''
+      const flushThinking = () => {
+        if (!pendingThinking) return
+        const text = pendingThinking
+        pendingThinking = ''
+        updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+          ...m,
+          reasoning: appendThinkingDelta(m.reasoning ?? [], text),
+        }))
+      }
+      const queueThinking = (text: string) => {
+        if (!text) return
+        pendingThinking += text
+      }
+      for await (const frame of streamSSE(
+        `/conversations/${encodeURIComponent(input.conversationId)}/messages`,
+        {
+          text: input.text,
+          generation_id: generationId,
+          kb_ids: turnKnowledgeBaseIds,
+          // §fast-mode: a fast turn omits model_id (the server resolves + hides the
+          // fast model). Advanced turns send the picked model.
+          model_id: input.fast ? undefined : input.modelId,
+          parent_id: requestParentId,
+          // §4.15: tell the backend this is a branch edit so an empty parent
+          // (editing the root question) stays a root sibling instead of being
+          // appended to the active leaf.
+          branch: input.branch,
+          // 'deep-research' switches the backend to the research engine.
+          mode: input.mode,
+          // §verify: enable the secondary-auditor pass for this turn.
+          verify: input.verify,
+          // Explicit three-state policy; only disabled mode may request the legacy
+          // server-run search injection.
+          tool_mode: requestToolMode,
+          selected_user_skill_ids: normalizeSelectedUserSkillIds(input.selectedUserSkillIds),
+          selected_tool_ids: input.selectedToolIds,
+          web_search: requestWebSearch,
+          // §fast-mode: run this turn on the admin's hidden fast model.
+          fast: input.fast,
+          attachments: input.attachments?.map(attachmentToApi),
+          params: input.params,
+          image_style_id: input.imageStyleId,
+          optimize_image_prompt: input.optimizeImagePrompt,
+          preserve_conversation_model: input.preserveConversationModel,
+          // UI language → backend anchors the reply language to it (§ reply language).
+          locale: currentLocale(),
+        },
+        transportAbort.signal,
+      )) {
+        const ev = frame.data as ApiSseEvent
+        switch (ev.type) {
+          case 'message_start':
+            assistantStarted = true
+            serverAssistantId = ev.message_id ?? assistantId
+            // Replace local id with backend id so future actions (regenerate,
+            // active-leaf) use the right id.
+            updateAssistant(set, input.conversationId, assistantId, (m) => ({
+              ...m,
+              id: serverAssistantId,
+              localOnly: undefined,
+            }))
+            // `message_start` proves the returned id is persisted even if a
+            // backend/import happens to use the same string as our placeholder.
+            generatedLocalMessageIds.delete(assistantId)
+            // Re-key the abort controller so abortStream (which uses the server
+            // id from the UI message) can actually cancel the local SSE reader.
+            if (serverAssistantId !== assistantId) {
+              const ctrl = streamControllers.get(assistantId)
+              if (ctrl) {
+                streamControllers.set(serverAssistantId, ctrl)
+              }
+              streamGenerationIds.set(serverAssistantId, generationId)
+            }
+            streamConversationIds.set(serverAssistantId, input.conversationId)
+            if (stoppedDuringFirstCreate) {
+              await conversationsApi.stop(input.conversationId, { message_id: serverAssistantId }).catch(() => {
+                /* The bounded path reconcile below remains the fallback. */
+              })
+            }
+            break
+          case 'text_delta':
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              content: m.content + (ev.text ?? ''),
+            }))
+            break
+          case 'thinking_delta':
+            // Extend the current thinking run inside the ordered trace (§7.1-4).
+            queueThinking(ev.text ?? '')
+            break
+          case 'image_status':
+            // §4.20 drawing phase → dedicated generating UI. Normalise the status
+            // (don't blind-cast an arbitrary string into the union).
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              imageStatus: ev.status === 'optimizing' ? 'optimizing' : 'generating',
+            }))
+            break
+          case 'artifact':
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              // The image arrived — drop the drawing placeholder.
+              imageStatus: undefined,
+              artifacts: [
+                ...(m.artifacts ?? []),
+                {
+                  id: ev.id ?? uid('art'),
+                  filename: ev.title ?? 'file',
+                  url: ev.url ?? '',
+                  mimeType: ev.summary ?? '',
+                },
+              ],
+            }))
+            break
+          case 'refusal':
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              refused: true,
+              content: m.content || (ev.message ?? 'The model declined to answer.'),
+            }))
+            break
+          case 'rag': {
+            // §6.2 retrieval lifecycle: legacy injection states and KB
+            // searching/expanding/found/partial/no_hit/error all reduce into the
+            // same transient line above citations.
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              ragInjection: ragInjectionFromEvent(ev, Date.now()),
+            }))
+            break
+          }
+          case 'research_plan':
+          case 'research_task':
+          case 'research_source':
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              research: applyResearchEvent(m.research, ev),
+            }))
+            break
+          case 'verify_started':
+          case 'verify_finding':
+          case 'verify_done':
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              verify: applyVerifyEvent(m.verify, ev),
+            }))
+            break
+          case 'tool_start': {
+            flushThinking()
+            // §6.2 dedupe: a round can emit tool_start twice. Track by id and
+            // append into the ordered trace at the spot it occurred (§7.1-4).
+            const tid = ev.id ?? uid('tc')
+            if (toolCallsById.has(tid)) break
+            const tc: ToolCall = {
+              id: tid,
+              name: ev.name,
+              label: ev.tool_label || prettyToolLabel(ev.name),
+              icon: ev.tool_icon || undefined,
+              status: 'running',
+              startedAt: Date.now(),
+              input: (ev.input as Record<string, unknown>) ?? undefined,
+            }
+            toolCallsById.set(tid, tc)
+            // Pre-tool narration the model already streamed becomes a reasoning
+            // step, so the final answer is only the post-tool text (§4.3).
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => {
+              const flushed = flushNarration(m)
+              return {
+                ...m,
+                content: flushed.content,
+                reasoning: appendToolStart(flushed.reasoning, tc),
+              }
+            })
+            break
+          }
+          case 'tool_input': {
+            if (!ev.id) break
+            const tid = ev.id
+            // §6.2: partial_json streams JSON fragments — accumulate and parse
+            // opportunistically so the trace shows the query/code as it forms.
+            let nextInput: Record<string, unknown> | undefined
+            if (ev.partial_json) {
+              const buf = (toolInputBuffers.get(tid) ?? '') + ev.partial_json
+              toolInputBuffers.set(tid, buf)
+              try {
+                nextInput = JSON.parse(buf) as Record<string, unknown>
+              } catch {
+                // incomplete JSON — keep accumulating
+              }
+            } else if (ev.input) {
+              nextInput = ev.input as Record<string, unknown>
+            }
+            if (!nextInput) break
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              reasoning: patchReasoningTool(m.reasoning ?? [], tid, { input: nextInput }),
+            }))
+            break
+          }
+          case 'tool_result': {
+            if (!ev.id) break
+            const tid = ev.id
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              reasoning: patchReasoningTool(m.reasoning ?? [], tid, {
+                output:
+                  ev.status === 'error' ? sanitizeToolErrorOutput(ev.summary) : ev.summary,
+                status: ev.status === 'error' ? 'error' : 'complete',
+                endedAt: Date.now(),
+              }),
+            }))
+            break
+          }
+          case 'citation': {
+            const c = ev.citation
+            const cit: Citation = {
+              id: c.id,
+              index: c.index,
+              title: c.title,
+              url: c.url,
+              domain: safeDomain(c.url),
+              snippet: c.snippet,
+              source: c.source,
+            }
+            lastCitations = [...lastCitations, cit]
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              citations: lastCitations,
+            }))
+            break
+          }
+          case 'error':
+            flushThinking()
+            errored = true
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              streaming: false,
+              imageStatus: undefined,
+              reasoning: interruptRunningTools(m.reasoning),
+              thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+              error: sanitizeUserVisibleError(ev.message),
+              errorCode: ev.code || GENERATION_INTERRUPTED_ERROR_CODE,
+            }))
+            break
+          case 'done':
+            flushThinking()
+            if (isFailedTerminalStopReason(ev.stop_reason)) errored = true
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => {
+              const next: Message = {
+                ...m,
+                streaming: false,
+                imageStatus: undefined,
+              // §verify: if the audit never settled by `done` (backend skipped it —
+              // model unset between fetch and send, empty answer), drop the stuck
+              // "running" badge rather than spin forever.
+              verify: m.verify?.status === 'running' ? undefined : m.verify,
+              thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+              credits: ev.credits && ev.credits > 0 ? ev.credits : m.credits,
+              moderation: ev.stop_reason === 'content_moderation' ? true : m.moderation,
+              quotaExceeded: ev.stop_reason === 'quota_exceeded' ? true : m.quotaExceeded,
+                stopped: ev.stop_reason === 'stopped' ? true : m.stopped,
+              }
+              return applyTerminalFailure(next, ev.stop_reason)
+            })
+            break
+        }
+      }
+      flushThinking()
+      // A mobile connection may return a clean EOF without a terminal frame
+      // while the detached server generation continues normally. Once the
+      // persisted id is known, hand the message to the replay GET stream; only
+      // explicit backend error events should surface as generation failures.
+      let replayingDetachedGeneration = false
+      {
+        const am = get()
+          .conversations.find((c) => c.id === input.conversationId)
+          ?.messages.find((m) => m.id === serverAssistantId)
+        if (am?.streaming) {
+          // A user-initiated stop is a deliberate halt, not a failure — keep the
+          // partial reply and never show the retry banner.
+          const stopped = abort.signal.aborted
+          if (!stopped && assistantStarted) {
+            beginMessageStreamReplay(set, get, input.conversationId, serverAssistantId, abort)
+            replayingDetachedGeneration = true
+          } else {
+            updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+              ...m,
+              streaming: false,
+              imageStatus: undefined,
+              stopped: stopped ? true : m.stopped,
+              reasoning: stopped ? m.reasoning : interruptRunningTools(m.reasoning),
+              error: stopped ? m.error : m.error || 'The reply ended unexpectedly. Please try again.',
+              errorCode: stopped ? m.errorCode : m.errorCode || GENERATION_INTERRUPTED_ERROR_CODE,
+            }))
+            if (!stopped) errored = true
+          }
+        }
+      }
+      if (replayingDetachedGeneration) return
+      // Stream finished cleanly — reconcile to the canonical tree path so the
+      // user/assistant siblings collapse and the `< n/m >` picker appears. Skip
+      // it on an error turn so the error message + retry button survive (a
+      // reconcile would replace them with the server's empty row).
+      if (abort.signal.aborted) {
+        await scheduleStoppedPathReconcile(set, get, input.conversationId, {
+          previousLeaf: persistedLeafBeforeTurn,
+          expectedAssistantId: assistantStarted ? serverAssistantId : undefined,
+        })
+      } else if (!errored) {
+        await get().reloadActivePath(input.conversationId)
+        if (expectsGeneratedTitle) {
+          scheduleGeneratedTitleReconcile(input.conversationId, generatedTitleFallback, optimisticSeedTitle)
+        }
+      }
+    } catch (e) {
+      if (abort.signal.aborted && streamHandoffs.delete(abort)) return
+      if (!abort.signal.aborted && serverAssistantId !== assistantId) {
+        beginMessageStreamReplay(set, get, input.conversationId, serverAssistantId, abort)
+        return
+      }
+      // Target the CURRENT server id so the patch lands even after the
+      // message_start re-key; always clear streaming so the spinner stops. A
+      // user-initiated stop aborts the local reader before the terminal `done`
+      // frame arrives — that AbortError is NOT a failure, so keep the partial
+      // reply and skip the retry banner. Otherwise mark the turn failed. We do
+      // Non-stop errors do not reconcile here because that would wipe the
+      // client-only error flag. Explicit stops use the bounded reconcile below.
+      updateAssistant(set, input.conversationId, serverAssistantId, (m) => ({
+        ...m,
+        streaming: false,
+        // §4.20: a stop / mid-stream drop on a drawing turn must clear the
+        // ImageGenerating placeholder (it renders independent of streaming/error).
+        imageStatus: undefined,
+        // §verify: a drop between verify_finding and verify_done would leave a
+        // perpetual "Verifying…" chip — settle it (no reconcile runs on error).
+        verify: m.verify?.status === 'running' ? undefined : m.verify,
+        stopped: abort.signal.aborted ? true : m.stopped,
+        reasoning: abort.signal.aborted ? m.reasoning : interruptRunningTools(m.reasoning),
+        // An explicit backend error frame (for example, an image provider
+        // rejection) is authoritative. A stream closing immediately after
+        // that frame must not overwrite it with the generic interruption text.
+        error: abort.signal.aborted ? m.error : m.error || errorMessage(e),
+        errorCode: abort.signal.aborted ? m.errorCode : m.errorCode || GENERATION_INTERRUPTED_ERROR_CODE,
+      }))
+      if (abort.signal.aborted) {
+        await scheduleStoppedPathReconcile(set, get, input.conversationId, {
+          previousLeaf: persistedLeafBeforeTurn,
+          expectedAssistantId: assistantStarted ? serverAssistantId : undefined,
+        })
+      }
+    } finally {
+      if (streamControllers.get(serverAssistantId) === abort) streamControllers.delete(serverAssistantId)
+      if (streamControllers.get(assistantId) === abort) streamControllers.delete(assistantId)
+      if (streamGenerationIds.get(serverAssistantId) === generationId) streamGenerationIds.delete(serverAssistantId)
+      if (streamGenerationIds.get(assistantId) === generationId) streamGenerationIds.delete(assistantId)
+      if (streamConversationIds.get(serverAssistantId) === input.conversationId) streamConversationIds.delete(serverAssistantId)
+      if (streamConversationIds.get(assistantId) === input.conversationId) streamConversationIds.delete(assistantId)
+      if (transportAbort !== abort) transportAbort.abort()
+      if (abort.signal.aborted) finishStoppedPathBarrier(input.conversationId)
+    }
+  },
+
+  async regenerate(conversationId, assistantId, modelId) {
+    const turnKnowledgeBaseIds = [
+      ...(get().conversations.find((conversation) => conversation.id === conversationId)?.kbIds ?? []),
+    ]
+    const assistantWasLocal = isKnownLocalMessageId(
+      get().conversations.find((c) => c.id === conversationId)?.messages ?? [],
+      assistantId,
+      generatedLocalMessageIds,
+    )
+    const stoppedReconcile = pendingStoppedPathWork(conversationId)
+    if (stoppedReconcile) await stoppedReconcile
+    if (assistantWasLocal) {
+      toast.info('Conversation is still syncing. Please try again.')
+      return
+    }
+    const abort = new AbortController()
+    const conv = get().conversations.find((c) => c.id === conversationId)
+    const persistedLeafBeforeRegenerate = previousPersistedLeaf(conv?.messages ?? [])
+    // §4.15: regenerate forks at the assistant — the new reply is a SIBLING
+    // of the old one under the same user turn, not an append. Truncate the
+    // visible path to that user parent (dropping the old reply and anything
+    // below it) before showing the streaming placeholder, so the screen never
+    // stacks two replies. The post-stream reconcile then restores the old
+    // sibling behind the `< n/m >` picker.
+    const oldAssistant = conv?.messages.find((m) => m.id === assistantId)
+    const userParentId = oldAssistant?.parentId
+    // Carry the original turn's mode so regenerating a deep-research reply
+    // re-runs the research engine (and shows the panel) instead of downgrading.
+    const mode = oldAssistant?.mode
+    // §verify: regenerate honours the CURRENT Verify toggle — exactly like a
+    // fresh send — rather than the original turn's setting. Otherwise turning
+    // Verify OFF and then retrying an errored turn still re-audits, so the
+    // badge "sticks" even though the user disabled it. (Common case is
+    // unchanged: if the toggle was on for the original send and untouched, it
+    // is still on, so the re-audit happens as before.)
+    // Regenerate honours the CURRENT verify / tool-policy / web-search
+    // toggles (a retry should reflect what's armed now). `mode` is the EXCEPTION
+    // — it stays the original turn's mode (below), so regenerating a deep-research
+    // reply re-runs research rather than adopting whatever mode is toggled now.
+    const regenerateModelId = modelId ?? conv?.modelId
+    const armed = resolveArmedTurnFlags(regenerateModelId)
+    // §fast-mode: regenerate honours the conversation's CURRENT 快速/进阶 selection
+    // (like verify/tool-policy above) — a fast conversation re-runs fast; switching to
+    // 进阶 first makes the retry use the real model.
+    const fast = conv?.fast === true
+    const verify = fast ? false : armed.verify
+    const { toolMode, webSearch } = resolveToolRequestFlags(armed.toolMode, {
+      fast,
+      mode,
+      webSearch: armed.webSearch,
+    })
+    const placeholderId = uid('m')
+    const generationId = createGenerationId()
+    generatedLocalMessageIds.add(placeholderId)
+    // The visible Stop button targets the optimistic placeholder before
+    // message_start, while the legacy alias keeps callers holding the source
+    // assistant id working during the same narrow window.
+    streamControllers.set(placeholderId, abort)
+    streamControllers.set(assistantId + '-regen', abort)
+    streamGenerationIds.set(placeholderId, generationId)
+    streamGenerationIds.set(assistantId + '-regen', generationId)
+    streamConversationIds.set(placeholderId, conversationId)
+    streamConversationIds.set(assistantId + '-regen', conversationId)
+    // §4.15 R2: regenerate forks at the assistant — the new reply is a SIBLING of
+    // the old one under the same user turn. Seed branch metadata on the
+    // placeholder so the `< n/m >` switcher shows under the reply IMMEDIATELY,
+    // before any token arrives (reloadActivePath later swaps in server truth). The
+    // user message is left untouched.
+    const oldReplies = conv?.messages.filter((m) => m.role === 'assistant' && m.parentId === userParentId) ?? []
+    const prevReplySiblings =
+      oldAssistant?.siblings && oldAssistant.siblings.length > 0
+        ? oldAssistant.siblings
+        : oldReplies.length > 0
+          ? oldReplies.map((m) => m.id)
+          : oldAssistant
+            ? [oldAssistant.id]
+            : []
+    const uniqReplies = Array.from(new Set(prevReplySiblings))
+    const prevReplyCount = Math.max(uniqReplies.length, 1)
+    // Hoisted so the catch can clear the streaming placeholder by its CURRENT
+    // id (re-keyed to the backend id after message_start), mirroring sendMessage
+    // (§ stream-error E7).
+    let serverAssistantId = placeholderId
+    let assistantStarted = false
+    let errored = false
+    try {
+      const placeholder: Message = {
+        id: placeholderId,
+        localOnly: true,
+        role: 'assistant',
+        content: '',
+        createdAt: Date.now(),
+        streaming: true,
+        modelId: fast ? undefined : modelId ?? conv?.modelId,
+        fast: fast || undefined,
+        mode,
+        verify: verify ? { status: 'running', findings: [] } : undefined,
+        branchCount: prevReplyCount + 1,
+        branchIndex: prevReplyCount,
+        siblings: [...uniqReplies, placeholderId],
+      }
+      set((s) => ({
+        conversations: s.conversations.map((c) => {
+          if (c.id !== conversationId) return c
+          const base = userParentId
+            ? truncateToParent(c.messages, userParentId)
+            : c.messages.filter((m) => m.id !== assistantId)
+          // Bump updatedAt so a regenerated conversation floats to the top of the
+          // sidebar immediately (parity with sendMessage).
+          return { ...c, messages: [...base, placeholder], updatedAt: Date.now() }
+        }),
+      }))
+      const toolCallsById = new Map<string, ToolCall>()
+      const toolInputBuffers = new Map<string, string>()
+      let lastCitations: Citation[] = []
+      let pendingThinking = ''
+      const flushThinking = () => {
+        if (!pendingThinking) return
+        const text = pendingThinking
+        pendingThinking = ''
+        updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+          ...m,
+          reasoning: appendThinkingDelta(m.reasoning ?? [], text),
+        }))
+      }
+      const queueThinking = (text: string) => {
+        if (!text) return
+        pendingThinking += text
+      }
+      for await (const frame of streamSSE(
+        `/conversations/${encodeURIComponent(conversationId)}/regenerate`,
+        {
+          assistant_id: assistantId,
+          generation_id: generationId,
+          kb_ids: turnKnowledgeBaseIds,
+          model_id: fast ? undefined : modelId,
+          mode,
+          verify,
+          tool_mode: toolMode,
+          selected_tool_ids: armed.selectedToolIds,
+          web_search: webSearch,
+          fast,
+          // Fast turns must not inherit parameter overrides cached from the
+          // previously selected advanced model (for example, `thinking`).
+          params: fast ? undefined : conv?.lastParams,
+          optimize_image_prompt: armed.optimizeImagePrompt,
+          locale: currentLocale(),
+        },
+        abort.signal,
+      )) {
+        const ev = frame.data as ApiSseEvent
+        switch (ev.type) {
+          case 'tool_start': {
+            flushThinking()
+            const tid = ev.id ?? uid('tc')
+            if (toolCallsById.has(tid)) break
+            const tc: ToolCall = {
+              id: tid,
+              name: ev.name,
+              label: ev.tool_label || prettyToolLabel(ev.name),
+              icon: ev.tool_icon || undefined,
+              status: 'running',
+              startedAt: Date.now(),
+              input: (ev.input as Record<string, unknown>) ?? undefined,
+            }
+            toolCallsById.set(tid, tc)
+            updateAssistant(set, conversationId, serverAssistantId, (m) => {
+              const flushed = flushNarration(m)
+              return {
+                ...m,
+                content: flushed.content,
+                reasoning: appendToolStart(flushed.reasoning, tc),
+              }
+            })
+            break
+          }
+          case 'tool_input': {
+            if (!ev.id) break
+            const tid = ev.id
+            let nextInput: Record<string, unknown> | undefined
+            if (ev.partial_json) {
+              const buf = (toolInputBuffers.get(tid) ?? '') + ev.partial_json
+              toolInputBuffers.set(tid, buf)
+              try {
+                nextInput = JSON.parse(buf) as Record<string, unknown>
+              } catch {
+                /* incomplete JSON — keep accumulating */
+              }
+            } else if (ev.input) {
+              nextInput = ev.input as Record<string, unknown>
+            }
+            if (!nextInput) break
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              reasoning: patchReasoningTool(m.reasoning ?? [], tid, { input: nextInput }),
+            }))
+            break
+          }
+          case 'tool_result': {
+            if (!ev.id) break
+            const tid = ev.id
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              reasoning: patchReasoningTool(m.reasoning ?? [], tid, {
+                output:
+                  ev.status === 'error' ? sanitizeToolErrorOutput(ev.summary) : ev.summary,
+                status: ev.status === 'error' ? 'error' : 'complete',
+                endedAt: Date.now(),
+              }),
+            }))
+            break
+          }
+          case 'citation': {
+            const c = ev.citation
+            lastCitations = [
+              ...lastCitations,
+              { id: c.id, index: c.index, title: c.title, url: c.url, domain: safeDomain(c.url), snippet: c.snippet, source: c.source },
+            ]
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              citations: lastCitations,
+            }))
+            break
+          }
+          case 'message_start':
+            assistantStarted = true
+            serverAssistantId = ev.message_id ?? placeholderId
+            updateAssistant(set, conversationId, placeholderId, (m) => ({
+              ...m,
+              id: serverAssistantId,
+              localOnly: undefined,
+              // Re-point the optimistic sibling list (R2) at the server id so the
+              // `< n/m >` picker stays self-consistent until reloadActivePath.
+              siblings: m.siblings?.map((sid) => (sid === placeholderId ? serverAssistantId : sid)),
+            }))
+            generatedLocalMessageIds.delete(placeholderId)
+            if (serverAssistantId !== placeholderId) {
+              const ctrl = streamControllers.get(placeholderId) ?? streamControllers.get(assistantId + '-regen')
+              if (ctrl) {
+                streamControllers.set(serverAssistantId, ctrl)
+              }
+              streamGenerationIds.set(serverAssistantId, generationId)
+            }
+            streamConversationIds.set(serverAssistantId, conversationId)
+            break
+          case 'text_delta':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              content: m.content + (ev.text ?? ''),
+            }))
+            break
+          case 'thinking_delta':
+            queueThinking(ev.text ?? '')
+            break
+          case 'rag':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              ragInjection: ragInjectionFromEvent(ev, Date.now()),
+            }))
+            break
+          case 'research_plan':
+          case 'research_task':
+          case 'research_source':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              research: applyResearchEvent(m.research, ev),
+            }))
+            break
+          case 'verify_started':
+          case 'verify_finding':
+          case 'verify_done':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              verify: applyVerifyEvent(m.verify, ev),
+            }))
+            break
+          case 'image_status':
+            // §4.20 drawing phase (regenerated image turn) → dedicated UI.
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              imageStatus: ev.status === 'optimizing' ? 'optimizing' : 'generating',
+            }))
+            break
+          case 'artifact':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              imageStatus: undefined,
+              artifacts: [
+                ...(m.artifacts ?? []),
+                { id: ev.id ?? uid('art'), filename: ev.title ?? 'file', url: ev.url ?? '', mimeType: ev.summary ?? '' },
+              ],
+            }))
+            break
+          case 'refusal':
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              imageStatus: undefined,
+              refused: true,
+              content: m.content || (ev.message ?? 'The model declined to answer.'),
+            }))
+            break
+          case 'done':
+            flushThinking()
+            if (isFailedTerminalStopReason(ev.stop_reason)) errored = true
+            updateAssistant(set, conversationId, serverAssistantId, (m) => {
+              const next: Message = {
+                ...m,
+                streaming: false,
+                imageStatus: undefined,
+              // §verify: clear a never-settled audit badge (see sendMessage).
+              verify: m.verify?.status === 'running' ? undefined : m.verify,
+              thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+              moderation: ev.stop_reason === 'content_moderation' ? true : m.moderation,
+                stopped: ev.stop_reason === 'stopped' ? true : m.stopped,
+              }
+              return applyTerminalFailure(next, ev.stop_reason)
+            })
+            break
+          case 'error':
+            flushThinking()
+            errored = true
+            updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+              ...m,
+              streaming: false,
+              imageStatus: undefined,
+              verify: m.verify?.status === 'running' ? undefined : m.verify,
+              reasoning: interruptRunningTools(m.reasoning),
+              thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+              error: sanitizeUserVisibleError(ev.message),
+              errorCode: ev.code || GENERATION_INTERRUPTED_ERROR_CODE,
+            }))
+            break
+        }
+      }
+      flushThinking()
+      const unfinished = get()
+        .conversations.find((c) => c.id === conversationId)
+        ?.messages.find((m) => m.id === serverAssistantId)
+      if (!abort.signal.aborted && assistantStarted && unfinished?.streaming) {
+        beginMessageStreamReplay(set, get, conversationId, serverAssistantId, abort)
+        return
+      }
+      // Reconcile so the freshly generated reply and the previous one show up as
+      // siblings with a `< n/m >` picker instead of two stacked bubbles (§4.15).
+      if (abort.signal.aborted) {
+        updateAssistant(set, conversationId, serverAssistantId, (m) => ({ ...m, streaming: false, stopped: true }))
+        await scheduleStoppedPathReconcile(set, get, conversationId, {
+          previousLeaf: persistedLeafBeforeRegenerate,
+          expectedAssistantId: assistantStarted ? serverAssistantId : undefined,
+        })
+      } else if (!errored) {
+        await get().reloadActivePath(conversationId)
+      }
+    } catch (e) {
+      if (abort.signal.aborted && streamHandoffs.delete(abort)) return
+      if (!abort.signal.aborted && serverAssistantId !== placeholderId) {
+        beginMessageStreamReplay(set, get, conversationId, serverAssistantId, abort)
+        return
+      }
+      // A user-initiated stop aborts the reader before the terminal frame — keep
+      // the partial reply and reconcile to the server's persisted stopped turn,
+      // without the interrupted note or error toast.
+      if (abort.signal.aborted) {
+        updateAssistant(set, conversationId, serverAssistantId, (m) => ({ ...m, streaming: false, stopped: true }))
+        await scheduleStoppedPathReconcile(set, get, conversationId, {
+          previousLeaf: persistedLeafBeforeRegenerate,
+          expectedAssistantId: assistantStarted ? serverAssistantId : undefined,
+        })
+      } else {
+        // A mid-stream drop on regenerate must clear the placeholder's
+        // streaming state (by its CURRENT id) so the spinner stops, surface a
+        // toast, and reconcile to the canonical path — mirroring sendMessage
+        // (§ stream-error E7).
+        updateAssistant(set, conversationId, serverAssistantId, (m) => ({
+          ...m,
+          streaming: false,
+          imageStatus: undefined,
+          verify: m.verify?.status === 'running' ? undefined : m.verify,
+          reasoning: interruptRunningTools(m.reasoning),
+          error: m.error || errorMessage(e),
+          errorCode: m.errorCode || GENERATION_INTERRUPTED_ERROR_CODE,
+        }))
+        toast.error(errorMessage(e, 'Regeneration failed'))
+      }
+    } finally {
+      if (streamControllers.get(assistantId + '-regen') === abort) streamControllers.delete(assistantId + '-regen')
+      if (streamControllers.get(placeholderId) === abort) streamControllers.delete(placeholderId)
+      if (streamControllers.get(serverAssistantId) === abort) streamControllers.delete(serverAssistantId)
+      if (streamGenerationIds.get(assistantId + '-regen') === generationId) streamGenerationIds.delete(assistantId + '-regen')
+      if (streamGenerationIds.get(placeholderId) === generationId) streamGenerationIds.delete(placeholderId)
+      if (streamGenerationIds.get(serverAssistantId) === generationId) streamGenerationIds.delete(serverAssistantId)
+      if (streamConversationIds.get(assistantId + '-regen') === conversationId) streamConversationIds.delete(assistantId + '-regen')
+      if (streamConversationIds.get(placeholderId) === conversationId) streamConversationIds.delete(placeholderId)
+      if (streamConversationIds.get(serverAssistantId) === conversationId) streamConversationIds.delete(serverAssistantId)
+      if (abort.signal.aborted) finishStoppedPathBarrier(conversationId)
+    }
+  },
+
+  async editMessageInPlace(conversationId, messageId, text) {
+    const previousMessage = get().conversations
+      .find((c) => c.id === conversationId)
+      ?.messages.find((m) => m.id === messageId)
+    const previous = previousMessage?.content
+    // Optimistic overwrite keeps the editor responsive; a failed request rolls
+    // back so the visible transcript never claims an edit the server rejected.
+    set((s) => ({
+      conversations: s.conversations.map((c) =>
+        c.id !== conversationId
+          ? c
+          : {
+              ...c,
+              messages: c.messages.map((m) => (m.id === messageId ? { ...m, content: text } : m)),
+            },
+      ),
+    }))
+    try {
+      const saved = await conversationsApi.editMessage(conversationId, messageId, text)
+      set((state) => ({
+        conversations: state.conversations.map((conversation) => {
+          if (conversation.id !== conversationId) return conversation
+
+          const editedRole = previousMessage?.role ?? saved.role
+          const invalidatedIds = new Set(
+            feedbackInvalidationTargetsAfterEdit(conversation.messages, messageId),
+          )
+          return {
+            ...conversation,
+            messages: conversation.messages.map((message) => {
+              if (!invalidatedIds.has(message.id)) return message
+              if (editedRole === 'assistant' && message.id === messageId) {
+                return {
+                  ...message,
+                  ...applyMessageFeedback(message, {
+                    feedback: saved.feedback ?? '',
+                    reasons: saved.feedback_reasons ?? [],
+                    comment: saved.feedback_comment ?? '',
+                  }),
+                }
+              }
+              return {
+                ...message,
+                ...applyMessageFeedback(message, { feedback: '', reasons: [], comment: '' }),
+              }
+            }),
+          }
+        }),
+      }))
+    } catch (error) {
+      set((s) => ({
+        conversations: s.conversations.map((c) =>
+          c.id !== conversationId
+            ? c
+            : {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === messageId && m.content === text && previous !== undefined
+                    ? { ...m, content: previous }
+                    : m,
+                ),
+              },
+        ),
+      }))
+      throw error
+    }
+  },
+
+  async setFeedback(conversationId, messageId, input) {
+    // Optimistically reflect the rating and optional dislike detail; the API is
+    // authoritative, so a failed mutation restores the complete previous state.
+    const prev = get()
+      .conversations.find((c) => c.id === conversationId)
+      ?.messages.find((m) => m.id === messageId)
+    const previousFeedback = {
+      liked: prev?.liked ?? false,
+      disliked: prev?.disliked ?? false,
+      feedbackReasons: prev?.feedbackReasons ?? [],
+      feedbackComment: prev?.feedbackComment ?? '',
+    }
+    updateAssistant(set, conversationId, messageId, (m) => ({
+      ...m,
+      ...applyMessageFeedback(m, input),
+    }))
+    try {
+      const saved = await conversationsApi.feedback(conversationId, messageId, input)
+      // Newer servers echo canonical feedback. Keep compatibility with older
+      // `{ ok: true }` responses while reconciling when those fields are present.
+      const canonicalFeedback = saved.feedback
+      if (canonicalFeedback !== undefined) {
+        updateAssistant(set, conversationId, messageId, (m) => ({
+          ...m,
+          ...applyMessageFeedback(m, {
+            feedback: canonicalFeedback,
+            reasons: saved.feedback_reasons,
+            comment: saved.feedback_comment,
+          }),
+        }))
+      }
+    } catch (error) {
+      updateAssistant(set, conversationId, messageId, (m) => ({ ...m, ...previousFeedback }))
+      throw error
+    }
+  },
+
+  abortStream(assistantMessageId) {
+    // Two-phase stop: target exactly this generation on the backend (so a live
+    // sibling branch keeps running and partial blocks are persisted), then abort
+    // only this local SSE reader so late frames cannot revive the stopped row.
+    // We look up the conversation id by walking the cache — abortStream is
+    // called with an assistantId and not the conv id, but the assistant always
+    // belongs to exactly one conversation.
+    const state = get()
+    const directConversation = state.conversations.find((c) =>
+      c.messages.some((m) => m.id === assistantMessageId),
+    )
+    const ctrl = streamControllers.get(assistantMessageId)
+    const regen = streamControllers.get(assistantMessageId + '-regen')
+    const controller = ctrl ?? regen
+    const aliasConversationId =
+      streamConversationIds.get(assistantMessageId) ??
+      streamConversationIds.get(assistantMessageId + '-regen')
+    const conv = directConversation ?? state.conversations.find((conversation) => conversation.id === aliasConversationId)
+    const message =
+      conv?.messages.find((item) => item.id === assistantMessageId) ??
+      (controller
+        ? conv?.messages.find(
+            (item) =>
+              streamControllers.get(item.id) === controller ||
+              streamControllers.get(item.id + '-regen') === controller,
+          )
+        : undefined)
+    const willAbortLocalStream = [ctrl, regen].some(
+      (controller) => controller && !controller.signal.aborted,
+    )
+    if (conv && willAbortLocalStream && conv.messages.some((message) => message.localOnly)) {
+      registerStoppedPathBarrier(conv.id)
+    }
+    if (conv) {
+      const generationId =
+        streamGenerationIds.get(assistantMessageId) ??
+        streamGenerationIds.get(assistantMessageId + '-regen') ??
+        (message ? streamGenerationIds.get(message.id) : undefined) ??
+        (message ? streamGenerationIds.get(message.id + '-regen') : undefined) ??
+        (message?.localOnly ? assistantMessageId : undefined)
+      const target = generationId
+        ? { generation_id: generationId }
+        : { message_id: message?.id ?? assistantMessageId }
+      void conversationsApi.stop(conv.id, target).catch(() => {
+        /* best effort — the local abort below still stops the stream */
+      })
+      updateAssistant(set, conv.id, message?.id ?? assistantMessageId, (item) => ({
+        ...item,
+        streaming: false,
+        imageStatus: undefined,
+        stopped: true,
+      }))
+    }
+    ctrl?.abort()
+    // Also try regen channel if streaming was triggered via regenerate().
+    regen?.abort()
+  },
+
+  getConversation(id) {
+    return get().conversations.find((c) => c.id === id)
+  },
+}))
+
+type StreamApplyState = {
+  lastCitations: Citation[]
+  toolCallsById: Map<string, ToolCall>
+  toolInputBuffers: Map<string, string>
+}
+
+async function consumeReplayStream(
+  set: (fn: (s: ConversationStore) => Partial<ConversationStore>) => void,
+  get: () => ConversationStore,
+  conversationId: string,
+  assistantId: string,
+  abort: AbortController,
+): Promise<void> {
+  const state: StreamApplyState = {
+    lastCitations: [],
+    toolCallsById: new Map(),
+    toolInputBuffers: new Map(),
+  }
+  try {
+    for await (const frame of streamSSEGet(
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(assistantId)}/stream`,
+      abort.signal,
+    )) {
+      const ev = frame.data as ApiSseEvent
+      applyReplayEvent(set, conversationId, assistantId, ev, state)
+      if (ev.type === 'done') {
+        if (isFailedTerminalStopReason(ev.stop_reason)) return
+        await get().reloadActivePath(conversationId)
+        return
+      }
+      if (ev.type === 'error') return
+    }
+    await get().reloadActivePath(conversationId)
+  } catch (e) {
+    if (abort.signal.aborted) {
+      streamHandoffs.delete(abort)
+      return
+    }
+    updateAssistant(set, conversationId, assistantId, (m) => ({
+      ...m,
+      streaming: false,
+      imageStatus: undefined,
+      verify: m.verify?.status === 'running' ? undefined : m.verify,
+      reasoning: interruptRunningTools(m.reasoning),
+      error: errorMessage(e, 'Stream replay failed'),
+      errorCode: GENERATION_INTERRUPTED_ERROR_CODE,
+    }))
+  }
+}
+
+function applyReplayEvent(
+  set: (fn: (s: ConversationStore) => Partial<ConversationStore>) => void,
+  conversationId: string,
+  assistantId: string,
+  ev: ApiSseEvent,
+  state: StreamApplyState,
+): void {
+  switch (ev.type) {
+    case 'message_start':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        id: ev.message_id || assistantId,
+        streaming: true,
+        content: '',
+        reasoning: [],
+        citations: [],
+        artifacts: [],
+        research: undefined,
+        ragInjection: undefined,
+        error: undefined,
+        errorCode: undefined,
+        stopped: undefined,
+      }))
+      break
+    case 'text_delta':
+      updateAssistant(set, conversationId, assistantId, (m) => ({ ...m, content: m.content + (ev.text ?? '') }))
+      break
+    case 'thinking_delta':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        reasoning: appendThinkingDelta(m.reasoning ?? [], ev.text ?? ''),
+      }))
+      break
+    case 'image_status':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        imageStatus: ev.status === 'optimizing' ? 'optimizing' : 'generating',
+      }))
+      break
+    case 'artifact':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        imageStatus: undefined,
+        artifacts: [
+          ...(m.artifacts ?? []),
+          { id: ev.id ?? uid('art'), filename: ev.title ?? 'file', url: ev.url ?? '', mimeType: ev.summary ?? '' },
+        ],
+      }))
+      break
+    case 'refusal':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        imageStatus: undefined,
+        refused: true,
+        content: m.content || (ev.message ?? 'The model declined to answer.'),
+      }))
+      break
+    case 'rag':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        ragInjection: ragInjectionFromEvent(ev, Date.now()),
+      }))
+      break
+    case 'research_plan':
+    case 'research_task':
+    case 'research_source':
+      updateAssistant(set, conversationId, assistantId, (m) => ({ ...m, research: applyResearchEvent(m.research, ev) }))
+      break
+    case 'verify_started':
+    case 'verify_finding':
+    case 'verify_done':
+      updateAssistant(set, conversationId, assistantId, (m) => ({ ...m, verify: applyVerifyEvent(m.verify, ev) }))
+      break
+    case 'tool_start': {
+      const tid = ev.id ?? uid('tc')
+      if (state.toolCallsById.has(tid)) break
+      const tc: ToolCall = {
+        id: tid,
+        name: ev.name,
+        label: ev.tool_label || prettyToolLabel(ev.name),
+        icon: ev.tool_icon || undefined,
+        status: 'running',
+        startedAt: Date.now(),
+        input: (ev.input as Record<string, unknown>) ?? undefined,
+      }
+      state.toolCallsById.set(tid, tc)
+      updateAssistant(set, conversationId, assistantId, (m) => {
+        const flushed = flushNarration(m)
+        return { ...m, content: flushed.content, reasoning: appendToolStart(flushed.reasoning, tc) }
+      })
+      break
+    }
+    case 'tool_input': {
+      if (!ev.id) break
+      let nextInput: Record<string, unknown> | undefined
+      if (ev.partial_json) {
+        const buf = (state.toolInputBuffers.get(ev.id) ?? '') + ev.partial_json
+        state.toolInputBuffers.set(ev.id, buf)
+        try {
+          nextInput = JSON.parse(buf) as Record<string, unknown>
+        } catch {
+          /* incomplete JSON */
+        }
+      } else if (ev.input) {
+        nextInput = ev.input as Record<string, unknown>
+      }
+      if (!nextInput) break
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        reasoning: patchReasoningTool(m.reasoning ?? [], ev.id!, { input: nextInput }),
+      }))
+      break
+    }
+    case 'tool_result':
+      if (!ev.id) break
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        reasoning: patchReasoningTool(m.reasoning ?? [], ev.id!, {
+          output: ev.status === 'error' ? sanitizeToolErrorOutput(ev.summary) : ev.summary,
+          status: ev.status === 'error' ? 'error' : 'complete',
+          endedAt: Date.now(),
+        }),
+      }))
+      break
+    case 'citation': {
+      const c = ev.citation
+      state.lastCitations = [
+        ...state.lastCitations,
+        { id: c.id, index: c.index, title: c.title, url: c.url, domain: safeDomain(c.url), snippet: c.snippet, source: c.source },
+      ]
+      updateAssistant(set, conversationId, assistantId, (m) => ({ ...m, citations: state.lastCitations }))
+      break
+    }
+    case 'done':
+      updateAssistant(set, conversationId, assistantId, (m) => {
+        const next: Message = {
+          ...m,
+          streaming: false,
+          imageStatus: undefined,
+        verify: m.verify?.status === 'running' ? undefined : m.verify,
+        thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+        credits: ev.credits && ev.credits > 0 ? ev.credits : m.credits,
+        moderation: ev.stop_reason === 'content_moderation' ? true : m.moderation,
+        quotaExceeded: ev.stop_reason === 'quota_exceeded' ? true : m.quotaExceeded,
+          stopped: ev.stop_reason === 'stopped' ? true : m.stopped,
+        }
+        return applyTerminalFailure(next, ev.stop_reason)
+      })
+      break
+    case 'error':
+      updateAssistant(set, conversationId, assistantId, (m) => ({
+        ...m,
+        streaming: false,
+        imageStatus: undefined,
+        verify: m.verify?.status === 'running' ? undefined : m.verify,
+        reasoning: interruptRunningTools(m.reasoning),
+        thinkingMs: ev.thinking_ms && ev.thinking_ms > 0 ? ev.thinking_ms : m.thinkingMs,
+        error: sanitizeUserVisibleError(ev.message),
+        errorCode: ev.code || GENERATION_INTERRUPTED_ERROR_CODE,
+      }))
+      break
+  }
+}
+
+// -------- conversion helpers ----------------------------------------------
+
+// Exported for the §23 realtime sync module (lib/realtime.ts), which merges
+// server rows into this store without flashing the sidebar loading state.
+export function toLocalConversation(c: ApiConversation): Conversation {
+  return {
+    id: c.id,
+    workspaceId: c.workspace_id || undefined,
+    isPublic: c.is_public === true,
+    creatorName: c.creator_name || undefined,
+    creatorAvatar: c.creator_avatar || undefined,
+    creatorId: c.user_id || undefined,
+    title: c.title,
+    createdAt: c.created_at * 1000,
+    updatedAt: c.updated_at * 1000,
+    modelId: c.model_id,
+    fast: c.fast === true,
+    projectId: c.project_id || undefined,
+    kbIds: c.kb_ids ?? [],
+    pinned: c.pinned,
+    starred: c.starred,
+    archived: c.archived,
+    inline: c.inline_source_conv
+      ? {
+          sourceConvId: c.inline_source_conv,
+          messageId: c.inline_parent_id ?? '',
+          quote: c.inline_quote ?? '',
+        }
+      : undefined,
+    messages: [],
+  }
+}
+
+// Exported so the admin thread viewer (AdminUserConversation) can reuse the
+// exact same ApiMessage → UI Message mapping the chat surface relies on —
+// keeps tool-call/citation/artifact rendering identical across both surfaces.
+// --- reasoning-trace builders (§7.1-4) -------------------------------------
+// The assistant's thinking runs and tool rounds arrive interleaved over SSE;
+// these keep them in arrival order inside ONE ordered list so the UI can render
+// "think → search → think → run" faithfully.
+
+function appendThinkingDelta(reasoning: ReasoningItem[], text: string): ReasoningItem[] {
+  if (!text) return reasoning
+  const last = reasoning[reasoning.length - 1]
+  if (last && last.kind === 'thinking') {
+    return [...reasoning.slice(0, -1), { ...last, text: last.text + text }]
+  }
+  return [...reasoning, { kind: 'thinking', id: uid('rt'), text }]
+}
+
+function appendToolStart(reasoning: ReasoningItem[], tool: ToolCall): ReasoningItem[] {
+  if (reasoning.some((it) => it.kind === 'tool' && it.id === tool.id)) return reasoning
+  return [...reasoning, { kind: 'tool', id: tool.id, tool }]
+}
+
+// --- Deep Research panel state (§ deep-research mode) ----------------------
+// Folds research_plan/research_task/research_source SSE events into one
+// ResearchState. Shared by the sendMessage + regenerate stream loops.
+function parseRound(name?: string): number | undefined {
+  if (!name) return undefined
+  const m = name.match(/(\d+)/)
+  return m ? Number(m[1]) : undefined
+}
+
+function applyResearchEvent(prev: ResearchState | undefined, ev: ApiSseEvent): ResearchState {
+  const r: ResearchState = prev ?? { title: '', tasks: [], sources: [] }
+  if (ev.type === 'research_plan') {
+    return { ...r, title: ev.text ?? r.title }
+  }
+  if (ev.type === 'research_task') {
+    const tasks = r.tasks.slice()
+    const i = tasks.findIndex((t) => t.id === ev.id)
+    const status = (ev.status as ResearchTask['status']) ?? (i >= 0 ? tasks[i].status : 'pending')
+    const round = parseRound(ev.name) ?? (i >= 0 ? tasks[i].round : undefined)
+    if (i >= 0) {
+      tasks[i] = { ...tasks[i], status, round, question: ev.text ?? tasks[i].question }
+    } else {
+      tasks.push({ id: ev.id, question: ev.text ?? '', status, round })
+    }
+    return { ...r, tasks }
+  }
+  if (ev.type === 'research_source') {
+    const sources = r.sources.slice()
+    const i = sources.findIndex((s) => s.id === ev.id)
+    if (i >= 0) {
+      sources[i] = {
+        ...sources[i],
+        status: (ev.status as ResearchSource['status']) ?? sources[i].status,
+        verdict: ev.summary || sources[i].verdict,
+        url: ev.url ?? sources[i].url,
+        title: ev.title ?? sources[i].title,
+      }
+    } else {
+      sources.push({
+        id: ev.id,
+        url: ev.url ?? '',
+        title: ev.title ?? ev.url ?? '',
+        domain: safeDomain(ev.url ?? ''),
+        status: (ev.status as ResearchSource['status']) ?? 'found',
+        verdict: ev.summary,
+      })
+    }
+    return { ...r, sources }
+  }
+  return r
+}
+
+// applyVerifyEvent reduces a Verify-mode (§verify) SSE event into the message's
+// verify state: started → 'running', each finding appended, done → final verdict.
+function applyVerifyEvent(prev: VerifyResult | undefined, ev: ApiSseEvent): VerifyResult {
+  const v: VerifyResult = prev ?? { findings: [] }
+  if (ev.type === 'verify_started') {
+    return { ...v, status: 'running' }
+  }
+  if (ev.type === 'verify_finding') {
+    const f = ev.finding
+    const severity: VerifyFinding['severity'] =
+      f.severity === 'error' || f.severity === 'warning' ? f.severity : 'note'
+    return { ...v, findings: [...v.findings, { severity, quote: f.quote ?? '', issue: f.issue ?? '' }] }
+  }
+  if (ev.type === 'verify_done') {
+    return { ...v, status: ev.verdict, verdict: ev.verdict }
+  }
+  return v
+}
+
+// appendNarration moves the model's pre-tool "let me look this up…" text into
+// the reasoning trace (§4.3) so it doesn't pollute the final answer. Merges
+// into a trailing narration run if one is already open.
+function appendNarration(reasoning: ReasoningItem[], text: string): ReasoningItem[] {
+  if (!text.trim()) return reasoning
+  const last = reasoning[reasoning.length - 1]
+  if (last && last.kind === 'narration') {
+    return [...reasoning.slice(0, -1), { ...last, text: last.text + text }]
+  }
+  return [...reasoning, { kind: 'narration', id: uid('rn'), text }]
+}
+
+// flushNarration moves the in-progress answer text into the trace as a
+// narration step and clears the answer buffer — called when a tool round starts
+// mid-answer, so the answer ends up being only the final (post-tool) text.
+function flushNarration(m: Message): { content: string; reasoning: ReasoningItem[] } {
+  if (m.content.trim()) {
+    return { content: '', reasoning: appendNarration(m.reasoning ?? [], m.content) }
+  }
+  return { content: m.content, reasoning: m.reasoning ?? [] }
+}
+
+function patchReasoningTool(
+  reasoning: ReasoningItem[],
+  id: string,
+  patch: Partial<ToolCall>,
+): ReasoningItem[] {
+  return reasoning.map((it) =>
+    it.kind === 'tool' && it.id === id ? { ...it, tool: { ...it.tool, ...patch } } : it,
+  )
+}
+
+function interruptRunningTools(reasoning: ReasoningItem[] | undefined): ReasoningItem[] | undefined {
+  if (!reasoning?.some((item) => item.kind === 'tool' && item.tool.status === 'running')) {
+    return reasoning
+  }
+  const endedAt = Date.now()
+  return reasoning.map((item) =>
+    item.kind === 'tool' && item.tool.status === 'running'
+      ? { ...item, tool: { ...item.tool, status: 'error', endedAt } }
+      : item,
+  )
+}
+
+export function toLocalMessage(m: ApiMessage): Message {
+  // Walk blocks IN ORDER so the reasoning trace interleaves thinking runs and
+  // tool rounds exactly as they occurred (§7.1-4). Text blocks accumulate into
+  // the final answer; artifacts are collected separately.
+  const reasoning: ReasoningItem[] = []
+  const artifacts: Message['artifacts'] = []
+  let research: ResearchState | undefined
+  let thinkingMs: number | undefined
+  const blocks = m.blocks ?? []
+  const failedToolIDs = new Set(
+    blocks
+      .filter(
+        (block) => block.kind === 'tool_output' && block.summary === 'error' && block.tool_id,
+      )
+      .map((block) => block.tool_id as string),
+  )
+  const lastToolBlockIndex = blocks.reduce(
+    (lastIndex, block, blockIndex) => (block.kind === 'tool_call' ? blockIndex + 1 : lastIndex),
+    0,
+  )
+  // Text accumulates into `pendingText`; when a tool_call follows, that text was
+  // pre-tool narration → flush it into the trace. Only the trailing text (after
+  // the last tool_call) is the final answer (§4.3 — mirrors the live flush).
+  let pendingText = ''
+  let idx = 0
+  for (const b of blocks) {
+    idx++
+    if (b.kind === 'text') {
+      pendingText += b.text ?? ''
+    } else if (b.kind === 'research') {
+      // Deep Research panel state — rehydrate it; presence implies the turn was
+      // a deep-research turn.
+      try {
+        research = JSON.parse(b.text ?? '{}') as ResearchState
+      } catch {
+        /* ignore malformed state */
+      }
+    } else if (b.kind === 'thinking') {
+      if (typeof b.thinking_ms === 'number' && b.thinking_ms > 0) {
+        thinkingMs = Math.max(thinkingMs ?? 0, b.thinking_ms)
+      }
+      const text = b.text ?? ''
+      if (!text) continue
+      const last = reasoning[reasoning.length - 1]
+      if (last && last.kind === 'thinking') {
+        // Merge consecutive thinking blocks into one run.
+        last.text += text
+      } else {
+        reasoning.push({ kind: 'thinking', id: `${m.id}-r${idx}`, text })
+      }
+    } else if (b.kind === 'artifact') {
+      artifacts.push({
+        id: b.file_ref ?? uid('art'),
+        filename: b.title ?? 'file',
+        url: b.url ?? '',
+        // §4.12 reload fidelity: persist mime type from the block so reloaded
+        // artifacts still render as <img> instead of falling back to a generic
+        // download chip. The orchestrator writes the mime onto the artifact
+        // block's `summary` field at finalize (it's already on the SSE event),
+        // so picking it up here closes the reload gap.
+        mimeType: b.summary ?? '',
+      })
+    } else if (b.kind === 'tool_call') {
+      // Flush any narration that preceded this tool into the trace.
+      if (pendingText.trim()) {
+        reasoning.push({ kind: 'narration', id: `${m.id}-n${idx}`, text: pendingText })
+        pendingText = ''
+      }
+      const id = b.tool_id ?? `${m.id}-r${idx}`
+      // Older rows predate the canonical tool_output status block and only
+      // marked a failed result by prefixing the tool_call summary with Error:.
+      const toolFailed = failedToolIDs.has(id) || /^error\s*:/i.test(b.summary?.trim() ?? '')
+      reasoning.push({
+        kind: 'tool',
+        id,
+        tool: {
+          id,
+          name: b.tool_name ?? 'tool',
+          label: b.tool_label || prettyToolLabel(b.tool_name ?? 'tool'),
+          icon: b.tool_icon || undefined,
+          status:
+            toolFailed || (m.status === 'error' && idx === lastToolBlockIndex && !b.summary)
+              ? 'error'
+              : 'complete',
+          startedAt: m.created_at * 1000,
+          endedAt: m.created_at * 1000,
+          // Persisted blocks currently carry no per-tool timestamps. Keep the
+          // ordering and status, but do not misrepresent every historical run
+          // as having completed in zero seconds.
+          timingKnown: false,
+          output: toolFailed ? sanitizeToolErrorOutput(b.summary) : b.summary,
+          // Reloaded tool rounds keep their input so the subtitle (query/code)
+          // still renders (§7.1-4).
+          input:
+            b.input && typeof b.input === 'object'
+              ? (b.input as Record<string, unknown>)
+              : undefined,
+        },
+      })
+    }
+  }
+  // Trailing text after the last tool_call (or all text when there were no
+  // tools) is the final answer.
+  const content = pendingText
+  return {
+    id: m.id,
+    parentId: m.parent_id || undefined,
+    authorId: m.author_id || undefined,
+    authorName: m.author_name || undefined,
+    authorAvatar: m.author_avatar || undefined,
+    role: m.role,
+    content,
+    reasoning: reasoning.length > 0 ? reasoning : undefined,
+    thinkingMs,
+    research,
+    mode: research ? 'deep-research' : undefined,
+    artifacts: artifacts.length > 0 ? artifacts : undefined,
+    modelId: m.model_id || undefined,
+    modelLabel: m.model_label || undefined,
+    fast: m.fast === true,
+    createdAt: m.created_at * 1000,
+    streaming: m.status === 'streaming',
+    stopped: m.stop_reason === 'stopped' || m.status === 'stopped',
+    cost: m.cost > 0 ? m.cost : undefined,
+    credits: m.credits && m.credits > 0 ? m.credits : undefined,
+    genMs: m.gen_ms && m.gen_ms > 0 ? m.gen_ms : undefined,
+    currency: m.currency || undefined,
+    // §verify: rehydrate the persisted auditor result (snake_case → camelCase).
+    // No `status` ⇒ settled; the badge reads `verdict`.
+    verify: m.verify
+      ? {
+          verdict: m.verify.verdict,
+          findings: (m.verify.findings ?? []).map((f) => ({
+            severity: f.severity === 'error' || f.severity === 'warning' ? f.severity : 'note',
+            quote: f.quote ?? '',
+            issue: f.issue ?? '',
+          })),
+          auditorModelId: m.verify.auditor_model_id,
+          auditorLabel: m.verify.auditor_label,
+        }
+      : undefined,
+    citations:
+      m.citations && m.citations.length > 0
+        ? m.citations.map((c) => ({
+            id: c.id,
+            index: c.index,
+            title: c.title,
+            url: c.url,
+            domain: safeDomain(c.url),
+            snippet: c.snippet,
+            source: c.source,
+          }))
+        : undefined,
+    attachments:
+      m.attachments && m.attachments.length > 0
+        ? m.attachments.map((a) => ({
+            id: a.id,
+            name: a.filename,
+            size: 0,
+            kind: (a.kind as Attachment['kind']) || 'other',
+            previewUrl: a.url,
+            documentId: a.document_id,
+            deleted: a.deleted,
+          }))
+        : undefined,
+    branchIndex: m.branch_index,
+    branchCount: m.branch_count,
+    siblings: m.siblings,
+    liked: m.feedback === 'like',
+    disliked: m.feedback === 'dislike',
+    feedbackReasons: m.feedback_reasons,
+    feedbackComment: m.feedback_comment,
+    moderation: m.stop_reason === 'content_moderation',
+    quotaExceeded: m.stop_reason === 'quota_exceeded',
+    refused:
+      m.stop_reason === 'content_moderation' ||
+      m.stop_reason === 'content_filter' ||
+      m.stop_reason === 'refusal' ||
+      m.stop_reason === 'safety',
+    errorCode:
+      m.stop_reason === GENERATION_INTERRUPTED_ERROR_CODE || m.status === 'error'
+        ? GENERATION_INTERRUPTED_ERROR_CODE
+        : undefined,
+    // Never render an empty bubble: surface a persisted error, and treat a
+    // finished-but-empty assistant turn (upstream failed without a usable reply,
+    // no refusal/moderation/quota) as a failure so the retry banner shows.
+    error: errorFromApiMessage(m, content, reasoning.length, artifacts.length, Boolean(research)),
+  }
+}
+
+// errorFromApiMessage decides whether a reloaded message should show the red
+// "reply failed — retry" banner: an explicit error status/string, or an
+// assistant turn that finished with no content, reasoning, or artifacts and
+// wasn't a refusal/moderation/quota stop.
+function errorFromApiMessage(
+  m: ApiMessage,
+  content: string,
+  reasoningCount: number,
+  artifactCount: number,
+  hasResearch: boolean,
+): string | undefined {
+  if (m.stop_reason === GENERATION_INTERRUPTED_ERROR_CODE) {
+    return sanitizeUserVisibleError(m.error, 'Generation interrupted. Please try again.')
+  }
+  if (m.error && m.error.trim()) return sanitizeUserVisibleError(m.error)
+  const refusalLike =
+    m.stop_reason === 'content_moderation' ||
+    m.stop_reason === 'content_filter' ||
+    m.stop_reason === 'refusal' ||
+    m.stop_reason === 'safety' ||
+    m.stop_reason === 'quota_exceeded' ||
+    // A user-stopped turn is a deliberate halt, not a failure — even if it
+    // produced no content before the stop, never show the retry banner.
+    m.stop_reason === 'stopped' ||
+    m.status === 'stopped'
+  const emptyAssistant =
+    m.role === 'assistant' &&
+    m.status !== 'streaming' &&
+    !content.trim() &&
+    reasoningCount === 0 &&
+    artifactCount === 0 &&
+    !hasResearch &&
+    !refusalLike
+  if (m.status === 'error' || emptyAssistant) {
+    return 'The model returned no response. Please try again.'
+  }
+  return undefined
+}
+
+function attachmentToApi(a: Attachment): ApiAttachment {
+  return {
+    id: a.id,
+    filename: a.name,
+    mime_type: '',
+    kind: a.kind,
+    url: a.previewUrl ?? '',
+    document_id: a.documentId,
+  }
+}
+
+// SendInput is the public surface used by ChatHome / ChatThread.
+export interface SendInput {
+  conversationId: string
+  text: string
+  modelId?: string
+  attachments?: Attachment[]
+  parentId?: string
+  /** param_controls values (§2.3-G). */
+  params?: Record<string, unknown>
+}
+
+// truncateToParent returns the visible path up to and INCLUDING `parentId`,
+// dropping everything after it — the optimistic basis for opening a new branch
+// (§4.15 edit / regenerate). An empty/undefined parent means "branch from the
+// root", so the whole path is cleared. A parent that isn't on the current path
+// (shouldn't happen) falls back to keeping the path intact.
+function truncateToParent(messages: Message[], parentId: string | undefined): Message[] {
+  if (!parentId) return []
+  const idx = messages.findIndex((m) => m.id === parentId)
+  if (idx < 0) return messages.slice()
+  return messages.slice(0, idx + 1)
+}
+
+function replaceOrPrepend(
+  list: Conversation[],
+  next: Conversation,
+  kbSelectionGuard?: KnowledgeBaseSelectionRequestGuard,
+): Conversation[] {
+  const idx = list.findIndex((c) => c.id === next.id)
+  if (idx < 0) return [next, ...list]
+  const out = list.slice()
+  out[idx] = preservePendingKnowledgeBaseSelection(next, list[idx], kbSelectionGuard)
+  return out
+}
+
+// Exported for the §23 realtime module: a remote delete must cascade exactly
+// like a local one (the conversation plus every inline sub-conversation
+// transitively anchored to it — mirrors the backend cascade).
+export function collectDoomedConversationIds(list: Conversation[], id: string): Set<string> {
+  const doomed = new Set<string>([id])
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const c of list) {
+      if (!doomed.has(c.id) && c.inline && doomed.has(c.inline.sourceConvId)) {
+        doomed.add(c.id)
+        grew = true
+      }
+    }
+  }
+  return doomed
+}
+
+function mergeStreamingSummaries(
+  existing: Conversation[],
+  incoming: Conversation[],
+  kbSelectionGuards?: Map<string, KnowledgeBaseSelectionRequestGuard>,
+): Conversation[] {
+  const byID = new Map(existing.map((c) => [c.id, c]))
+  const merged = incoming.map((remote) => {
+    let next = remote
+    const cur = byID.get(next.id)
+    next = preservePendingKnowledgeBaseSelection(
+      next,
+      cur,
+      kbSelectionGuards?.get(next.id),
+    )
+    if (!cur || cur.messages.length === 0) return next
+    const streaming = cur.messages.some((m) => m.streaming)
+    return {
+      ...next,
+      // The list endpoint carries no messages — never clobber a transcript a
+      // concurrent loadOne already hydrated (boot/deep-link race, workspace
+      // switch while the thread is open, Privacy-page / unarchive reloads).
+      messages: cur.messages,
+      lastParams: cur.lastParams,
+      hasOlder: cur.hasOlder,
+      olderCursor: cur.olderCursor,
+      // A live stream additionally keeps its optimistic sort bump + title.
+      updatedAt: streaming ? Math.max(cur.updatedAt, next.updatedAt) : next.updatedAt,
+      title: streaming ? next.title || cur.title : next.title,
+    }
+  })
+  // Canvas generations use archived conversations so they stay out of the
+  // sidebar. Keep an archived/local conversation in the in-memory cache while
+  // its assistant is still streaming; otherwise a background list refresh can
+  // remove it before a slow image provider emits the final artifact.
+  const incomingIDs = new Set(incoming.map((conversation) => conversation.id))
+  const activeWorkspace = activeWorkspaceId()
+  const hiddenStreaming = existing.filter(
+    (conversation) =>
+      !incomingIDs.has(conversation.id) &&
+      conversation.messages.some((message) => message.streaming) &&
+      (conversation.workspaceId ?? '') === (activeWorkspace ?? ''),
+  )
+  return hiddenStreaming.length > 0 ? [...merged, ...hiddenStreaming] : merged
+}
+
+function safeDomain(u: string): string {
+  try {
+    return new URL(u).hostname
+  } catch {
+    return u
+  }
+}
+
+function prettyToolLabel(name: string): string {
+  switch (name) {
+    case 'web_search':
+    case 'aivory_web_search':
+      return 'Searching the web'
+    case 'web_fetch':
+      return 'Reading a web page'
+    case 'python_execute':
+      return 'Running Python'
+    case 'code_interpreter':
+      return 'Running code interpreter'
+    case 'image_generate':
+      return 'Generating an image'
+    case 'image_generation':
+      return 'Generating an image'
+    case 'use_skill':
+      return 'Loading a skill'
+    case 'save_memory':
+      return 'Saving memory'
+    default:
+      return name
+  }
+}
+
+function errorMessage(e: unknown, fallback = 'Something went wrong'): string {
+  if (e instanceof ApiError) {
+    if (e.message === 'knowledge_base_selection_incompatible') {
+      return i18n.t('chat:composer.incompatibleKnowledgeBase')
+    }
+    return e.message
+  }
+  if (e instanceof Error) return e.message
+  return fallback
+}
+
+function isFailedTerminalStopReason(stopReason?: string): boolean {
+  return stopReason === GENERATION_INTERRUPTED_ERROR_CODE || stopReason === 'error' || stopReason === 'failed'
+}
+
+function applyTerminalFailure(m: Message, stopReason?: string): Message {
+  if (!isFailedTerminalStopReason(stopReason)) return m
+  return {
+    ...m,
+    error: m.error || 'Generation interrupted. Please try again.',
+    errorCode: m.errorCode || GENERATION_INTERRUPTED_ERROR_CODE,
+  }
+}
+
+// updateAssistant edits an assistant message inside a conversation by id.
+function updateAssistant(
+  set: (fn: (s: ConversationStore) => Partial<ConversationStore>) => void,
+  conversationId: string,
+  assistantId: string,
+  patch: (m: Message) => Message,
+) {
+  set((s) => ({
+    conversations: s.conversations.map((c) =>
+      c.id !== conversationId
+        ? c
+        : // NOTE: do NOT bump updatedAt here. This runs on every streamed token;
+          // changing updatedAt would re-sort the sidebar and (via the summary
+          // equality below) force every list subscriber to re-render 60×/s. The
+          // conversation is already hoisted to the top by sendMessage/regenerate
+          // when the turn starts, which is the only time its position should move.
+          { ...c, messages: c.messages.map((m) => (m.id === assistantId ? patch(m) : m)) },
+    ),
+  }))
+}
+
+/**
+ * sameConvListShape is an equality fn for list subscribers (sidebar, command
+ * menu) that care about a conversation's SUMMARY — id, title, flags, position —
+ * but NOT its message content. Returning true skips the re-render. This is what
+ * stops the per-token streaming updates (which only mutate `messages`) from
+ * re-running the sidebar's filter/sort/bucket pipeline and reconciling every row.
+ * Pass it as the second arg to useConversations(selector, sameConvListShape).
+ */
+export function sameConvListShape(a: Conversation[], b: Conversation[]): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]
+    const y = b[i]
+    if (x === y) continue
+    if (
+      x.id !== y.id ||
+      x.title !== y.title ||
+      x.updatedAt !== y.updatedAt ||
+      x.pinned !== y.pinned ||
+      x.starred !== y.starred ||
+      x.archived !== y.archived ||
+      x.projectId !== y.projectId ||
+      x.isPublic !== y.isPublic ||
+      Boolean(x.inline) !== Boolean(y.inline) ||
+      x.messages.some((m) => m.streaming) !== y.messages.some((m) => m.streaming)
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+/** Used by the legacy mock-data path; preserved so any seed-derived stuff
+ *  that still calls these helpers does not break. */
+export function buildUserMessage(content: string, attachments?: Attachment[]): Message {
+  return {
+    id: uid('m'),
+    role: 'user',
+    content,
+    createdAt: Date.now(),
+    attachments: attachments?.length ? attachments : undefined,
+  }
+}
+
+export function buildAssistantPlaceholder(): Message {
+  return {
+    id: uid('m'),
+    role: 'assistant',
+    content: '',
+    createdAt: Date.now(),
+    streaming: true,
+  }
+}

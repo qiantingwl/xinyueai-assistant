@@ -1,0 +1,134 @@
+# Server deployment for the Aivory sandbox.
+#
+# Pull-and-run on the server (no build needed — images come from ghcr.io):
+#   export OWNER=hjxwz123
+#   export SANDBOX_API_KEY=$(openssl rand -hex 24)
+#   docker compose pull && docker compose up -d
+#
+# Then point the Go backend at it:
+#   SANDBOX_BASE_URL=http://<server>:48217
+#   SANDBOX_API_KEY=<same value as above>
+#
+# The sidecar drives the host Docker daemon (mounted socket) to spawn one
+# locked-down `aivory-sandbox` container per session. SANDBOX_PULL_ON_START
+# makes it fetch the runtime image on boot so the first /sessions call works.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY NOTE — host-takeover risk via docker.sock + root sidecar (F1)
+# ─────────────────────────────────────────────────────────────────────────────
+# This service mounts /var/run/docker.sock and uses it to create/start/exec
+# containers. That socket is root-equivalent on the host: anyone who can drive
+# it (i.e. anyone who reaches this service) can take over the host (mount the
+# host FS into a container, run privileged, etc.). The architecture REQUIRES the
+# socket, so it is intentionally kept — but harden the blast radius:
+#
+#   1. SANDBOX_API_KEY is MANDATORY. The sidecar now refuses to start without it
+#      (set SANDBOX_ALLOW_NO_AUTH=1 only on a trusted localhost-only dev box).
+#   2. Do NOT expose port 48217 to the public internet. Bind it to a private
+#      interface / VPN, or front it with mTLS. The main app reaches it over the
+#      private network only.
+#   3. STRONGLY RECOMMENDED: put a docker-socket-proxy in front of the real
+#      socket instead of mounting it raw, restricted to just the calls this
+#      service makes (container create/start/exec/kill/inspect + image pull):
+#
+#        socket-proxy:
+#          image: tecnativa/docker-socket-proxy
+#          environment:
+#            CONTAINERS: 1    # create / inspect / rm
+#            POST: 1          # required for create/start/exec/kill
+#            EXEC: 1          # docker exec
+#            IMAGES: 1        # docker pull (SANDBOX_PULL_ON_START)
+#            VERSION: 1       # /healthz
+#            # leave everything else at 0 (no SWARM/NETWORKS/VOLUMES/INFO/AUTH…)
+#          volumes:
+#            - /var/run/docker.sock:/var/run/docker.sock:ro
+#          # do not publish this; only the sandbox service should reach it
+#        # then on the sandbox service set: DOCKER_HOST: tcp://socket-proxy:2375
+#        # and mount nothing under /var/run.
+#
+#   4. Pin a seccomp profile on the SESSION containers via SANDBOX_SECCOMP_PROFILE
+#      (path readable INSIDE this sidecar; e.g. mount a profile and point at it).
+#      Combined with the already-set --cap-drop ALL and
+#      --security-opt no-new-privileges this narrows the per-session kernel
+#      attack surface. Leave unset to use docker's built-in default profile.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  sandbox:
+    image: ghcr.io/${OWNER:-hjxwz123}/aivory-sandbox-sidecar:latest
+    restart: unless-stopped
+    ports:
+      # Host port is an uncommon high port to avoid clashes with other
+      # services; the in-container port stays 8000.
+      - "48217:8000"
+    environment:
+      SANDBOX_IMAGE: ghcr.io/${OWNER:-hjxwz123}/aivory-sandbox:latest
+      SANDBOX_PULL_ON_START: "1"
+      SANDBOX_MEMORY: 2g
+      SANDBOX_CPUS: "1"
+      SANDBOX_MAX_SESSIONS: "16"
+      SANDBOX_MAX_CONCURRENT_EXECS: "4"
+      SANDBOX_MAX_CONCURRENT_CREATES: "2"
+      SANDBOX_MAX_UPLOAD_BYTES: "41943040"
+      SANDBOX_MAX_FILES_PER_EXEC: "20"
+      SANDBOX_MAX_TOTAL_ARTIFACT_BYTES: "52428800"
+      # F5: control-plane OOM guards (reject oversized requests up front).
+      SANDBOX_MAX_BODY_BYTES: "58720256"   # 56 MiB; > 40 MiB upload after base64
+      SANDBOX_MAX_CODE_BYTES: "1048576"    # 1 MiB cap on /exec `code`
+      # F6: disk-fill DoS guards. Read-only rootfs + size-bounded writable
+      # /workspace tmpfs are ON by default; tune the workspace size here. Set
+      # SANDBOX_DISK_SIZE only on an overlay2+prjquota host (opt-in, best-effort).
+      SANDBOX_READ_ONLY_ROOTFS: "1"
+      SANDBOX_WORKSPACE_SIZE: 512m
+      # SANDBOX_DISK_SIZE: 1g
+      # §4.5-F zero-config workspace persistence: the admin `storage_provider`
+      # defaults to "local", so reaped /workspace tarballs are archived here (the
+      # named volume below) and RESTORED when the conversation runs code again —
+      # archives are keyed by conversation id, so they survive session recycle
+      # (§4.5-C G2). No S3/OSS/MinIO needed. Unset the provider (or drop the
+      # volume) for ephemeral "reaped = gone". Single-node only (a plain volume
+      # isn't shared across replicas); multi-replica deployments must use S3/OSS.
+      SANDBOX_LOCAL_STORAGE_DIR: /var/lib/aivory/sandbox-archives
+      # F1: optional pinned seccomp profile for session containers (path must be
+      # readable INSIDE this sidecar container — mount it and point here).
+      # SANDBOX_SECCOMP_PROFILE: /seccomp/aivory-sandbox.json
+      # F2: MANDATORY. The sidecar exposes host Docker control (RCE) and refuses
+      # to start without this. Generate with: openssl rand -hex 24
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:?set SANDBOX_API_KEY (openssl rand -hex 24); the sandbox refuses to start without it}
+    # Liveness probe via urllib (no curl/wget in the image); non-2xx raises ->
+    # unhealthy. start_period covers SANDBOX_PULL_ON_START on a cold boot.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # Bound the control-plane container itself; mem_limit must exceed the in-memory
+    # archive buffer (SANDBOX_MAX_ARCHIVE_BYTES, default 200 MiB) + storage bodies.
+    mem_limit: 1g
+    pids_limit: 512
+    volumes:
+      # The sidecar needs the host daemon to spawn sibling session containers.
+      # See the SECURITY NOTE above: prefer a docker-socket-proxy over the raw
+      # socket, restricted to container create/start/exec/kill + image pull.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # §4.5 durable local archive store (SANDBOX_LOCAL_STORAGE_DIR above). Keep
+      # it OUT of any session container's reach — it holds cross-session tarballs.
+      - sandbox-archives:/var/lib/aivory/sandbox-archives
+
+  # Pins the runtime image locally so `docker image prune -a` (or a cleanup cron)
+  # can't evict it between sessions — the per-session containers are ephemeral, so
+  # otherwise nothing references it and the next session-create cold-pulls ~600MB
+  # and times out (500). This idle container just sleeps at ~zero cost. It carries
+  # NO `aivory.sandbox=1` label and no `aivory-sbx-` name, so the sidecar's reaper
+  # / MAX_SESSIONS counter ignore it.
+  sandbox-image-keepalive:
+    image: ghcr.io/${OWNER:-hjxwz123}/aivory-sandbox:latest
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+    network_mode: none
+    mem_limit: 64m
+    pids_limit: 16
+
+volumes:
+  sandbox-archives:

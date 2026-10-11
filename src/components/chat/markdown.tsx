@@ -1,0 +1,253 @@
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useState, type MouseEvent } from 'react'
+import {
+  tokenizeMarkdown,
+  inlineMarkdownToHtml,
+  blockMarkdownToHtml,
+  type CiteRef,
+  type MarkdownBlock,
+} from '@/lib/markdown'
+import { CodeBlock } from './code-block'
+import { MermaidDiagram } from './mermaid-diagram'
+import { cn, safeHref } from '@/lib/utils'
+import { rewriteSandboxArtifactLinks } from '@/lib/artifact-links'
+
+import type { ArtifactRef, Citation } from '@/types/chat'
+import {
+  documentIdFromCitationUrl,
+  isDocumentCitation,
+  isKnowledgeBaseCitation,
+} from '@/lib/citations'
+
+interface MarkdownProps {
+  content: string
+  className?: string
+  /** True while the owning message is still streaming (drives live HTML preview). */
+  live?: boolean
+  /** Stable prefix (message id) so code blocks keep their identity across remounts. */
+  blockKeyPrefix?: string
+  /** Citations for this turn — inline `[n]` markers become source links. */
+  citations?: Citation[]
+  /** Artifacts owned by this message, used to resolve sandbox output links. */
+  artifacts?: ArtifactRef[]
+  /** Opens an authenticated preview for an inline knowledge-base citation. */
+  onOpenDocumentCitation?: (citation: Citation) => void
+  /**
+   * Render a single newline as a hard line break (<br>). Off by default so
+   * assistant markdown follows standard rendering (soft `\n` = space). Turn ON
+   * for literal user input and thinking text, where the author's own line
+   * breaks are meaningful and must survive.
+   */
+  breaks?: boolean
+}
+
+function HeadingTag({ depth, html, className }: { depth: number; html: string; className?: string }) {
+  const base = 'font-sans font-semibold tracking-tight text-[var(--color-fg)]'
+  const inner = <span dangerouslySetInnerHTML={{ __html: html }} />
+  switch (depth) {
+    case 1:
+      return <h1 className={cn(base, 'text-2xl mt-6', className)}>{inner}</h1>
+    case 2:
+      return <h2 className={cn(base, 'text-xl mt-6', className)}>{inner}</h2>
+    case 3:
+      return <h3 className={cn(base, 'text-lg mt-5', className)}>{inner}</h3>
+    case 4:
+      return <h4 className={cn('font-sans font-semibold text-base mt-4 text-[var(--color-fg)]', className)}>{inner}</h4>
+    default:
+      return <h5 className={cn('font-sans font-semibold text-sm mt-3 text-[var(--color-fg)]', className)}>{inner}</h5>
+  }
+}
+
+interface MarkdownBlockViewProps {
+  block: MarkdownBlock
+  index: number
+  live: boolean
+  blockKeyPrefix?: string
+  cites: CiteRef[]
+  breaks: boolean
+}
+
+/**
+ * A streamed reply only changes its trailing block most of the time. Keeping
+ * each block behind its own memo boundary prevents stable leading paragraphs
+ * from repeatedly running marked, KaTeX and the DOM sanitizer as the tail
+ * grows. The parent still tokenizes the complete source, so Markdown boundary
+ * semantics and the final rendered output remain identical.
+ */
+const MarkdownBlockView = memo(
+  function MarkdownBlockView({ block: b, index, live, blockKeyPrefix, cites, breaks }: MarkdownBlockViewProps) {
+    const blockAnim = live ? 'animate-[fade-in_500ms_var(--ease-out)_backwards]' : undefined
+
+    switch (b.type) {
+      case 'heading':
+        return <HeadingTag depth={b.depth ?? 2} html={inlineMarkdownToHtml(b.content, cites, breaks)} className={blockAnim} />
+      case 'paragraph':
+        return (
+          <p
+            className={cn('leading-relaxed text-[var(--color-fg)]', blockAnim)}
+            dangerouslySetInnerHTML={{ __html: inlineMarkdownToHtml(b.content, cites, breaks) }}
+          />
+        )
+      case 'list':
+      case 'ordered-list':
+        return (
+          <div
+            className={cn(
+              'my-3 text-[var(--color-fg)] leading-relaxed',
+              '[&_ul]:list-disc [&_ol]:list-decimal [&_ul]:pl-5 [&_ol]:pl-5',
+              '[&_ul]:my-1 [&_ol]:my-1 [&_li]:my-1 [&_li]:pl-0.5',
+              '[&_ul_ul]:list-[circle] [&_ul_ul]:my-0.5 [&_ol_ol]:my-0.5 [&_li_p]:my-0',
+              blockAnim,
+            )}
+            dangerouslySetInnerHTML={{ __html: blockMarkdownToHtml(b.content, cites, breaks) }}
+          />
+        )
+      case 'code':
+        if ((b.lang ?? '').toLowerCase() === 'mermaid') {
+          return <MermaidDiagram code={b.content} live={live} className={blockAnim} />
+        }
+        return (
+          <CodeBlock
+            code={b.content}
+            lang={b.lang}
+            live={live}
+            className={blockAnim}
+            previewKey={blockKeyPrefix ? `${blockKeyPrefix}#${index}` : undefined}
+          />
+        )
+      case 'blockquote':
+        return (
+          <blockquote
+            className={cn(
+              'border-l-2 border-[var(--color-border-strong)] pl-4 text-[var(--color-fg-muted)] italic',
+              blockAnim,
+            )}
+            dangerouslySetInnerHTML={{ __html: inlineMarkdownToHtml(b.content, cites, breaks) }}
+          />
+        )
+      case 'math':
+        return (
+          <div
+            className={cn('my-3 overflow-x-auto', blockAnim)}
+            dangerouslySetInnerHTML={{ __html: b.content }}
+          />
+        )
+      case 'hr':
+        return <hr className={cn('my-6 border-[var(--color-divider)]', blockAnim)} />
+      case 'table':
+        return (
+          <div
+            className={cn(
+              'my-4 overflow-x-auto rounded-[10px] border border-[var(--color-border)]',
+              '[&_table]:w-full [&_table]:border-collapse [&_table]:text-sm',
+              '[&_thead]:bg-[var(--color-bg-muted)]',
+              '[&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:text-[var(--color-fg)] [&_th]:border-b [&_th]:border-[var(--color-border)]',
+              '[&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td]:text-[var(--color-fg-muted)] [&_td]:border-b [&_td]:border-[var(--color-divider)]',
+              '[&_tr:last-child_td]:border-b-0',
+              blockAnim,
+            )}
+            dangerouslySetInnerHTML={{ __html: blockMarkdownToHtml(b.content, cites, breaks) }}
+          />
+        )
+      default:
+        return null
+    }
+  },
+  (prev, next) =>
+    prev.index === next.index &&
+    prev.live === next.live &&
+    prev.blockKeyPrefix === next.blockKeyPrefix &&
+    prev.cites === next.cites &&
+    prev.breaks === next.breaks &&
+    prev.block.type === next.block.type &&
+    prev.block.content === next.block.content &&
+    prev.block.depth === next.block.depth &&
+    prev.block.lang === next.block.lang,
+)
+
+/**
+ * useThrottledContent caps how often `content` is recomputed during a stream.
+ * Streaming token-by-token re-renders trigger a full markdown re-parse on
+ * every keystroke (16ms cadence with a fast model) which dominates CPU. We
+ * use React's `useDeferredValue` PLUS a 50ms wall-clock floor so the rendered
+ * value stops trying to keep up with the slot at sub-frame granularity.
+ *
+ * Final value (when the stream ends) is always flushed verbatim.
+ */
+function useThrottledContent(content: string, intervalMs = 50): string {
+  const deferred = useDeferredValue(content)
+  const [snap, setSnap] = useState(deferred)
+  useEffect(() => {
+    if (deferred === snap) return
+    const t = setTimeout(() => setSnap(deferred), intervalMs)
+    return () => clearTimeout(t)
+  }, [deferred, snap, intervalMs])
+  return snap
+}
+
+export const Markdown = memo(function Markdown({
+  content,
+  className,
+  live = false,
+  blockKeyPrefix,
+  citations,
+  artifacts,
+  onOpenDocumentCitation,
+  breaks = false,
+}: MarkdownProps) {
+  const contentWithArtifactLinks = useMemo(
+    () => rewriteSandboxArtifactLinks(content, artifacts),
+    [content, artifacts],
+  )
+  const throttled = useThrottledContent(contentWithArtifactLinks)
+  const blocks = useMemo(() => tokenizeMarkdown(throttled, breaks), [throttled, breaks])
+  // Map citations to the lib's CiteRef shape once; `inline`/`block` helpers thread
+  // them into the HTML so `[n]` markers become source links.
+  const cites = useMemo<CiteRef[]>(
+    () =>
+      (citations ?? []).map((c) => ({
+        index: c.index,
+        url: c.url,
+        title: c.title,
+        domain: c.domain,
+        isDoc: isDocumentCitation(c) || !safeHref(c.url),
+        documentID:
+          onOpenDocumentCitation && isKnowledgeBaseCitation(c)
+            ? documentIdFromCitationUrl(c.url)
+            : undefined,
+      })),
+    [citations, onOpenDocumentCitation],
+  )
+  const handleCitationClick = useCallback(
+    (event: MouseEvent<HTMLDivElement>) => {
+      if (!onOpenDocumentCitation || !(event.target instanceof Element)) return
+      const trigger = event.target.closest<HTMLButtonElement>('button[data-doc-citation-index]')
+      if (!trigger || !event.currentTarget.contains(trigger)) return
+      const index = Number(trigger.dataset.docCitationIndex)
+      const citation = citations?.find((item) => item.index === index)
+      if (
+        !citation ||
+        !isKnowledgeBaseCitation(citation) ||
+        !documentIdFromCitationUrl(citation.url)
+      ) return
+      onOpenDocumentCitation(citation)
+    },
+    [citations, onOpenDocumentCitation],
+  )
+  if (!content) return null
+
+  return (
+    <div className={cn('prose-aivory', className)} onClick={handleCitationClick}>
+      {blocks.map((block, index) => (
+        <MarkdownBlockView
+          key={index}
+          block={block}
+          index={index}
+          live={live}
+          blockKeyPrefix={blockKeyPrefix}
+          cites={cites}
+          breaks={breaks}
+        />
+      ))}
+    </div>
+  )
+})

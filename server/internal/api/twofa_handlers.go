@@ -1,0 +1,321 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"aivory/server/internal/auth"
+	"aivory/server/internal/envcfg"
+	"aivory/server/internal/store"
+)
+
+// Two-factor (TOTP) login (§ 2FA). Setup hands the user a secret; enable proves
+// possession with a code; once enabled, password login returns a short-lived
+// ticket instead of a session, and the code must be supplied to finish.
+
+const twofaIssuer = "Aivory"
+
+var (
+	twofaLoginTicketBurnThreshold = envcfg.Int64("AIVORY_API_2FA_LOGIN_TICKET_BURN_THRESHOLD", 5)
+	issueTwofaTicketTTL           = securityDuration("AIVORY_API_ISSUE_TWOFA_TICKET", 5*time.Minute)
+)
+
+// twofaSetupHandler generates a fresh (not yet enabled) secret and returns the
+// provisioning URI for the user's authenticator app.
+func twofaSetupHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	if u.TotpEnabled {
+		writeError(w, 400, errors.New("two-factor is already enabled"))
+		return
+	}
+	secret, err := auth.GenerateTotpSecret()
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	if err := store.SetUserTotp(r.Context(), d.DB, u.ID, secret, false); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	invalidateAuthUser(d, u.ID)
+	writeJSON(w, 200, map[string]string{
+		"secret":      secret,
+		"otpauth_url": auth.TotpURI(secret, twofaIssuer, u.Email),
+	})
+}
+
+type twofaCodeReq struct {
+	Code string `json:"code"`
+}
+
+func normalizeTotpCode(code string) string {
+	return strings.ReplaceAll(strings.TrimSpace(code), " ", "")
+}
+
+// twofaEnableHandler turns 2FA on after verifying a code against the pending
+// secret created by setup.
+func twofaEnableHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	var req twofaCodeReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	if u.TotpSecret == "" {
+		writeError(w, 400, errors.New("start setup first"))
+		return
+	}
+	// Replay-attack guard: reject a code that was already consumed within the
+	// current 30-second window (±1 step tolerance = up to 90s of validity).
+	code := normalizeTotpCode(req.Code)
+	usedKey := fmt.Sprintf("2fa:used:%s:%s", u.ID, code)
+	if !auth.VerifyTotp(u.TotpSecret, code) {
+		writeError(w, 400, errors.New("invalid code"))
+		return
+	}
+	if !d.Cache.SetNX(usedKey, "1", 90*time.Second) {
+		writeError(w, 400, errors.New("TOTP code already used"))
+		return
+	}
+	if err := store.SetUserTotp(r.Context(), d.DB, u.ID, u.TotpSecret, true); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	invalidateAuthUser(d, u.ID)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// twofaDisableHandler turns 2FA off after verifying a current code.
+func twofaDisableHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	var req twofaCodeReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	if !u.TotpEnabled {
+		writeError(w, 400, errors.New("two-factor is not enabled"))
+		return
+	}
+	// Replay-attack guard.
+	code := normalizeTotpCode(req.Code)
+	usedKey := fmt.Sprintf("2fa:used:%s:%s", u.ID, code)
+	if !auth.VerifyTotp(u.TotpSecret, code) {
+		writeError(w, 400, errors.New("invalid code"))
+		return
+	}
+	if !d.Cache.SetNX(usedKey, "1", 90*time.Second) {
+		writeError(w, 400, errors.New("TOTP code already used"))
+		return
+	}
+	if err := store.DisableUserTotp(r.Context(), d.DB, u.ID); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	invalidateAuthUser(d, u.ID)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// adminDisableTwofaHandler lets an admin reset a user's 2FA — the recovery path
+// for a member who lost their authenticator device.
+func adminDisableTwofaHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	id := pathParam(r, "id")
+	if err := store.DisableUserTotp(r.Context(), d.DB, id); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	invalidateAuthUser(d, id)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+type login2faReq struct {
+	Ticket string `json:"ticket"`
+	Code   string `json:"code"`
+}
+
+// login2faHandler completes a 2FA-gated login: it exchanges the ticket from the
+// password step plus a valid code for a real session.
+func login2faHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	var req login2faReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	// Ticket comes from the JSON body (password-login flow) or, for the OAuth
+	// flow, from the short-lived HttpOnly cookie set by the callback (§A10).
+	ticket := req.Ticket
+	if ticket == "" {
+		if c, cerr := r.Cookie("aivory_2fa"); cerr == nil {
+			ticket = c.Value
+		}
+	}
+	if ticket == "" {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	// NOTE: do NOT clear the OAuth handoff cookie here. It used to be cleared
+	// unconditionally on every call, which meant a single wrong/premature code
+	// destroyed the cookie and ALL subsequent attempts failed with "expired" —
+	// even a correct one. (The password flow keeps its ticket in the request
+	// body, so it tolerated retries; the OAuth flow got exactly one shot.) We
+	// only clear the cookie once the ticket is actually consumed or burned.
+	rawTicket, ok := d.Cache.Get("2fa:" + ticket)
+	if !ok {
+		clear2faCookie(w) // dead ticket → the handoff cookie is useless now
+		d.Logger.Printf("[2fa] verify: ticket not found/expired (must redo sign-in)")
+		writeError(w, 401, errTwofaSessionExpired)
+		return
+	}
+	ticketData := parseTwofaLoginTicket(rawTicket)
+	if ticketData.Source != store.LoginMethodOAuth {
+		enabled, settingErr := passwordLoginEnabled(d)
+		if settingErr != nil {
+			writeError(w, http.StatusInternalServerError, settingErr)
+			return
+		}
+		if !enabled {
+			clear2faCookie(w)
+			_ = d.Cache.CompareAndDelete("2fa:"+ticket, rawTicket)
+			writeError(w, http.StatusForbidden, errPasswordLoginDisabled)
+			return
+		}
+	}
+	uid := ticketData.UserID
+	user, err := store.FindUserByID(r.Context(), d.DB, uid)
+	if err != nil || user.Status != "active" || !user.TotpEnabled || ticketData.TokenVer == nil || *ticketData.TokenVer != user.TokenVer {
+		clear2faCookie(w)
+		// Consume a ticket whose authentication context is no longer valid. The
+		// compare prevents a racing replacement from being deleted.
+		_ = d.Cache.CompareAndDelete("2fa:"+ticket, rawTicket)
+		writeError(w, 401, errTwofaInvalidSession)
+		return
+	}
+	if ticketData.Source == store.LoginMethodOAuth {
+		if ticketData.ProviderGuard == nil ||
+			store.ValidateOAuthProviderCallbackGuard(r.Context(), d.DB, *ticketData.ProviderGuard) != nil {
+			clear2faCookie(w)
+			_ = d.Cache.CompareAndDelete("2fa:"+ticket, rawTicket)
+			writeError(w, 401, errTwofaInvalidSession)
+			return
+		}
+	}
+	// Replay-attack guard: reject a code that was already consumed within the
+	// current window before we call VerifyTotp (which only checks correctness).
+	code := normalizeTotpCode(req.Code)
+	usedKey := fmt.Sprintf("2fa:used:%s:%s", uid, code)
+	if !auth.VerifyTotp(user.TotpSecret, code) {
+		// §A5: burn the ticket after 5 wrong codes so a captured ticket can't be
+		// brute-forced for its full TTL — the user must redo the password step.
+		// Until then KEEP the cookie so the user can retry (mirrors the
+		// body-ticket password flow).
+		burned := d.Cache.Incr("2fa:fail:"+ticket, 5*time.Minute) >= twofaLoginTicketBurnThreshold
+		if burned {
+			d.Cache.Delete("2fa:" + ticket)
+			d.Cache.Delete("2fa:fail:" + ticket)
+			clear2faCookie(w)
+		}
+		d.Logger.Printf("[2fa] verify: code rejected for user=%s (secretLen=%d, codeLen=%d, burned=%v)", uid, len(user.TotpSecret), len(strings.TrimSpace(req.Code)), burned)
+		writeError(w, 401, errTwofaInvalidCode)
+		return
+	}
+	if !d.Cache.SetNX(usedKey, "1", 90*time.Second) {
+		writeError(w, 401, errTwofaCodeUsed)
+		return
+	}
+	if !d.Cache.CompareAndDelete("2fa:"+ticket, rawTicket) {
+		clear2faCookie(w)
+		writeError(w, 401, errTwofaSessionExpired)
+		return
+	}
+	d.Cache.Delete("2fa:fail:" + ticket)
+	clear2faCookie(w)
+	method := store.LoginMethodPassword2FA
+	if ticketData.Source == store.LoginMethodOAuth {
+		method = store.LoginMethodOAuth2FA
+		finaliseOAuthLoginSession(d, w, r, user, method, *ticketData.ProviderGuard)
+		return
+	}
+	finaliseLoginSession(d, w, r, user, method)
+}
+
+// clear2faCookie expires the OAuth 2FA handoff cookie (Path must match the one
+// set in the OAuth callback).
+func clear2faCookie(w http.ResponseWriter) {
+	// Deletion only (MaxAge -1) — leave Secure off so the removal also takes
+	// effect over plain HTTP (a Secure Set-Cookie is ignored on http://).
+	http.SetCookie(w, &http.Cookie{
+		Name: "aivory_2fa", Value: "", Path: "/api/auth",
+		HttpOnly: true, Secure: false, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+	})
+}
+
+// issueTwofaTicket mints a short-lived ticket that stands in for a verified
+// password until the user supplies their 2FA code.
+type twofaLoginTicket struct {
+	UserID        string                            `json:"user_id"`
+	Source        string                            `json:"source"`
+	TokenVer      *int                              `json:"token_ver"`
+	ProviderGuard *store.OAuthProviderCallbackGuard `json:"provider_guard,omitempty"`
+}
+
+func issueTwofaTicket(d Deps, userID string, tokenVer int, source string) string {
+	return issueTwofaTicketWithOAuthGuard(d, userID, tokenVer, source, nil)
+}
+
+func issueOAuthTwofaTicket(
+	d Deps,
+	userID string,
+	tokenVer int,
+	guard store.OAuthProviderCallbackGuard,
+) string {
+	return issueTwofaTicketWithOAuthGuard(d, userID, tokenVer, store.LoginMethodOAuth, &guard)
+}
+
+func issueTwofaTicketWithOAuthGuard(
+	d Deps,
+	userID string,
+	tokenVer int,
+	source string,
+	guard *store.OAuthProviderCallbackGuard,
+) string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	ticket := hex.EncodeToString(buf)
+	if source == store.LoginMethodOAuth && guard == nil {
+		return ""
+	}
+	if source != store.LoginMethodOAuth {
+		source = store.LoginMethodPassword
+		guard = nil
+	}
+	payload, err := json.Marshal(twofaLoginTicket{
+		UserID: userID, Source: source, TokenVer: &tokenVer, ProviderGuard: guard,
+	})
+	if err != nil {
+		return ""
+	}
+	d.Cache.Set("2fa:"+ticket, string(payload), issueTwofaTicketTTL)
+	return ticket
+}
+
+// parseTwofaLoginTicket deliberately rejects pre-upgrade in-flight tickets for
+// redemption: legacy values contain no token version, so a password reset or
+// account-state change cannot be distinguished from the original authentication.
+func parseTwofaLoginTicket(raw string) twofaLoginTicket {
+	var ticket twofaLoginTicket
+	if json.Unmarshal([]byte(raw), &ticket) == nil && ticket.UserID != "" {
+		if ticket.Source != store.LoginMethodOAuth {
+			ticket.Source = store.LoginMethodPassword
+		}
+		return ticket
+	}
+	return twofaLoginTicket{}
+}

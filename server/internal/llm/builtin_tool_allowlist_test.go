@@ -1,0 +1,874 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"aivory/server/internal/store"
+)
+
+type recordingToolRunner struct {
+	calls []string
+}
+
+func (r *recordingToolRunner) Run(_ context.Context, name string, _ []byte) (string, []Citation, error) {
+	r.calls = append(r.calls, name)
+	return "ran " + name, nil, nil
+}
+
+type recordingToolRegistry struct {
+	calls []string
+}
+
+func (r *recordingToolRegistry) List(string) []ToolDef {
+	return []ToolDef{{Name: "aivory_web_search"}, {Name: "web_fetch"}, {Name: "python_execute"}}
+}
+
+func (r *recordingToolRegistry) Run(_ context.Context, name string, _ []byte, _ *ToolContext) (string, []Citation, error) {
+	r.calls = append(r.calls, name)
+	return "ok", nil, nil
+}
+
+type snippetSearchRegistry struct {
+	calls []string
+}
+
+func (r *snippetSearchRegistry) List(string) []ToolDef {
+	return []ToolDef{{Name: "aivory_web_search"}, {Name: "web_fetch"}}
+}
+
+func (r *snippetSearchRegistry) Run(_ context.Context, name string, _ []byte, _ *ToolContext) (string, []Citation, error) {
+	r.calls = append(r.calls, name)
+	if name == "aivory_web_search" {
+		return "search result", []Citation{{
+			Title: "Official result", URL: "https://www.nist.gov/example", Snippet: "A useful search snippet.", Source: "web",
+		}}, nil
+	}
+	return "fetched body", nil, nil
+}
+
+type toolContextRecordingRegistry struct {
+	modelIDs       []string
+	allowedSkills  []bool
+	disallowedSeen []bool
+}
+
+func (r *toolContextRecordingRegistry) List(string) []ToolDef {
+	return []ToolDef{{Name: "use_skill"}}
+}
+
+func (r *toolContextRecordingRegistry) Run(_ context.Context, _ string, _ []byte, tc *ToolContext) (string, []Citation, error) {
+	r.modelIDs = append(r.modelIDs, tc.ModelID)
+	r.allowedSkills = append(r.allowedSkills, tc.AllowsAdminSkill("allowed-skill"))
+	r.disallowedSeen = append(r.disallowedSeen, tc.AllowsAdminSkill("denied-skill"))
+	return "ok", nil, nil
+}
+
+type memoryToolRegistry struct{}
+
+func (memoryToolRegistry) List(string) []ToolDef {
+	return []ToolDef{{Name: "save_memory"}, {Name: "aivory_web_search"}}
+}
+
+func (memoryToolRegistry) Run(_ context.Context, name string, _ []byte, _ *ToolContext) (string, []Citation, error) {
+	return "ran " + name, nil, nil
+}
+
+func TestBuiltinToolDefaultsApplyUntilUserExplicitlySelects(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET builtin_tools='["aivory_web_search"]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider.invokeTool = "python_execute"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	request := provider.mainRequests[0]
+	if len(request.Tools) != 1 || request.Tools[0].Name != "aivory_web_search" {
+		t.Fatalf("native declarations = %+v, want only aivory_web_search", request.Tools)
+	}
+	if provider.toolRunErr == nil || !strings.Contains(provider.toolRunErr.Error(), "not enabled") {
+		t.Fatalf("forged native call reached execution: %v", provider.toolRunErr)
+	}
+
+	orchestrator, provider, model, conversation, _, db = setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET builtin_tools='["aivory_web_search"]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider.invokeTool = "python_execute"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeEnabled, SelectedToolsConfigured: true,
+		SelectedToolIDs: []string{"builtin:python_execute"},
+	})
+	request = provider.mainRequests[0]
+	if len(request.Tools) != 1 || request.Tools[0].Name != "python_execute" {
+		t.Fatalf("explicit selection remained capped by model defaults: %+v", request.Tools)
+	}
+	if provider.toolRunErr != nil {
+		t.Fatalf("explicitly selected tool was denied: %v", provider.toolRunErr)
+	}
+}
+
+func TestGroupToolPolicyCapsExplicitSelectionAndFinalRunner(t *testing.T) {
+	orchestrator, provider, model, conversation, _, _ := setupToolRouteTest(t)
+	provider.invokeTool = "python_execute"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeEnabled, SelectedToolsConfigured: true,
+		SelectedToolIDs: []string{"builtin:aivory_web_search", "builtin:python_execute"},
+		ToolAccessPolicy: &ToolAccessPolicy{
+			Mode: store.ResourceAccessSelected, IDs: []string{"builtin:aivory_web_search"},
+			AllowDrawing: true, AllowMemory: true, AllowSkills: true,
+		},
+	})
+	request := provider.mainRequests[0]
+	if len(request.Tools) != 1 || request.Tools[0].Name != "aivory_web_search" {
+		t.Fatalf("group ceiling exposed the wrong definitions: %+v", request.Tools)
+	}
+	if provider.toolRunErr == nil || !strings.Contains(provider.toolRunErr.Error(), "not enabled") {
+		t.Fatalf("group-restricted forged call reached execution: %v", provider.toolRunErr)
+	}
+}
+
+func TestGroupSelectedSkillPolicyFiltersPromptAndAutoRouting(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	allowed, err := store.CreateSkill(context.Background(), db, store.Skill{
+		ID: "group-skill-allowed", Name: "GROUP-ALLOWED-SKILL", Description: "GROUP-ALLOWED-DESCRIPTION",
+		Instructions: "GROUP-ALLOWED-INSTRUCTIONS", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	denied, err := store.CreateSkill(context.Background(), db, store.Skill{
+		ID: "group-skill-denied", Name: "GROUP-DENIED-SKILL", Description: "GROUP-DENIED-DESCRIPTION",
+		Instructions: "GROUP-DENIED-INSTRUCTIONS", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSkillsForModel(context.Background(), db, model.ID, []string{allowed.ID, denied.ID}); err != nil {
+		t.Fatal(err)
+	}
+	policy := &ToolAccessPolicy{
+		AllowDrawing: true, AllowMemory: true, AllowSkills: true,
+		SkillMode: store.ResourceAccessSelected, SkillIDs: []string{allowed.ID},
+	}
+
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeEnabled, ToolAccessPolicy: policy,
+	})
+	request := provider.mainRequests[len(provider.mainRequests)-1]
+	for _, want := range []string{allowed.Name, allowed.Description} {
+		if !strings.Contains(request.SystemPrompt, want) {
+			t.Fatalf("selected skill prompt missing %q:\n%s", want, request.SystemPrompt)
+		}
+	}
+	for _, forbidden := range []string{denied.Name, denied.Description, denied.Instructions} {
+		if strings.Contains(request.SystemPrompt, forbidden) {
+			t.Fatalf("selected skill prompt leaked %q:\n%s", forbidden, request.SystemPrompt)
+		}
+	}
+
+	provider.routeResponse = "0"
+	provider.taskRequests = nil
+	provider.routeCalls = 0
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeAuto, ToolAccessPolicy: policy, UserText: "Use " + denied.Name,
+	})
+	if provider.routeCalls != 1 {
+		t.Fatalf("denied skill name bypassed automatic routing; route calls=%d", provider.routeCalls)
+	}
+
+	provider.taskRequests = nil
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeAuto, ToolAccessPolicy: policy, UserText: "Use " + allowed.Name,
+	})
+	if provider.routeCalls != 1 || len(provider.taskRequests) != 0 {
+		t.Fatalf("allowed skill name did not take the deterministic route: calls=%d task=%d", provider.routeCalls, len(provider.taskRequests))
+	}
+}
+
+func TestGlobalDisabledToolsRemainDeniedAtFinalRunner(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET tool_mode='prompt', builtin_tools='["aivory_web_search","python_execute"]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSetting(db, "disabled_tools", []string{"python_execute"}); err != nil {
+		t.Fatal(err)
+	}
+	provider.invokeTool = "python_execute"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	if !provider.mainRequests[0].ToolModePrompt {
+		t.Fatal("test request did not exercise prompt tool mode")
+	}
+	if requestHasTool(provider.mainRequests[0], "python_execute") {
+		t.Fatalf("globally disabled tool was declared: %+v", provider.mainRequests[0].Tools)
+	}
+	if provider.toolRunErr == nil || !strings.Contains(provider.toolRunErr.Error(), "not enabled") {
+		t.Fatalf("globally disabled forged call reached execution: %v", provider.toolRunErr)
+	}
+}
+
+func TestMemoryDisabledRemovesSaveMemoryAndDeniesForgedCall(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	orchestrator.tools = memoryToolRegistry{}
+	if err := store.SetSetting(db, "memory_enabled", false); err != nil {
+		t.Fatal(err)
+	}
+	provider.invokeTool = "save_memory"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	request := provider.mainRequests[0]
+	if requestHasTool(request, "save_memory") {
+		t.Fatalf("memory-disabled request declared save_memory: %+v", request.Tools)
+	}
+	if !requestHasTool(request, "aivory_web_search") {
+		t.Fatalf("memory-disabled request lost unrelated tools: %+v", request.Tools)
+	}
+	if provider.toolRunErr == nil || !strings.Contains(provider.toolRunErr.Error(), "not enabled") {
+		t.Fatalf("forged save_memory call reached execution: %v", provider.toolRunErr)
+	}
+}
+
+func TestPromptModePreambleAndForgedCallUseFilteredDefinitions(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET tool_mode='prompt', builtin_tools='["aivory_web_search"]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	request := provider.mainRequests[0]
+	if !request.ToolModePrompt || len(request.Tools) != 1 || request.Tools[0].Name != "aivory_web_search" {
+		t.Fatalf("prompt request tools=%+v prompt=%v", request.Tools, request.ToolModePrompt)
+	}
+	preamble := PromptToolPreamble(request.Tools)
+	if !strings.Contains(preamble, "aivory_web_search") || strings.Contains(preamble, "python_execute") {
+		t.Fatalf("prompt preamble leaked unsupported tools: %s", preamble)
+	}
+
+	underlying := &recordingToolRunner{}
+	exactRunner := toolDefAllowlistRunner{next: underlying, allowed: toolDefNameSet(request.Tools)}
+	round := 0
+	var systems []string
+	_, _, _, _, _, err := RunPromptToolLoop(
+		context.Background(), "system", nil, request.Tools,
+		func(_ context.Context, _ []UnifiedMessage, system string) (PromptToolRound, error) {
+			systems = append(systems, system)
+			round++
+			if round == 1 {
+				return PromptToolRound{Text: `<tool_call>{"name":"python_execute","arguments":{"code":"print(1)"}}</tool_call>`}, nil
+			}
+			return PromptToolRound{Text: "done"}, nil
+		},
+		exactRunner,
+		func(SseEvent) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(underlying.calls) != 0 {
+		t.Fatalf("forged prompt call executed: %v", underlying.calls)
+	}
+	if len(systems) == 0 || !strings.Contains(systems[0], "aivory_web_search") || strings.Contains(systems[0], "python_execute") {
+		t.Fatalf("RunPromptToolLoop received unfiltered definitions: %v", systems)
+	}
+}
+
+func TestPromptModePersistsBoundedCanonicalToolOutput(t *testing.T) {
+	definitions := []ToolDef{{Name: "lookup"}}
+	underlying := &recordingToolRunner{}
+	round := 0
+	_, blocks, _, _, _, err := RunPromptToolLoop(
+		context.Background(), "system", nil, definitions,
+		func(_ context.Context, _ []UnifiedMessage, _ string) (PromptToolRound, error) {
+			round++
+			if round == 1 {
+				return PromptToolRound{Text: `<tool_call>{"name":"lookup","arguments":{}}</tool_call>`}, nil
+			}
+			return PromptToolRound{Text: "done"}, nil
+		},
+		underlying,
+		func(SseEvent) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) < 3 || blocks[0].Kind != "tool_call" || blocks[1].Kind != "tool_output" {
+		t.Fatalf("prompt-mode blocks = %+v", blocks)
+	}
+	if blocks[1].ToolID != blocks[0].ToolID || blocks[1].Text != "ran lookup" {
+		t.Fatalf("canonical tool output = %+v, call = %+v", blocks[1], blocks[0])
+	}
+}
+
+func TestPromptModeRawEnvelopeKeepsCompleteMiddleToolEvidence(t *testing.T) {
+	const evidence = "PROMPT_MIDDLE_EVIDENCE accession=PMC123 decision=approved"
+	output := "prompt head " + strings.Repeat("filler ", 900) + evidence + strings.Repeat(" tail-filler", 900) + " prompt tail"
+	rounds := 0
+	_, blocks, _, _, _, raw, err := RunPromptToolLoopWithRaw(
+		context.Background(), "system", nil, []ToolDef{{Name: "lookup"}},
+		func(context.Context, []UnifiedMessage, string) (PromptToolRound, error) {
+			rounds++
+			if rounds == 1 {
+				return PromptToolRound{Text: `<tool_call>{"name":"lookup","arguments":{}}</tool_call>`}, nil
+			}
+			return PromptToolRound{Text: "done"}, nil
+		},
+		&staticPromptOutputRunner{output: output},
+		func(SseEvent) {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) < 2 || blocks[1].Kind != "tool_output" || !strings.Contains(blocks[1].Text, "[middle omitted]") {
+		t.Fatalf("canonical prompt output was not bounded: %+v", blocks)
+	}
+	if !isPromptToolRawEnvelope(raw) {
+		t.Fatalf("raw result is not the internal prompt envelope: %s", raw)
+	}
+	messageBlocks, _ := json.Marshal(blocks)
+	var source strings.Builder
+	if err := appendCompactionSourceChecked(&source, []store.Message{{
+		ID: "prompt-envelope", Role: "assistant", Blocks: messageBlocks, Raw: raw,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(source.String(), evidence) || strings.Contains(source.String(), "[middle omitted]") {
+		t.Fatalf("compaction did not recover complete prompt result: %s", source.String())
+	}
+}
+
+func TestPromptRawEnvelopeIsProviderNeutralAndNeverNativeReplay(t *testing.T) {
+	raw := marshalPromptToolRawEnvelope([]promptToolRawOutput{{
+		Name: "lookup", ID: "pt_0", Output: "complete prompt result", Status: "complete",
+	}})
+	history := []UnifiedMessage{{
+		Role: "assistant", Blocks: []UnifiedBlock{{Kind: "text", Text: "visible answer"}}, Raw: raw,
+	}}
+
+	if got := historyToAnthropic(history, false); len(got) != 1 || got[0]["role"] != "assistant" {
+		t.Fatalf("Anthropic did not use canonical prompt history: %+v", got)
+	}
+	if got := historyToGemini(history, false); len(got) != 1 || got[0]["role"] != "model" {
+		t.Fatalf("Gemini did not use canonical prompt history: %+v", got)
+	}
+	if got := nativeRawForPersistedModel(raw, "ttft-fallback"); string(got) != string(raw) {
+		t.Fatalf("provider-neutral envelope was discarded on TTFT fallback: %s", got)
+	}
+
+	blocksJSON, _ := json.Marshal(history[0].Blocks)
+	stored := []store.Message{{
+		ID: "a1", Role: "assistant", Provider: "openai", ModelID: "old-model",
+		Blocks: blocksJSON, Raw: raw, Status: "complete",
+	}}
+	unified := storeToUnified(stored, "anthropic", "new-model", false)
+	if len(unified) != 1 || string(unified[0].Raw) != string(raw) {
+		t.Fatalf("model/provider switch discarded compaction envelope: %+v", unified)
+	}
+}
+
+func TestPromptRawEnvelopeFiltersDisallowedToolOutputs(t *testing.T) {
+	raw := marshalPromptToolRawEnvelope([]promptToolRawOutput{
+		{Name: "python_execute", ID: "denied", Output: "secret denied output"},
+		{Name: "aivory_web_search", ID: "allowed", Output: "allowed search output"},
+	})
+	history := []UnifiedMessage{{
+		Role: "assistant",
+		Blocks: []UnifiedBlock{
+			{Kind: "tool_call", ToolName: "python_execute", ToolID: "denied"},
+			{Kind: "tool_output", ToolName: "python_execute", ToolID: "denied", Text: "denied preview"},
+			{Kind: "tool_call", ToolName: "aivory_web_search", ToolID: "allowed"},
+			{Kind: "tool_output", ToolName: "aivory_web_search", ToolID: "allowed", Text: "allowed preview"},
+		},
+		Raw: raw,
+	}}
+	filtered := stripDisallowedBuiltinToolBlocks(history, map[string]bool{"aivory_web_search": true})
+	envelope, ok := parsePromptToolRawEnvelope(filtered[0].Raw)
+	if !ok || len(envelope.Outputs) != 1 || envelope.Outputs[0].Name != "aivory_web_search" {
+		t.Fatalf("filtered prompt envelope = %+v ok=%v", envelope, ok)
+	}
+	if strings.Contains(string(filtered[0].Raw), "secret denied output") {
+		t.Fatalf("disallowed complete output survived in Raw: %s", filtered[0].Raw)
+	}
+}
+
+type staticPromptOutputRunner struct{ output string }
+
+func (r *staticPromptOutputRunner) Run(context.Context, string, []byte) (string, []Citation, error) {
+	return r.output, nil, nil
+}
+
+func TestPromptModeWithEmptyBuiltinAllowlistUsesPlainSingleTurnRequest(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET tool_mode='prompt', builtin_tools='[]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	request := provider.mainRequests[0]
+	if len(request.Tools) != 0 || request.ToolModePrompt {
+		t.Fatalf("empty allowlist started prompt tool loop: tools=%+v prompt=%v", request.Tools, request.ToolModePrompt)
+	}
+}
+
+func TestAutoRouterCandidatesExcludeUnavailableToolsAndSkills(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET builtin_tools='["aivory_web_search"]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	skill, err := store.CreateSkill(context.Background(), db, store.Skill{ID: "sk-allow", Name: "private-skill", Description: "Must not become a route candidate", Instructions: "instructions", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetSkillsForModel(context.Background(), db, model.ID, []string{skill.ID}); err != nil {
+		t.Fatal(err)
+	}
+	provider.routeResponse = "0"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeAuto, UserText: "answer this"})
+	if len(provider.taskRequests) != 1 {
+		t.Fatalf("task requests=%d", len(provider.taskRequests))
+	}
+	prompt := provider.taskRequests[0].History[0].Blocks[0].Text
+	if !strings.Contains(prompt, "CAP=web") {
+		t.Fatalf("router lost allowed capability: %s", prompt)
+	}
+	for _, forbidden := range []string{"aivory_web_search", "python_execute", "use_skill", "skill:private-skill", "Must not become a route candidate"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Fatalf("router included unavailable %q: %s", forbidden, prompt)
+		}
+	}
+}
+
+func TestAutoWithEmptyEffectiveToolSetSkipsClassifierAndUsesNoToolsPipeline(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	if _, err := db.Exec(`UPDATE models SET tool_mode='prompt', builtin_tools='[]' WHERE id=?`, model.ID); err != nil {
+		t.Fatal(err)
+	}
+	provider.routeResponse = "1"
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{
+		ToolMode: ToolModeAuto,
+		UserText: "Use any available tool",
+	})
+	if provider.routeCalls != 0 {
+		t.Fatalf("empty effective tool set invoked classifier %d time(s)", provider.routeCalls)
+	}
+	if len(provider.taskRequests) != 0 {
+		t.Fatalf("empty effective tool set issued task-model requests: %+v", provider.taskRequests)
+	}
+	if len(provider.mainRequests) != 1 {
+		t.Fatalf("main requests=%d, want 1", len(provider.mainRequests))
+	}
+	request := provider.mainRequests[0]
+	if len(request.Tools) != 0 || request.ToolModePrompt {
+		t.Fatalf("deny-all Auto request exposed tools: tools=%+v prompt=%v", request.Tools, request.ToolModePrompt)
+	}
+	if request.SystemPromptOptions == nil || request.SystemPromptOptions.ToolMode != "none" {
+		t.Fatalf("deny-all Auto did not enter no-tools prompt pipeline: %+v", request.SystemPromptOptions)
+	}
+	if strings.Contains(request.SystemPrompt, "Tool guidance") || strings.Contains(request.SystemPrompt, "python_execute") {
+		t.Fatalf("deny-all Auto prompt retained tool guidance:\n%s", request.SystemPrompt)
+	}
+}
+
+func TestDeepResearchDoesNotBypassBuiltinToolAllowlist(t *testing.T) {
+	registry := &recordingToolRegistry{}
+	var events []SseEvent
+	rs := &researcher{
+		o:        &Orchestrator{tools: registry},
+		tc:       &ToolContext{BuiltinTools: map[string]bool{}},
+		question: "test question",
+		emit:     func(event SseEvent) { events = append(events, event) },
+		logger:   func(string, ...any) {},
+	}
+	plan := rs.plan(context.Background())
+	rs.researchLoop(context.Background(), plan)
+	if len(registry.calls) != 0 {
+		t.Fatalf("Deep Research executed disallowed tools: %v", registry.calls)
+	}
+	if len(rs.state.Tasks) != 1 || rs.state.Tasks[0].Status != "done" {
+		t.Fatalf("denied search left research tasks pending: %+v", rs.state.Tasks)
+	}
+	foundDone := false
+	for _, event := range events {
+		if event.Type == "research_task" && event.Status == "done" {
+			foundDone = true
+		}
+	}
+	if !foundDone {
+		t.Fatalf("denied search did not emit a completed task event: %+v", events)
+	}
+}
+
+func TestDeepResearchKeepsSearchEvidenceWithoutWebFetch(t *testing.T) {
+	registry := &snippetSearchRegistry{}
+	rs := &researcher{
+		o:        &Orchestrator{tools: registry},
+		tc:       &ToolContext{BuiltinTools: map[string]bool{"aivory_web_search": true}},
+		question: "test question",
+		emit:     func(SseEvent) {},
+		seen:     map[string]int{},
+		sourceID: map[string]string{},
+		logger:   func(string, ...any) {},
+	}
+	plan := rs.plan(context.Background())
+	rs.researchLoop(context.Background(), plan)
+	if len(registry.calls) != 1 || registry.calls[0] != "aivory_web_search" {
+		t.Fatalf("Deep Research calls=%v, want aivory_web_search only", registry.calls)
+	}
+	if len(rs.evidence) != 1 || rs.evidence[0].Snippet != "A useful search snippet." || rs.evidence[0].Body != "" {
+		t.Fatalf("search-only evidence was not preserved correctly: %+v", rs.evidence)
+	}
+	if len(rs.cites) != 1 || len(rs.state.Sources) != 1 || rs.state.Sources[0].Status != "kept" {
+		t.Fatalf("search-only source state is incomplete: cites=%+v state=%+v", rs.cites, rs.state.Sources)
+	}
+}
+
+func TestForcedSearchAndFallbackRespectBuiltinToolAllowlist(t *testing.T) {
+	t.Run("forced search", func(t *testing.T) {
+		registry := &recordingToolRegistry{}
+		o := &Orchestrator{tools: registry}
+		text, cites := o.forcedWebSearch(
+			context.Background(),
+			RunRequest{UserID: "u1", ConversationID: "c1", UserText: "latest"},
+			&store.Conversation{ID: "c1"}, nil, 0, map[string]bool{}, func(SseEvent) {},
+		)
+		if text != "" || cites != nil || len(registry.calls) != 0 {
+			t.Fatalf("forced search bypassed deny-all: text=%q cites=%v calls=%v", text, cites, registry.calls)
+		}
+	})
+
+	t.Run("fallback declarations and runner", func(t *testing.T) {
+		orchestrator, _, model, _, _, db := setupToolRouteTest(t)
+		fallback, err := store.CreateModel(context.Background(), db, store.Model{
+			ChannelID: model.ChannelID, Kind: "chat", RequestID: "builtin-fallback", Label: "Builtin fallback",
+			Enabled: true, Stream: true, ToolMode: "native", BuiltinTools: json.RawMessage(`["aivory_web_search"]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := UnifiedChatRequest{Tools: []ToolDef{{Name: "python_execute"}, {Name: "aivory_web_search"}, {Name: "use_skill"}}}
+		request, _, _, err := orchestrator.buildFallbackRequest(context.Background(), base, fallback.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(request.Tools) != 1 || request.Tools[0].Name != "aivory_web_search" {
+			t.Fatalf("fallback tools=%+v, want only aivory_web_search", request.Tools)
+		}
+		underlying := &recordingToolRunner{}
+		runner := toolDefAllowlistRunner{next: underlying, allowed: toolDefNameSet(request.Tools)}
+		if _, _, err := runner.Run(context.Background(), "python_execute", nil); err == nil {
+			t.Fatal("fallback runner accepted disallowed tool")
+		}
+		if len(underlying.calls) != 0 {
+			t.Fatalf("fallback executed disallowed tool: %v", underlying.calls)
+		}
+	})
+
+	t.Run("fallback recomposes prompt skills and combined history filters", func(t *testing.T) {
+		orchestrator, _, model, _, _, db := setupToolRouteTest(t)
+		fallback, err := store.CreateModel(context.Background(), db, store.Model{
+			ChannelID: model.ChannelID, Kind: "chat", RequestID: "prompt-fallback", Label: "Prompt fallback",
+			Enabled: true, Stream: true, ToolMode: "prompt", BuiltinTools: json.RawMessage(`["aivory_web_search"]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		options := systemPromptOpts{
+			ModelLabel: "Primary", ToolMode: "prompt",
+			ToolNames:          []string{"python_execute", "aivory_web_search", "use_skill"},
+			Skills:             []SkillIndex{{Name: "PRIMARY-SKILL-MARKER", When: "primary marker"}},
+			SkillsFull:         []SkillFull{{Name: "PRIMARY-SKILL-MARKER", Instructions: "PRIMARY-INSTRUCTIONS-MARKER"}},
+			SandboxFiles:       []ProjectFileSummary{{Name: "primary.csv", Kind: "text/csv"}},
+			SkillToolAvailable: true,
+			SkillsAllowed:      true,
+		}
+		base := UnifiedChatRequest{
+			SystemPrompt:        composeSystemPrompt(options),
+			SystemPromptOptions: &options,
+			Tools:               []ToolDef{{Name: "python_execute"}, {Name: "aivory_web_search"}, {Name: "use_skill"}},
+			History: []UnifiedMessage{{
+				Role: "assistant",
+				Blocks: []UnifiedBlock{
+					{Kind: "image", MimeType: "image/png", Data: "aW1n"},
+					{Kind: "tool_call", ToolName: "python_execute", ToolID: "denied"},
+					{Kind: "tool_output", ToolID: "denied", Text: "output"},
+					{Kind: "tool_call", ToolName: "aivory_web_search", ToolID: "allowed"},
+					{Kind: "text", Text: "answer"},
+				},
+				Raw: json.RawMessage(`[{"type":"input_image"},{"type":"function_call","name":"python_execute"}]`),
+			}},
+		}
+		request, _, _, err := orchestrator.buildFallbackRequest(context.Background(), base, fallback.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(request.Tools) != 1 || request.Tools[0].Name != "aivory_web_search" || !request.ToolModePrompt {
+			t.Fatalf("fallback request tools=%+v prompt=%v", request.Tools, request.ToolModePrompt)
+		}
+		for _, forbidden := range []string{"python_execute", "PRIMARY-SKILL-MARKER", "PRIMARY-INSTRUCTIONS-MARKER", "primary.csv"} {
+			if strings.Contains(request.SystemPrompt, forbidden) {
+				t.Fatalf("fallback system prompt retained %q:\n%s", forbidden, request.SystemPrompt)
+			}
+		}
+		if !strings.Contains(request.SystemPrompt, "aivory_web_search") {
+			t.Fatalf("fallback prompt lost allowed tool:\n%s", request.SystemPrompt)
+		}
+		encoded, _ := json.Marshal(request.History)
+		if strings.Contains(string(encoded), "python_execute") || strings.Contains(string(encoded), "input_image") || strings.Contains(string(encoded), `"kind":"image"`) {
+			t.Fatalf("fallback history retained denied tool or image: %s", encoded)
+		}
+		if !strings.Contains(string(encoded), "aivory_web_search") || !strings.Contains(string(encoded), "answer") {
+			t.Fatalf("fallback history lost allowed content: %s", encoded)
+		}
+		if options.ToolMode != "prompt" || len(options.ToolNames) != 3 || len(options.SandboxFiles) != 1 {
+			t.Fatalf("fallback mutated primary prompt options: %+v", options)
+		}
+	})
+
+	t.Run("prompt fallback with hosted tools strips primary native raw", func(t *testing.T) {
+		orchestrator, _, model, _, _, db := setupToolRouteTest(t)
+		fallback, err := store.CreateModel(context.Background(), db, store.Model{
+			ChannelID: model.ChannelID, Kind: "chat", RequestID: "mixed-prompt-fallback", Label: "Mixed prompt fallback",
+			Enabled: true, Stream: true, ToolMode: "prompt", BuiltinTools: json.RawMessage(`["aivory_web_search"]`),
+			OfficialTools: json.RawMessage(`[{"name":"web_search","icon":"search","request":{"tools":[{"type":"web_search"}]}}]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		baseRaw := json.RawMessage(`[{"type":"function_call","name":"aivory_web_search"},{"type":"function_call_output","output":"old"}]`)
+		base := UnifiedChatRequest{
+			UserID: "u1", ToolsEnabled: true,
+			History: []UnifiedMessage{{
+				Role:   "assistant",
+				Blocks: []UnifiedBlock{{Kind: "tool_call", ToolName: "aivory_web_search", ToolID: "old", Summary: "old search"}},
+				Raw:    baseRaw,
+			}},
+		}
+		request, _, _, err := orchestrator.buildFallbackRequest(context.Background(), base, fallback.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !request.ToolModePrompt || len(request.Tools) != 1 || len(request.OfficialToolRequests) != 1 {
+			t.Fatalf("mixed prompt fallback tools = local:%+v hosted:%s prompt:%v", request.Tools, request.OfficialToolRequests, request.ToolModePrompt)
+		}
+		if len(request.History) != 1 || len(request.History[0].Raw) != 0 {
+			t.Fatalf("prompt fallback replayed primary native raw: %+v", request.History)
+		}
+		if len(request.History[0].Blocks) != 1 || request.History[0].Blocks[0].ToolName != "aivory_web_search" {
+			t.Fatalf("prompt fallback lost canonical tool trace: %+v", request.History[0].Blocks)
+		}
+		if len(base.History[0].Raw) == 0 {
+			t.Fatal("fallback request construction mutated the primary history")
+		}
+	})
+
+	t.Run("fallback advertises only its own bound skills", func(t *testing.T) {
+		orchestrator, _, model, _, _, db := setupToolRouteTest(t)
+		fallback, err := store.CreateModel(context.Background(), db, store.Model{
+			ChannelID: model.ChannelID, Kind: "chat", RequestID: "skill-fallback", Label: "Skill fallback",
+			Enabled: true, Stream: true, ToolMode: "native", BuiltinTools: json.RawMessage(`["use_skill"]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fallbackSkill, err := store.CreateSkill(context.Background(), db, store.Skill{
+			ID: "fallback-skill", Name: "FALLBACK-SKILL-MARKER", Description: "FALLBACK-DESCRIPTION-MARKER",
+			Instructions: "FALLBACK-INSTRUCTIONS-MARKER", Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetSkillsForModel(context.Background(), db, fallback.ID, []string{fallbackSkill.ID}); err != nil {
+			t.Fatal(err)
+		}
+		deniedSkill, err := store.CreateSkill(context.Background(), db, store.Skill{
+			ID: "fallback-denied-skill", Name: "FALLBACK-DENIED-SKILL", Description: "FALLBACK-DENIED-DESCRIPTION",
+			Instructions: "FALLBACK-DENIED-INSTRUCTIONS", Enabled: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetSkillsForModel(context.Background(), db, fallback.ID, []string{fallbackSkill.ID, deniedSkill.ID}); err != nil {
+			t.Fatal(err)
+		}
+		options := systemPromptOpts{
+			ModelLabel: "Primary", ToolMode: "native", ToolNames: []string{"use_skill"},
+			Skills:             []SkillIndex{{Name: "PRIMARY-SKILL-MARKER", When: "PRIMARY-DESCRIPTION-MARKER"}},
+			SkillsFull:         []SkillFull{{Name: "PRIMARY-SKILL-MARKER", Instructions: "PRIMARY-INSTRUCTIONS-MARKER"}},
+			SkillToolAvailable: true, SkillsAllowed: true,
+		}
+		request, _, _, err := orchestrator.buildFallbackRequest(context.Background(), UnifiedChatRequest{
+			SystemPrompt: composeSystemPrompt(options), SystemPromptOptions: &options, Tools: []ToolDef{{Name: "use_skill"}},
+			ToolAccessPolicy: &ToolAccessPolicy{
+				AllowSkills: true, SkillMode: store.ResourceAccessSelected, SkillIDs: []string{fallbackSkill.ID},
+			},
+		}, fallback.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(request.SystemPrompt, "FALLBACK-SKILL-MARKER") || !strings.Contains(request.SystemPrompt, "FALLBACK-DESCRIPTION-MARKER") {
+			t.Fatalf("fallback prompt did not advertise its bound skill:\n%s", request.SystemPrompt)
+		}
+		for _, forbidden := range []string{
+			"PRIMARY-SKILL-MARKER", "PRIMARY-DESCRIPTION-MARKER", "PRIMARY-INSTRUCTIONS-MARKER",
+			"FALLBACK-DENIED-SKILL", "FALLBACK-DENIED-DESCRIPTION", "FALLBACK-DENIED-INSTRUCTIONS",
+		} {
+			if strings.Contains(request.SystemPrompt, forbidden) {
+				t.Fatalf("fallback prompt retained primary skill %q:\n%s", forbidden, request.SystemPrompt)
+			}
+		}
+	})
+
+	t.Run("fallback empty prompt policy", func(t *testing.T) {
+		orchestrator, _, model, _, _, db := setupToolRouteTest(t)
+		fallback, err := store.CreateModel(context.Background(), db, store.Model{
+			ChannelID: model.ChannelID, Kind: "chat", RequestID: "empty-prompt-fallback", Label: "Empty prompt fallback",
+			Enabled: true, Stream: true, ToolMode: "prompt", BuiltinTools: json.RawMessage(`[]`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, _, _, err := orchestrator.buildFallbackRequest(context.Background(), UnifiedChatRequest{Tools: []ToolDef{{Name: "aivory_web_search"}}}, fallback.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(request.Tools) != 0 || request.ToolModePrompt {
+			t.Fatalf("empty fallback policy started prompt tool loop: tools=%+v prompt=%v", request.Tools, request.ToolModePrompt)
+		}
+	})
+}
+
+func TestBuiltinToolHistoryDropsDisallowedCallsAndRaw(t *testing.T) {
+	history := []UnifiedMessage{{
+		Role: "assistant",
+		Blocks: []UnifiedBlock{
+			{Kind: "tool_call", ToolName: "python_execute", ToolID: "denied", Input: json.RawMessage(`{"code":"print(1)"}`)},
+			{Kind: "tool_output", ToolID: "denied", Text: "1"},
+			{Kind: "tool_call", ToolName: "aivory_web_search", ToolID: "allowed"},
+			{Kind: "text", Text: "final"},
+		},
+		Raw: json.RawMessage(`[{"type":"function_call","name":"python_execute"}]`),
+	}, {
+		Role:   "assistant",
+		Blocks: []UnifiedBlock{{Kind: "tool_call", ToolName: "aivory_web_search", ToolID: "still-allowed"}},
+		Raw:    json.RawMessage(`[{"type":"function_call","name":"aivory_web_search"}]`),
+	}}
+	filtered := stripDisallowedBuiltinToolBlocks(history, map[string]bool{"aivory_web_search": true})
+	encoded, _ := json.Marshal(filtered)
+	if strings.Contains(string(encoded), "python_execute") || strings.Contains(string(encoded), `print(1)`) || len(filtered[0].Raw) != 0 {
+		t.Fatalf("disallowed historical call survived: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "aivory_web_search") || !strings.Contains(string(encoded), "final") {
+		t.Fatalf("allowed history was removed: %s", encoded)
+	}
+	if len(filtered[1].Raw) == 0 {
+		t.Fatal("unaffected allowed history lost provider Raw")
+	}
+	if len(history[0].Raw) == 0 || history[0].Blocks[0].ToolName != "python_execute" {
+		t.Fatal("history filter mutated its input")
+	}
+}
+
+func TestRetiredKnowledgeSearchHistoryIsRemovedInOfficialMode(t *testing.T) {
+	history := []UnifiedMessage{{
+		Role: "assistant",
+		Blocks: []UnifiedBlock{
+			{Kind: "tool_call", ToolName: "search_knowledge_base", ToolID: "retired-search"},
+			{Kind: "tool_output", ToolID: "retired-search", Text: "legacy document result"},
+			{Kind: "tool_call", ToolName: "hosted_search", ToolID: "official-search"},
+			{Kind: "text", Text: "ordinary answer"},
+		},
+		Raw: json.RawMessage(`[{
+			"type":"function_call","name":"search_knowledge_base"
+		}]`),
+	}}
+	filtered := stripRetiredKnowledgeSearchToolBlocks(history)
+	encoded, _ := json.Marshal(filtered)
+	if strings.Contains(string(encoded), "search_knowledge_base") || strings.Contains(string(encoded), "legacy document result") {
+		t.Fatalf("retired document-search history survived: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "hosted_search") || !strings.Contains(string(encoded), "ordinary answer") {
+		t.Fatalf("unrelated official history was removed: %s", encoded)
+	}
+	if len(filtered[0].Raw) != 0 {
+		t.Fatalf("affected provider Raw survived: %s", filtered[0].Raw)
+	}
+}
+
+func TestDefaultAllPolicyStillDropsHistoryForUnregisteredTool(t *testing.T) {
+	orchestrator, provider, model, conversation, _, db := setupToolRouteTest(t)
+	// builtin_tools remains NULL (default all). "retired_tool" is deliberately
+	// absent from the live registry, so exact per-request filtering must remove
+	// its old native exchange even without an explicit model allowlist.
+	userBlocks, _ := json.Marshal([]UnifiedBlock{{Kind: "text", Text: "old question"}})
+	previousUser, err := store.CreateMessage(context.Background(), db, store.Message{
+		ConversationID: conversation.ID, Role: "user", Provider: "openai", ModelID: model.ID, Blocks: userBlocks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistantBlocks, _ := json.Marshal([]UnifiedBlock{
+		{Kind: "tool_call", ToolName: "retired_tool", ToolID: "retired-call"},
+		{Kind: "tool_output", ToolID: "retired-call", Text: "legacy output"},
+		{Kind: "text", Text: "old final answer"},
+	})
+	if _, err := store.CreateMessage(context.Background(), db, store.Message{
+		ConversationID: conversation.ID, ParentID: previousUser.ID, Role: "assistant", Provider: "openai", ModelID: model.ID,
+		Blocks: assistantBlocks, Raw: json.RawMessage(`[{"type":"function_call","name":"retired_tool"}]`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runToolRouteTurn(t, orchestrator, model.ID, conversation.ID, RunRequest{ToolMode: ToolModeEnabled})
+	if len(provider.mainRequests) != 1 {
+		t.Fatalf("main requests=%d", len(provider.mainRequests))
+	}
+	encoded, _ := json.Marshal(provider.mainRequests[0].History)
+	if strings.Contains(string(encoded), "retired_tool") || strings.Contains(string(encoded), "legacy output") {
+		t.Fatalf("default-all request replayed an unregistered tool: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), "old final answer") {
+		t.Fatalf("history filtering removed ordinary answer content: %s", encoded)
+	}
+	for _, message := range provider.mainRequests[0].History {
+		if strings.Contains(string(message.Raw), "retired_tool") {
+			t.Fatalf("affected history retained provider Raw: %s", message.Raw)
+		}
+	}
+}
+
+func TestFallbackToolRunnerUsesFallbackModelContext(t *testing.T) {
+	registry := &toolContextRecordingRegistry{}
+	orchestrator := &Orchestrator{tools: registry}
+	primary := &orchToolRunner{
+		orch: orchestrator,
+		ctx: &ToolContext{
+			ModelID: "primary-model", BuiltinTools: map[string]bool{"use_skill": true},
+			AdminSkillIDs: map[string]bool{"allowed-skill": true},
+		},
+	}
+	runner := toolDefAllowlistRunner{next: primary, allowed: map[string]bool{"use_skill": true}}
+	fallbackRunner := toolRunnerForModelRequest(runner, "fallback-model", []ToolDef{{Name: "use_skill"}})
+	if _, _, err := fallbackRunner.Run(context.Background(), "use_skill", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(registry.modelIDs) != 1 || registry.modelIDs[0] != "fallback-model" {
+		t.Fatalf("fallback execution used model contexts %v", registry.modelIDs)
+	}
+	if len(registry.allowedSkills) != 1 || !registry.allowedSkills[0] || registry.disallowedSeen[0] {
+		t.Fatalf("fallback execution broadened skill policy: allowed=%v denied=%v", registry.allowedSkills, registry.disallowedSeen)
+	}
+}
+
+func TestToolDefAllowlistRunnerFailsClosed(t *testing.T) {
+	underlying := &recordingToolRunner{}
+	runner := toolDefAllowlistRunner{next: underlying, allowed: map[string]bool{"aivory_web_search": true}}
+	if _, _, err := runner.Run(context.Background(), "python_execute", nil); err == nil {
+		t.Fatal("runner accepted an undeclared tool")
+	}
+	if len(underlying.calls) != 0 {
+		t.Fatalf("runner executed undeclared tool: %v", underlying.calls)
+	}
+	if _, _, err := runner.Run(context.Background(), "aivory_web_search", nil); err != nil {
+		t.Fatalf("runner rejected declared tool: %v", err)
+	}
+	if len(underlying.calls) != 1 || underlying.calls[0] != "aivory_web_search" {
+		t.Fatalf("declared tool calls=%v", underlying.calls)
+	}
+}

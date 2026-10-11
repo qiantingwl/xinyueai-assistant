@@ -1,0 +1,163 @@
+package payment
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"syscall"
+
+	"github.com/stripe/stripe-go/v86"
+	pancake "github.com/waffo-com/waffo-pancake-sdk-go"
+)
+
+var ErrCheckoutStateUnknown = errors.New("payment provider checkout state is unknown")
+var ErrCheckoutNotClosable = errors.New("payment provider checkout cannot be closed safely")
+var ErrCheckoutNotResumable = errors.New("payment provider checkout cannot be resumed")
+var ErrCheckoutExpired = errors.New("payment provider checkout has expired")
+var ErrReconciliationUnsupported = errors.New("payment provider reconciliation is unsupported")
+var ErrWaffoProductCurrencyUnsupported = errors.New("payment_waffo_product_currency_unsupported")
+
+// IsCheckoutStateUnknown classifies transport failures where the provider may
+// have accepted the request even though Aivory did not receive a response.
+// Such orders must remain reconcilable instead of being marked definitively
+// failed and allowing a second charge attempt immediately.
+func IsCheckoutStateUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCheckoutStateUnknown) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	// A provider-side 5xx is also indeterminate: the checkout may have been
+	// committed before the provider failed to return a successful response.
+	// Keep the local order reconcilable instead of allowing a new order (and a
+	// new provider idempotency key) to create a duplicate charge.
+	var stripeErr *stripe.Error
+	if errors.As(err, &stripeErr) && stripeErr.HTTPStatusCode >= http.StatusInternalServerError {
+		return true
+	}
+	var waffoErr *pancake.Error
+	if errors.As(err, &waffoErr) && waffoErr.Status >= http.StatusInternalServerError {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+const (
+	ProviderStripe = "stripe"
+	ProviderEPay   = "epay"
+	ProviderWaffo  = "waffo"
+)
+
+const (
+	ActionRedirect = "redirect"
+	ActionFormPost = "form_post"
+)
+
+const (
+	CheckoutResumeOriginalSession = "original_session"
+	CheckoutResumeRetrySubmission = "retry_submission"
+)
+
+const (
+	EventPaid       = "paid"
+	EventProcessing = "processing"
+	EventFailed     = "failed"
+	EventExpired    = "expired"
+	EventIgnored    = "ignored"
+)
+
+type ReconcileRequest struct {
+	OrderID          string
+	UserID           string
+	AmountMinor      int64
+	Currency         string
+	SessionID        string
+	SessionExpiresAt int64
+	Close            bool
+}
+
+type CheckoutRequest struct {
+	OrderID         string
+	MerchantOrderID string
+	Name            string
+	AmountMinor     int64
+	Currency        string
+	TaxCategory     string
+	UserID          string
+	UserEmail       string
+	NotifyURL       string
+	SuccessURL      string
+	CancelURL       string
+}
+
+// CheckoutResumeRequest combines the immutable local checkout snapshot with
+// the provider session identifiers saved when checkout was first created.
+// SessionURL must never contain short-lived credentials such as Waffo's JWT
+// fragment.
+type CheckoutResumeRequest struct {
+	CheckoutRequest
+	ProviderOrderID  string
+	SessionID        string
+	SessionURL       string
+	SessionExpiresAt int64
+}
+
+type CheckoutAction struct {
+	Type            string            `json:"type"`
+	URL             string            `json:"url"`
+	Fields          map[string]string `json:"fields,omitempty"`
+	ResumeMode      string            `json:"resume_mode,omitempty"`
+	ProviderOrderID string            `json:"-"`
+	SessionID       string            `json:"-"`
+	// SessionURL is the credential-free URL persisted for a later resume.
+	SessionURL string `json:"-"`
+	ExpiresAt  int64  `json:"-"`
+}
+
+type ProviderEvent struct {
+	ID                string
+	Type              string
+	Status            string
+	OrderID           string
+	ProviderOrderID   string
+	ProviderPaymentID string
+	// AmountMinor is the tax-exclusive catalog amount used to authorize the
+	// snapshotted local order. PaidAmountMinor is the actual provider charge;
+	// providers without added tax set both to the same value.
+	AmountMinor     int64
+	PaidAmountMinor int64
+	TaxAmountMinor  int64
+	Currency        string
+	// AmountMajor carries EPay's signed decimal money field until the API can
+	// parse it using the immutable provider-currency snapshot on the order.
+	AmountMajor   string
+	MethodType    string
+	MethodName    string
+	UserID        string
+	FailureReason string
+}
+
+const (
+	TaxCategoryDigitalGoods = "digital_goods"
+	TaxCategorySaaS         = "saas"
+)
+
+type CheckoutCreator interface {
+	CreateCheckout(context.Context, CheckoutRequest) (CheckoutAction, error)
+}
+
+type CheckoutResumer interface {
+	ResumeCheckout(context.Context, CheckoutResumeRequest) (CheckoutAction, error)
+}

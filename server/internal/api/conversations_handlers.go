@@ -1,0 +1,1415 @@
+package api
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"aivory/server/internal/envcfg"
+	"aivory/server/internal/llm"
+	"aivory/server/internal/msgcache"
+	"aivory/server/internal/store"
+)
+
+// listConversationsHandler returns the user's conversations with pagination.
+// Query params: project_id, archived=only, limit (default 200, max 500), offset (default 0).
+func listConversationsHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	projectID := r.URL.Query().Get("project_id")
+	// ?archived=only returns the archived chats (for the "Archived" view); the
+	// default hides them.
+	archivedFilter := "active"
+	if r.URL.Query().Get("archived") == "only" {
+		archivedFilter = "archived"
+	}
+	limit := envcfg.Int("AIVORY_API_LIMIT_2", 200)
+	if ls := r.URL.Query().Get("limit"); ls != "" {
+		if n, err := strconv.Atoi(ls); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if maxLimit := envcfg.Int("AIVORY_API_LIMIT_3", 500); limit > maxLimit {
+		limit = maxLimit
+	}
+	offset := 0
+	if os := r.URL.Query().Get("offset"); os != "" {
+		if n, err := strconv.Atoi(os); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	// Workspace scope (§workspaces): list THAT workspace's shared conversations
+	// (all members', with creator identity for the sidebar) instead of the
+	// caller's personal ones — members only.
+	var rows []store.Conversation
+	var err error
+	if wsID := strings.TrimSpace(r.URL.Query().Get("workspace_id")); wsID != "" {
+		if role, merr := store.IsWorkspaceMember(r.Context(), d.DB, wsID, u.ID); merr != nil || role == "" {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		rows, err = store.ListWorkspaceConversationsForUser(r.Context(), d.DB, wsID, projectID, archivedFilter, u.ID, limit, offset)
+	} else {
+		rows, err = store.ListConversations(r.Context(), d.DB, u.ID, projectID, archivedFilter, limit, offset)
+	}
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	for i := range rows {
+		stripServerConvFields(&rows[i])
+	}
+	writeJSON(w, 200, map[string]any{
+		"conversations": rows,
+		"limit":         limit,
+		"offset":        offset,
+		"has_more":      len(rows) == limit,
+	})
+}
+
+// stripServerConvFields zeroes conversation fields that are server-internal and
+// never read by the client. summary_blocks (the §4.7 compaction state) can be
+// large and otherwise ships in every list row, wasting bandwidth and exposing
+// summarised content. Mutates in place; the store layer keeps the real value.
+func stripServerConvFields(c *store.Conversation) {
+	c.SummaryBlocks = json.RawMessage("[]")
+}
+
+func compactConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	if d.Orchestrator == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("context compaction is unavailable"))
+		return
+	}
+	result, err := d.Orchestrator.CompactConversation(r.Context(), u.ID, id)
+	if err != nil {
+		writeCompactConversationError(r.Context(), w, result, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func writeCompactConversationError(requestCtx context.Context, w http.ResponseWriter, result llm.ManualCompactionResult, err error) {
+	switch {
+	case requestCtx != nil && requestCtx.Err() != nil &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+		// The caller is gone, so there is no response surface left to update.
+		// In particular, do not misreport an intentional disconnect as a 500.
+		return
+	case errors.Is(err, context.DeadlineExceeded):
+		result.Reason = "timed_out"
+		writeJSON(w, http.StatusGatewayTimeout, result)
+	case errors.Is(err, context.Canceled):
+		// A provider may return context.Canceled without the HTTP request being
+		// canceled. That is a real compaction failure, not an empty successful API
+		// response.
+		result.Reason = "compaction_failed"
+		writeJSON(w, http.StatusInternalServerError, result)
+	case errors.Is(err, llm.ErrCompactionDisabled):
+		result.Reason = "disabled"
+		writeJSON(w, http.StatusConflict, result)
+	case errors.Is(err, llm.ErrCompactionInFlight):
+		result.Reason = "generation_in_progress"
+		writeJSON(w, http.StatusConflict, result)
+	case errors.Is(err, llm.ErrCompactionChanged):
+		result.Reason = "conversation_changed"
+		writeJSON(w, http.StatusConflict, result)
+	case errors.Is(err, llm.ErrCompactionPersist):
+		result.Reason = "persistence_failed"
+		writeJSON(w, http.StatusInternalServerError, result)
+	case errors.Is(err, llm.ErrCompactionFailed), errors.Is(err, llm.ErrTaskBillingRecord):
+		result.Reason = "compaction_failed"
+		writeJSON(w, http.StatusInternalServerError, result)
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, errNotFound)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
+}
+
+// searchHandler runs full-text search over the user's own conversation titles
+// and message content (§ homepage search). Query param `q` (min 2 chars).
+// Returns title hits + message hits (each with a snippet + message_id so the
+// client can jump straight to the matching message).
+func searchHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len([]rune(q)) < 2 {
+		writeJSON(w, 200, map[string]any{"query": q, "titles": []store.SearchHit{}, "messages": []store.SearchHit{}})
+		return
+	}
+	// Workspace scope (§workspaces): search that workspace's shared conversations
+	// instead of the personal space — but ONLY for its members (a forged
+	// workspace_id must not read someone else's space).
+	wsID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	if wsID != "" {
+		if role, err := store.IsWorkspaceMember(r.Context(), d.DB, wsID, u.ID); err != nil || role == "" {
+			writeError(w, 404, errNotFound)
+			return
+		}
+	}
+	titles, messages, err := store.SearchConversations(r.Context(), d.DB, u.ID, wsID, q, 8, envcfg.Int("AIVORY_API_SEARCH_MESSAGE_HIT_LIMIT", 40))
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"query": q, "titles": titles, "messages": messages})
+}
+
+type createConversationReq struct {
+	ModelID   string `json:"model_id"`
+	ProjectID string `json:"project_id"`
+	Title     string `json:"title"`
+	// Nil lets the server apply the account default for old clients and direct
+	// API calls. An explicit value always represents a user's picker choice.
+	Fast *bool `json:"fast"`
+	// '' = personal; set = create INSIDE that workspace (§workspaces, membership
+	// validated server-side).
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// createConversationHandler creates a fresh conversation.
+func createConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	var req createConversationReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	permissions, permissionErr := requestPermissions(d, r)
+	if permissionErr != nil {
+		writeError(w, http.StatusForbidden, errPermissionDenied)
+		return
+	}
+	if !permissions.AllowKnowledgeBases && strings.TrimSpace(req.ProjectID) != "" {
+		writeError(w, http.StatusForbidden, errKnowledgeBaseGroupPermission)
+		return
+	}
+	explicitModel := strings.TrimSpace(req.ModelID) != ""
+	req.ModelID = strings.TrimSpace(req.ModelID)
+	userDefaultModelID := ""
+	if !explicitModel {
+		userDefaultModelID = validUserDefaultConversationModel(r.Context(), d.DB, u.Settings)
+		req.ModelID = userDefaultModelID
+	}
+	if req.ModelID == "" {
+		// Fall back to the administrator's default model. Fast mode still resolves
+		// its hidden model independently when the first turn starts.
+		if raw, err := store.GetSetting(d.DB, "default_model_id"); err == nil {
+			_ = json.Unmarshal(raw, &req.ModelID)
+		}
+		req.ModelID = strings.TrimSpace(req.ModelID)
+	}
+	if !permissions.AllowDrawing && req.ModelID != "" {
+		if model, modelErr := store.GetModel(r.Context(), d.DB, req.ModelID); modelErr == nil && model.Kind == "image" {
+			writeError(w, http.StatusForbidden, errDrawingGroupPermission)
+			return
+		}
+	}
+	fast := false
+	if req.Fast != nil {
+		fast = *req.Fast
+	} else if !explicitModel && userDefaultModelID == "" {
+		fastModel, err := store.GetFastModel(r.Context(), d.DB)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		fast = fastModel != nil
+	}
+	// Workspace binding (§workspaces): only members may create inside a space.
+	req.WorkspaceID = strings.TrimSpace(req.WorkspaceID)
+	if req.WorkspaceID != "" {
+		if role, merr := store.IsWorkspaceMember(r.Context(), d.DB, req.WorkspaceID, u.ID); merr != nil || role == "" {
+			writeError(w, 404, errNotFound)
+			return
+		}
+	}
+	// Validate the project belongs to this user before attaching (don't trust
+	// the client-supplied project_id). GetProject is member-aware, and the
+	// project must live in the SAME space as the conversation.
+	if req.ProjectID != "" {
+		p, err := store.GetProject(r.Context(), d.DB, req.ProjectID, u.ID)
+		if err != nil || p.WorkspaceID != req.WorkspaceID {
+			writeError(w, 404, errors.New("project not found"))
+			return
+		}
+	}
+	conv, err := store.CreateConversation(r.Context(), d.DB, store.Conversation{
+		UserID:      u.ID,
+		ProjectID:   req.ProjectID,
+		Title:       strings.TrimSpace(req.Title),
+		ModelID:     req.ModelID,
+		Fast:        fast,
+		WorkspaceID: req.WorkspaceID,
+	})
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	publishUserEvent(d, r, u.ID, "conversation.created", conv.ID)
+	writeJSON(w, 201, conv)
+}
+
+func validUserDefaultConversationModel(ctx context.Context, db *sql.DB, settings json.RawMessage) string {
+	var profile struct {
+		DefaultModelID string `json:"default_model_id"`
+	}
+	if json.Unmarshal(settings, &profile) != nil {
+		return ""
+	}
+	id := strings.TrimSpace(profile.DefaultModelID)
+	if id == "" {
+		return ""
+	}
+	model, err := store.GetModel(ctx, db, id)
+	if err != nil || !model.Enabled || model.Kind != "chat" || model.Fast {
+		return ""
+	}
+	return id
+}
+
+// Import limits — bound the work a single import request can schedule.
+var (
+	importMaxConversations   = envcfg.Int("AIVORY_API_IMPORT_MAX_CONVERSATIONS", 1000)
+	importMaxMessagesPerConv = envcfg.Int("AIVORY_API_IMPORT_MAX_MESSAGES_PER_CONV", 10000)
+	importMaxContentBytes    = envcfg.Int("AIVORY_API_IMPORT_MAX_CONTENT_BYTES", 200*1024)
+)
+
+type importMessageReq struct {
+	ID       string `json:"id"`
+	ParentID string `json:"parent_id"`
+	Role     string `json:"role"`
+	Content  string `json:"content"`
+}
+
+type importConversationReq struct {
+	Title        string             `json:"title"`
+	ModelID      string             `json:"model_id"`
+	ActiveLeafID string             `json:"active_leaf_id"`
+	Messages     []importMessageReq `json:"messages"`
+}
+
+// importConversationsHandler bulk-creates conversations + message trees from an
+// external export (§ conversation import). It bypasses the orchestrator entirely
+// — no model calls, no quota — and only stores chat history + titles. The client
+// has already stripped images/files/usage/<details> blocks; the server just
+// validates shape, caps sizes, and remaps the tree. Per-conversation failures are
+// skipped (reported in `failed`) rather than aborting the whole import.
+func importConversationsHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	var req struct {
+		Conversations []importConversationReq `json:"conversations"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	if len(req.Conversations) == 0 {
+		writeError(w, 400, errors.New("no conversations to import"))
+		return
+	}
+	if len(req.Conversations) > importMaxConversations {
+		writeError(w, 400, errors.New("too many conversations in one import"))
+		return
+	}
+	// Default model so imported conversations can be continued.
+	defaultModel := ""
+	if raw, err := store.GetSetting(d.DB, "default_model_id"); err == nil {
+		_ = json.Unmarshal(raw, &defaultModel)
+	}
+	ids := []string{}
+	failed := 0
+	for _, c := range req.Conversations {
+		if len(c.Messages) == 0 || len(c.Messages) > importMaxMessagesPerConv {
+			failed++
+			continue
+		}
+		modelID := c.ModelID
+		if modelID == "" {
+			modelID = defaultModel
+		}
+		msgs := make([]store.ImportMessageInput, 0, len(c.Messages))
+		for _, m := range c.Messages {
+			content := m.Content
+			if len(content) > importMaxContentBytes {
+				content = strings.ToValidUTF8(content[:importMaxContentBytes], "")
+			}
+			msgs = append(msgs, store.ImportMessageInput{
+				ClientID:       m.ID,
+				ParentClientID: m.ParentID,
+				Role:           m.Role,
+				Content:        content,
+			})
+		}
+		title := strings.TrimSpace(c.Title)
+		if title == "" {
+			title = "Imported chat"
+		}
+		convID, err := store.ImportConversation(r.Context(), d.DB, store.Conversation{
+			UserID:  u.ID,
+			Title:   title,
+			ModelID: modelID,
+		}, msgs, c.ActiveLeafID)
+		if err != nil {
+			failed++
+			continue
+		}
+		ids = append(ids, convID)
+	}
+	if len(ids) > 0 {
+		// One generic created event (no id): an import can add hundreds of
+		// conversations — receivers just refresh their list once.
+		publishUserEvent(d, r, u.ID, "conversation.created", "")
+	}
+	writeJSON(w, 201, map[string]any{"imported": len(ids), "failed": failed, "conversation_ids": ids})
+}
+
+type createInlineThreadReq struct {
+	MessageID string `json:"message_id"`
+	Quote     string `json:"quote"`
+}
+
+// createInlineThreadHandler opens a sub-conversation anchored to a quoted
+// excerpt of a message in the given source conversation (§ text-selection
+// sub-conversations). It inherits the source's model and is hidden from the
+// normal conversation list; the quote is injected as system context so the
+// assistant stays scoped to the highlighted passage.
+func createInlineThreadHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	srcID := pathParam(r, "id")
+	src, err := store.GetConversation(r.Context(), d.DB, srcID, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	var req createInlineThreadReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	quote := strings.TrimSpace(req.Quote)
+	if quote == "" || req.MessageID == "" {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	// Cap the quote so a runaway selection can't bloat the system prompt.
+	quoteCap := envcfg.Int("AIVORY_API_INLINE_THREAD_QUOTE_CAP", 4000)
+	if rs := []rune(quote); len(rs) > quoteCap {
+		quote = string(rs[:quoteCap])
+	}
+	// The anchored message must belong to the source conversation.
+	msg, err := store.GetMessage(r.Context(), d.DB, req.MessageID)
+	if err != nil || msg.ConversationID != srcID {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	title := quote
+	if rs := []rune(title); len(rs) > 40 {
+		title = strings.TrimSpace(string(rs[:40])) + "…"
+	}
+	conv, err := store.CreateConversation(r.Context(), d.DB, store.Conversation{
+		UserID:           u.ID,
+		ModelID:          src.ModelID,
+		Provider:         src.Provider,
+		Title:            title,
+		InlineSourceConv: srcID,
+		InlineParentID:   req.MessageID,
+		InlineQuote:      quote,
+		WorkspaceID:      src.WorkspaceID,
+		// Inline threads are new conversations. Workspace threads therefore use
+		// the creator-private default; CreateConversation forces them public when
+		// this member does not have can_private_conversations.
+		IsPublic: false,
+	})
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 201, conv)
+}
+
+// listInlineThreadsHandler returns the sub-conversations anchored to a source
+// conversation so the UI can render inline-thread markers on its messages.
+func listInlineThreadsHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	srcID := pathParam(r, "id")
+	if _, err := store.GetConversation(r.Context(), d.DB, srcID, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	rows, err := store.ListInlineThreads(r.Context(), d.DB, srcID, u.ID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, rows)
+}
+
+// getConversationHandler reads one conversation + path messages.
+func getConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	conv, err := store.GetConversation(r.Context(), d.DB, id, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	msgs, _ := msgcache.ListMessages(r.Context(), d.Cache, d.DB, conv.ID, conv.ActiveLeafID)
+	// Optional reverse pagination over the active path: ?limit=N (&before=<id>)
+	// returns the trailing window oldest-first. With NO limit the whole path is
+	// returned and has_more=false — preserving the original (unpaginated) contract.
+	before := r.URL.Query().Get("before")
+	limit := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, perr := strconv.Atoi(l); perr == nil && n > 0 && n <= envcfg.Int("AIVORY_API_GETCONVERSATION_ACTIVE_PATH_LIMIT", 200) {
+			limit = n
+		}
+	}
+	window, hasMore, nextBefore := paginatePath(msgs, before, limit)
+	stripServerConvFields(conv)
+	// Enrich with sibling indexes so the active-path load carries branch_count /
+	// branch_index / siblings — without this the frontend never sees the
+	// `< n/m >` branch picker on a fresh load or post-stream reconcile (§4.15).
+	writeJSON(w, 200, map[string]any{
+		"conversation": conv,
+		"messages":     userMessageResponse(d, r, window),
+		"has_more":     hasMore,
+		"next_before":  nextBefore,
+	})
+}
+
+// paginatePath returns the trailing window of an active path. When before!="" the
+// path is first cut to everything strictly above that message id. When limit>0 the
+// last `limit` messages are returned (oldest-first) with hasMore + the cursor
+// (oldest returned id) for the next older page. limit<=0 returns the whole slice
+// unchanged with hasMore=false — i.e. no pagination.
+func paginatePath(msgs []store.Message, before string, limit int) (window []store.Message, hasMore bool, nextBefore string) {
+	if before != "" {
+		cut := -1
+		for i, m := range msgs {
+			if m.ID == before {
+				cut = i
+				break
+			}
+		}
+		if cut < 0 {
+			// Stale/foreign cursor (message deleted, branch switched, wrong path):
+			// treat as exhausted rather than re-serving the latest window, which
+			// would let the client loop re-requesting the same page.
+			return []store.Message{}, false, ""
+		}
+		msgs = msgs[:cut]
+	}
+	if limit <= 0 {
+		return msgs, false, ""
+	}
+	if len(msgs) > limit {
+		hasMore = true
+		msgs = msgs[len(msgs)-limit:]
+	}
+	if hasMore && len(msgs) > 0 {
+		nextBefore = msgs[0].ID
+	}
+	return msgs, hasMore, nextBefore
+}
+
+// updateConversationHandler edits selected fields (title, project, archive…).
+func updateConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	var p store.ConversationPatch
+	if err := decodeJSON(r, &p); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	permissions, permissionErr := requestPermissions(d, r)
+	if permissionErr != nil {
+		writeError(w, http.StatusForbidden, errPermissionDenied)
+		return
+	}
+	if !permissions.AllowKnowledgeBases && (rawStringArrayHasValue(p.KBIDs) || p.ProjectID != nil && strings.TrimSpace(*p.ProjectID) != "") {
+		writeError(w, http.StatusForbidden, errKnowledgeBaseGroupPermission)
+		return
+	}
+	if !permissions.AllowDrawing && p.ModelID != nil && strings.TrimSpace(*p.ModelID) != "" {
+		if model, modelErr := store.GetModel(r.Context(), d.DB, strings.TrimSpace(*p.ModelID)); modelErr == nil && model.Kind == "image" {
+			writeError(w, http.StatusForbidden, errDrawingGroupPermission)
+			return
+		}
+	}
+	var current *store.Conversation
+	if p.IsPublic != nil || p.KBIDs != nil || p.ProjectID != nil {
+		var err error
+		current, err = store.GetConversation(r.Context(), d.DB, id, u.ID)
+		if err != nil {
+			writeError(w, 404, errNotFound)
+			return
+		}
+	}
+	visibilityChanged := false
+	visibilityWorkspaceID := ""
+	if p.IsPublic != nil {
+		// §workspace RBAC: visibility belongs to the conversation creator and
+		// workspace admins. A uniform 404 avoids exposing private conversation
+		// ids to other members.
+		if current.WorkspaceID == "" {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		if current.UserID != u.ID {
+			decision, err := store.AuthorizeWorkspace(r.Context(), d.DB, store.WorkspaceAuthorizationRequest{
+				WorkspaceID: current.WorkspaceID, UserID: u.ID,
+				Action:   store.ActionConversationVisibilityUpdate,
+				Resource: "conversation", ResourceID: id,
+			})
+			if err != nil || !decision.Allowed {
+				writeError(w, 404, errNotFound)
+				return
+			}
+		}
+		visibilityChanged = current.IsPublic != *p.IsPublic
+		visibilityWorkspaceID = current.WorkspaceID
+	}
+	// §C1: never let a user attach a KB they don't own — filter kb_ids to the
+	// owned subset at write time (the orchestrator re-filters at read time too).
+	// The scope follows the CONVERSATION's space (§workspaces): a workspace
+	// conversation may only attach that workspace's shared KBs, and a personal
+	// one only personal KBs.
+	selectedKBIDs := []string{}
+	if p.KBIDs != nil {
+		var ids []string
+		if json.Unmarshal(p.KBIDs, &ids) == nil {
+			selectedKBIDs = store.OwnedKBIDs(r.Context(), d.DB, u.ID, current.WorkspaceID, ids)
+			b, _ := json.Marshal(selectedKBIDs)
+			p.KBIDs = b
+		} else {
+			p.KBIDs = json.RawMessage("[]")
+		}
+	} else if p.ProjectID != nil {
+		// A project change can make the unchanged explicit KB selection
+		// incompatible, so include the currently persisted selection below.
+		_ = json.Unmarshal(current.KBIDs, &selectedKBIDs)
+		selectedKBIDs = store.OwnedKBIDs(r.Context(), d.DB, u.ID, current.WorkspaceID, selectedKBIDs)
+	}
+	// Mirror the create path: a moved conversation must point at a project the
+	// caller owns — don't trust a client-supplied project_id (an empty string
+	// detaches, which is always allowed).
+	var selectedProject *store.Project
+	if p.KBIDs != nil || p.ProjectID != nil {
+		projectID := current.ProjectID
+		if p.ProjectID != nil {
+			projectID = strings.TrimSpace(*p.ProjectID)
+			p.ProjectID = &projectID
+		}
+		if projectID != "" {
+			proj, err := store.GetProject(r.Context(), d.DB, projectID, u.ID)
+			if err != nil || proj.WorkspaceID != current.WorkspaceID {
+				writeError(w, 404, errors.New("project not found"))
+				return
+			}
+			selectedProject = proj
+		}
+	}
+	if p.KBIDs != nil || p.ProjectID != nil {
+		compatibilityIDs := append([]string(nil), selectedKBIDs...)
+		if selectedProject != nil && selectedProject.KBID != "" {
+			compatibilityIDs = append(compatibilityIDs, selectedProject.KBID)
+		}
+		if err := store.ValidateKBEmbeddingCompatibility(r.Context(), d.DB, compatibilityIDs); err != nil {
+			if errors.Is(err, store.ErrMixedKBEmbeddingModels) {
+				writeError(w, http.StatusConflict, errKnowledgeBaseSelectionIncompatible)
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	conv, err := store.UpdateConversation(r.Context(), d.DB, id, u.ID, p)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	msgcache.Bump(d.Cache, id)
+	stripServerConvFields(conv)
+	publishUserEvent(d, r, u.ID, "conversation.updated", id)
+	if visibilityChanged {
+		revokeConversationGenerations(d, id)
+		publishWorkspaceConversationVisibility(d, r, visibilityWorkspaceID, u.ID, id, conv.IsPublic)
+	}
+	writeJSON(w, 200, conv)
+}
+
+func rawStringArrayHasValue(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var values []string
+	if json.Unmarshal(raw, &values) != nil {
+		return false
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// publishWorkspaceConversationVisibility reconciles other members immediately:
+// a newly-private conversation disappears without a deletion tombstone (it may
+// be made public again), while a newly-public row enters their authorized list.
+// Authorization remains database-enforced if this best-effort notification is
+// missed or a client is offline.
+func publishWorkspaceConversationVisibility(d Deps, r *http.Request, workspaceID, actorID, conversationID string, isPublic bool) {
+	recipients := map[string]struct{}{}
+	if members, err := store.ListWorkspaceMembers(r.Context(), d.DB, workspaceID); err == nil {
+		for _, member := range members {
+			recipients[member.UserID] = struct{}{}
+		}
+	}
+	// Legacy workspaces may be missing the redundant owner membership row.
+	if workspace, err := store.GetWorkspaceForMember(r.Context(), d.DB, workspaceID, actorID); err == nil {
+		recipients[workspace.OwnerID] = struct{}{}
+	}
+	eventType := "conversation.hidden"
+	if isPublic {
+		eventType = "conversation.created"
+	}
+	for userID := range recipients {
+		if userID == "" || userID == actorID {
+			continue
+		}
+		// The actor's device id is not meaningful for another user's tabs.
+		publishUserEvent(d, nil, userID, eventType, conversationID)
+	}
+}
+
+// deleteConversationHandler removes a conversation.
+func deleteConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	permissions, permissionErr := requestPermissions(d, r)
+	if permissionErr != nil || !permissions.AllowConversationDeletion {
+		writeError(w, http.StatusForbidden, errForbidden)
+		return
+	}
+	deletion, err := store.DeleteConversationWithState(r.Context(), d.DB, id, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	// Conversation uploads cascade-delete (documents.conversation_id ON DELETE
+	// CASCADE); files are physically deleted by DeleteConversation. Drop vectors
+	// and storage objects for the conversation and every inline sub-conversation
+	// that was removed with it.
+	for _, cid := range deletion.ConversationIDs {
+		msgcache.Bump(d.Cache, cid)
+		cleanupRAGConversation(r.Context(), d, cid, "delete conversation "+id)
+	}
+	cleanupStoragePaths(r.Context(), d, deletion.StoragePaths, "delete conversation "+id)
+	publishUserEvent(d, r, u.ID, "conversation.deleted", id)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// listMessagesHandler returns either the active path or the full tree.
+func listMessagesHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	if _, err := store.GetConversation(r.Context(), d.DB, id, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	mode := r.URL.Query().Get("mode")
+	if mode == "tree" {
+		msgs, err := store.ListAllMessages(r.Context(), d.DB, id)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		// Enrich each message with sibling indexes so the frontend can render
+		// branch pickers without a second roundtrip.
+		writeJSON(w, 200, userMessageResponse(d, r, msgs))
+		return
+	}
+	conv, _ := store.GetConversation(r.Context(), d.DB, id, u.ID)
+	msgs, err := msgcache.ListMessages(r.Context(), d.Cache, d.DB, id, conv.ActiveLeafID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+
+	// §6.1 cursor reverse-pagination over the active path: ?before=<id>&limit=N
+	// returns the trailing window oldest-first. Cursor metadata travels in
+	// headers so the response stays a plain array (backward compatible).
+	before := r.URL.Query().Get("before")
+	limit := envcfg.Int("AIVORY_API_LIMIT_4", 30)
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, perr := strconv.Atoi(l); perr == nil && n > 0 && n <= envcfg.Int("AIVORY_API_LISTMESSAGES_PAGE_LIMIT", 200) {
+			limit = n
+		}
+	}
+	window, hasMore, nextBefore := paginatePath(msgs, before, limit)
+	w.Header().Set("X-Has-More", strconv.FormatBool(hasMore))
+	if nextBefore != "" {
+		w.Header().Set("X-Next-Before", nextBefore)
+	}
+	writeJSON(w, 200, userMessageResponse(d, r, window))
+}
+
+type enrichedMessage struct {
+	store.Message
+	BranchIndex int      `json:"branch_index"`
+	BranchCount int      `json:"branch_count"`
+	Siblings    []string `json:"siblings"`
+	// Author display identity (§workspaces — shared conversations attribute each
+	// user turn). Empty outside workspaces / on legacy rows.
+	AuthorName   string `json:"author_name,omitempty"`
+	AuthorAvatar string `json:"author_avatar,omitempty"`
+}
+
+// enrichWithAuthors resolves author_id → display name + avatar in ONE batched
+// users query. Only meaningful for workspace conversations; personal ones have
+// a single implied author and skip the lookup.
+func enrichWithAuthors(d Deps, r *http.Request, ems []enrichedMessage) []enrichedMessage {
+	idSet := map[string]struct{}{}
+	for i := range ems {
+		if ems[i].AuthorID != "" {
+			idSet[ems[i].AuthorID] = struct{}{}
+		}
+	}
+	if len(idSet) == 0 {
+		return ems
+	}
+	ids := make([]string, 0, len(idSet))
+	for id := range idSet {
+		ids = append(ids, id)
+	}
+	identities, err := store.UserIdentities(r.Context(), d.DB, ids)
+	if err != nil {
+		return ems
+	}
+	for i := range ems {
+		if ident, ok := identities[ems[i].AuthorID]; ok {
+			ems[i].AuthorName = ident.Name
+			ems[i].AuthorAvatar = ident.AvatarURL
+		}
+	}
+	return ems
+}
+
+// enrichWithFeedback overwrites the legacy message-level feedback mirror with
+// the authenticated user's own row. It runs after the shared path cache is read,
+// so two workspace members never see each other's rating and feedback updates do
+// not depend on cache expiry.
+func enrichWithFeedback(d Deps, r *http.Request, ems []enrichedMessage) []enrichedMessage {
+	u := authUser(r)
+	if u == nil {
+		return ems
+	}
+	ids := make([]string, 0, len(ems))
+	for i := range ems {
+		ems[i].Feedback = ""
+		ems[i].FeedbackReasons = []string{}
+		ems[i].FeedbackComment = ""
+		if ems[i].Role == "assistant" {
+			ids = append(ids, ems[i].ID)
+		}
+	}
+	feedback, err := store.ListMessageFeedbackForUser(r.Context(), d.DB, u.ID, ids)
+	if err != nil {
+		return ems
+	}
+	for i := range ems {
+		if row, ok := feedback[ems[i].ID]; ok {
+			ems[i].Feedback = row.Rating
+			ems[i].FeedbackReasons = row.Reasons
+			ems[i].FeedbackComment = row.Comment
+		}
+	}
+	return ems
+}
+
+// userMessageResponse is the single user-facing message hydration boundary:
+// branch/author metadata, current-user feedback, then cost/raw/model redaction.
+func userMessageResponse(d Deps, r *http.Request, msgs []store.Message) []enrichedMessage {
+	enriched := enrichWithSiblings(d, r, msgs)
+	enriched = enrichWithAuthors(d, r, enriched)
+	enriched = enrichWithFeedback(d, r, enriched)
+	enriched = enrichWithMCPToolDisplay(d, enriched)
+	return redactCost(enriched)
+}
+
+// enrichWithMCPToolDisplay backfills display metadata for messages created
+// before tool_label/tool_icon were persisted. The executable tool_name remains
+// unchanged; only the user-facing presentation is enriched.
+func enrichWithMCPToolDisplay(d Deps, msgs []enrichedMessage) []enrichedMessage {
+	if d.Tools == nil || len(msgs) == 0 {
+		return msgs
+	}
+	displays := make(map[string]struct{ label, icon string })
+	for _, definition := range d.Tools.ListMCP("") {
+		name := strings.TrimSpace(definition.Name)
+		label := strings.TrimSpace(definition.DisplayName)
+		if name == "" || label == "" {
+			continue
+		}
+		displays[name] = struct{ label, icon string }{label: label, icon: strings.TrimSpace(definition.Icon)}
+	}
+	if len(displays) == 0 {
+		return msgs
+	}
+	for i := range msgs {
+		var blocks []llm.UnifiedBlock
+		if json.Unmarshal(msgs[i].Blocks, &blocks) != nil {
+			continue
+		}
+		changed := false
+		for j := range blocks {
+			if blocks[j].ToolName == "" {
+				continue
+			}
+			display, ok := displays[blocks[j].ToolName]
+			if !ok {
+				continue
+			}
+			if blocks[j].ToolLabel == "" {
+				blocks[j].ToolLabel = display.label
+				changed = true
+			}
+			if blocks[j].ToolIcon == "" && display.icon != "" {
+				blocks[j].ToolIcon = display.icon
+				changed = true
+			}
+		}
+		if changed {
+			if encoded, err := json.Marshal(blocks); err == nil {
+				msgs[i].Blocks = encoded
+			}
+		}
+	}
+	return msgs
+}
+
+func enrichWithSiblings(d Deps, r *http.Request, msgs []store.Message) []enrichedMessage {
+	// Resolve all sibling lists in a single batch (one query per unique parent
+	// slot) instead of issuing one query per message (N+1 pattern).
+	siblingMap, _ := store.BatchSiblingsOf(r.Context(), d.DB, msgs)
+	out := make([]enrichedMessage, 0, len(msgs))
+	for _, m := range msgs {
+		ids := siblingMap[m.ID]
+		idx := 0
+		for i, id := range ids {
+			if id == m.ID {
+				idx = i
+				break
+			}
+		}
+		out = append(out, enrichedMessage{
+			Message:     m,
+			BranchIndex: idx,
+			BranchCount: len(ids),
+			Siblings:    ids,
+		})
+	}
+	return out
+}
+
+// redactCost zeroes the per-message cost/currency before a USER-facing response.
+// Spend is admin-only (visible in /admin/usage); regular users never see it, and
+// the API never returns it to them. Admin message-drilldown endpoints skip this.
+func redactCost(ems []enrichedMessage) []enrichedMessage {
+	for i := range ems {
+		ems[i].Cost = 0
+		ems[i].Currency = ""
+		// `raw` is the provider-native exchange (tool I/O, retrieved RAG context,
+		// provider plumbing) kept server-side for same-vendor replay — never meant
+		// for end users. Strip it on every user-facing path; admin endpoints that
+		// intentionally skip redaction still expose it.
+		ems[i].Raw = nil
+		// tool_output contains the bounded, canonical tool result retained solely so
+		// server-side context compaction can summarize more than the short UI preview.
+		// It may still hold sensitive tool data and is not a display block, so remove it
+		// at the same user-facing boundary as provider Raw. Admin diagnostics bypass
+		// redactCost and keep the complete persisted representation.
+		ems[i].Blocks = redactInternalMessageBlocks(ems[i].Blocks)
+		// §fast-mode: a fast turn's real model must never reach the user. Blank the
+		// identity (model_id / model_label / provider); `fast:true` stays on the wire
+		// so the client renders the localized "快速" label + a generic icon. This is
+		// the single user-facing chokepoint (getConversation / listMessages /
+		// setActiveLeaf / editMessage all pass through here); admin drill-down and
+		// usage analytics skip redactCost, so the real model stays intact for them.
+		if ems[i].Fast {
+			ems[i].ModelID = ""
+			ems[i].ModelLabel = ""
+			ems[i].Provider = ""
+		}
+		ems[i].Attachments = backfillAttachmentURLs(ems[i].Attachments)
+	}
+	return ems
+}
+
+func redactInternalMessageBlocks(raw json.RawMessage) json.RawMessage {
+	if len(raw) <= 2 {
+		return raw
+	}
+	var blocks []llm.UnifiedBlock
+	if json.Unmarshal(raw, &blocks) != nil {
+		// The user API has no reason to return an unparseable persisted payload:
+		// it could contain a malformed internal tool_output record which cannot be
+		// selectively redacted. Fail closed rather than leaking opaque server-only
+		// data. Admin diagnostics deliberately bypass this user-facing redaction.
+		return json.RawMessage("[]")
+	}
+	filtered := make([]llm.UnifiedBlock, 0, len(blocks))
+	changed := false
+	for _, block := range blocks {
+		if block.Kind == "tool_output" {
+			changed = true
+			continue
+		}
+		filtered = append(filtered, block)
+	}
+	if !changed {
+		return raw
+	}
+	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		return json.RawMessage("[]")
+	}
+	return encoded
+}
+
+// backfillAttachmentURLs walks the attachments JSON blob and, for any item
+// missing a `url`, inserts "/api/files/<id>". Older messages persisted before
+// the upload endpoint started emitting URLs (or messages whose client never
+// populated url) need this so the user-bubble image preview can render through
+// the persistent download endpoint instead of a revoked blob: URL.
+func backfillAttachmentURLs(raw json.RawMessage) json.RawMessage {
+	if len(raw) < 2 {
+		return raw
+	}
+	var atts []map[string]any
+	if err := json.Unmarshal(raw, &atts); err != nil {
+		return raw
+	}
+	changed := false
+	for i := range atts {
+		if url, _ := atts[i]["url"].(string); url == "" {
+			if id, _ := atts[i]["id"].(string); id != "" {
+				atts[i]["url"] = "/api/files/" + id
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(atts)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+type setActiveLeafReq struct {
+	LeafID string `json:"leaf_id"`
+}
+
+// setActiveLeafHandler updates conversations.active_leaf_id; the front-end
+// passes the deepest descendant of the picked sibling so the UI renders the
+// full branch.
+func setActiveLeafHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	var req setActiveLeafReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	if req.LeafID == "" {
+		writeError(w, 400, errors.New("leaf_id required"))
+		return
+	}
+	target, err := store.LatestAssistantInSubtree(r.Context(), d.DB, id, req.LeafID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		writeError(w, 500, err)
+		return
+	}
+	conv, err := store.UpdateConversation(r.Context(), d.DB, id, u.ID, store.ConversationPatch{ActiveLeafID: &target})
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	msgcache.Bump(d.Cache, id)
+	// §23: the active branch is persisted state — other devices viewing this
+	// conversation should switch along instead of rendering a stale branch.
+	publishUserEvent(d, r, u.ID, "conversation.updated", id)
+	msgs, _ := msgcache.ListMessages(r.Context(), d.Cache, d.DB, id, conv.ActiveLeafID)
+	stripServerConvFields(conv)
+	writeJSON(w, 200, map[string]any{
+		"conversation": conv,
+		"messages":     userMessageResponse(d, r, msgs),
+	})
+}
+
+// forkConversationHandler copies the path ending at leaf_id into a brand new
+// conversation, leaving the original intact. This implements §4.15's
+// "fork to new conversation".
+func forkConversationHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	conv, err := store.GetConversation(r.Context(), d.DB, id, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	var body struct {
+		LeafID string `json:"leaf_id"`
+		Title  string `json:"title"`
+	}
+	_ = decodeJSON(r, &body)
+	if body.LeafID == "" {
+		body.LeafID = conv.ActiveLeafID
+	}
+	if body.LeafID == "" {
+		writeError(w, 400, errors.New("leaf_id required"))
+		return
+	}
+	path, err := msgcache.ListMessages(r.Context(), d.Cache, d.DB, conv.ID, body.LeafID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	title := strings.TrimSpace(body.Title)
+	if title == "" {
+		title = conv.Title + " (fork)"
+	}
+	newConv, err := store.CreateConversation(r.Context(), d.DB, store.Conversation{
+		UserID:      u.ID,
+		ProjectID:   conv.ProjectID,
+		Title:       title,
+		Provider:    conv.Provider,
+		ModelID:     conv.ModelID,
+		Fast:        conv.Fast, // §fast-mode: a fork of a fast conversation stays fast
+		KBIDs:       conv.KBIDs,
+		WorkspaceID: conv.WorkspaceID,
+		// Forks are new conversations, so workspace forks follow the new
+		// creator-private default instead of inheriting the source's visibility.
+		IsPublic: false,
+	})
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	// Copy the whole chain in ONE transaction (store.CreateMessagePath). The old
+	// per-message CreateMessage loop paid a commit+fsync per copied message —
+	// forking a long conversation took seconds, users assumed it failed and
+	// clicked again, forking twice.
+	copies := make([]store.Message, 0, len(path))
+	for _, m := range path {
+		authorID := m.AuthorID
+		if conv.WorkspaceID != "" && m.Role == "user" && authorID == "" {
+			// Legacy user turns implied the source conversation creator. Once the
+			// fork has a different creator, make that attribution explicit.
+			authorID = conv.UserID
+		}
+		copies = append(copies, store.Message{
+			ConversationID: newConv.ID,
+			Role:           m.Role,
+			Provider:       m.Provider,
+			ModelID:        m.ModelID,
+			ModelLabel:     m.ModelLabel, // pass the source label through; the batch insert does no per-row lookup
+			// §fast-mode: carry the fast marker forward — a forked fast row keeps the
+			// REAL model id/label/provider (copied above), so without this the fork
+			// would have fast=0 and redactCost would serve the real model name to the
+			// user on every load of the forked conversation.
+			Fast:                 m.Fast,
+			Blocks:               m.Blocks,
+			Raw:                  m.Raw,
+			StopReason:           m.StopReason,
+			Attachments:          m.Attachments,
+			SelectedUserSkillIDs: m.SelectedUserSkillIDs,
+			Citations:            m.Citations,
+			InputTokens:          m.InputTokens,
+			ContextTokens:        m.ContextTokens,
+			OutputTokens:         m.OutputTokens,
+			CacheReadTokens:      m.CacheReadTokens,
+			CacheWriteTokens:     m.CacheWriteTokens,
+			Cost:                 m.Cost,
+			Currency:             m.Currency,
+			Status:               "complete",
+			AuthorID:             authorID,
+		})
+	}
+	if len(copies) > 0 {
+		if _, err := store.CreateMessagePath(r.Context(), d.DB, copies); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	publishUserEvent(d, r, u.ID, "conversation.created", newConv.ID)
+	writeJSON(w, 201, newConv)
+}
+
+// promoteDocumentHandler moves a conversation document into the project KB.
+func promoteDocumentHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	convID := pathParam(r, "id")
+	docID := pathParam(r, "docId")
+	conv, err := store.GetConversation(r.Context(), d.DB, convID, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	if conv.ProjectID == "" {
+		writeError(w, 400, errors.New("conversation is not in a project"))
+		return
+	}
+	p, err := store.GetProject(r.Context(), d.DB, conv.ProjectID, u.ID)
+	if err != nil || p.KBID == "" {
+		writeError(w, 400, errors.New("project has no knowledge base"))
+		return
+	}
+	doc, err := store.GetDocumentForUser(r.Context(), d.DB, docID, u.ID)
+	if err != nil || doc.ConversationID != conv.ID {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	// §C5: re-embed with the destination KB's locked embedder (not a raw chunk
+	// move) so the promoted document is actually retrievable in the KB.
+	if err := d.RAG.PromoteDocument(r.Context(), docID, p.KBID, u.ID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// listConversationDocsHandler returns the conversation-scoped documents and
+// their ingest status, so the client can show upload/parse progress and block
+// the first send until a just-attached file is 'ready' (§ chat uploads).
+func listConversationDocsHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	convID := pathParam(r, "id")
+	if _, err := store.GetConversation(r.Context(), d.DB, convID, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	docs, err := store.ListDocumentsForUser(r.Context(), d.DB, "conversation", convID, u.ID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, userDocuments(docs))
+}
+
+// retryConversationDocumentHandler requeues a failed conversation-scoped
+// document after the user fixes the underlying issue (for example OSS/MinerU
+// credentials) and clicks Retry in the composer.
+func retryConversationDocumentHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	convID := pathParam(r, "id")
+	docID := pathParam(r, "docId")
+	conv, err := store.GetConversation(r.Context(), d.DB, convID, u.ID)
+	if err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	doc, err := store.GetDocumentForUser(r.Context(), d.DB, docID, u.ID)
+	if err != nil || doc.ConversationID != conv.ID {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	if doc.Status != "failed" {
+		writeError(w, 409, errors.New("document is not failed"))
+		return
+	}
+	if d.RAG == nil {
+		writeError(w, 503, errors.New("rag service is unavailable"))
+		return
+	}
+	if err := store.RetryDocumentForUser(r.Context(), d.DB, docID, convID, u.ID); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		writeError(w, 500, err)
+		return
+	}
+	d.RAG.IngestNow(docID)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// convFile is the shape returned by the conversation files drawer (§ conversation
+// files): the authoritative set of files this conversation references, each with
+// a download URL.
+type convFile struct {
+	ID             string `json:"id"`
+	Filename       string `json:"filename"`
+	Kind           string `json:"kind"`
+	MimeType       string `json:"mime_type"`
+	SizeBytes      int64  `json:"size_bytes"`
+	CreatedAt      int64  `json:"created_at"`
+	URL            string `json:"url"`
+	Draft          bool   `json:"draft"`
+	DocumentID     string `json:"document_id,omitempty"`
+	DocumentStatus string `json:"document_status,omitempty"`
+	DocumentError  string `json:"document_error,omitempty"`
+}
+
+// listConversationFilesHandler returns every file currently attached to the
+// conversation (what the model actually sees / stages), for the files drawer.
+func listConversationFilesHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	convID := pathParam(r, "id")
+	if _, err := store.GetConversation(r.Context(), d.DB, convID, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	files, err := store.ListFilesByConversation(r.Context(), d.DB, convID, u.ID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	draftOnly := r.URL.Query().Get("draft") == "1" || r.URL.Query().Get("draft") == "true"
+	docs, err := store.ListDocumentsForUser(r.Context(), d.DB, "conversation", convID, u.ID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	docByPath := make(map[string]store.Document, len(docs))
+	for _, doc := range docs {
+		if _, exists := docByPath[doc.StoragePath]; !exists {
+			docByPath[doc.StoragePath] = doc
+		}
+	}
+	out := make([]convFile, 0, len(files))
+	for _, f := range files {
+		if draftOnly && !f.Draft {
+			continue
+		}
+		row := convFile{
+			ID: f.ID, Filename: f.Filename, Kind: f.Kind, MimeType: f.MimeType,
+			SizeBytes: f.SizeBytes, CreatedAt: f.CreatedAt, URL: "/api/files/" + f.ID, Draft: f.Draft,
+		}
+		if doc, ok := docByPath[f.StoragePath]; ok {
+			row.DocumentID = doc.ID
+			row.DocumentStatus = doc.Status
+			row.DocumentError = doc.Error
+		}
+		out = append(out, row)
+	}
+	writeJSON(w, 200, out)
+}
+
+// deleteConversationFileHandler permanently removes a file from the
+// conversation's referenced set (§ conversation files), its file row, and the
+// conversation-scoped RAG documents backed by the same bytes. An auto-added
+// project-KB document is a shared-library copy and survives this operation, as do
+// its vectors and physical bytes.
+func deleteConversationFileHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	convID := pathParam(r, "id")
+	fileID := pathParam(r, "fileId")
+	if _, err := store.GetConversation(r.Context(), d.DB, convID, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	f, err := store.GetFile(r.Context(), d.DB, fileID, u.ID)
+	if err != nil || f == nil || f.ConversationID != convID {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	storagePaths := []string{f.StoragePath}
+	docs, err := store.DocumentsByStoragePathForUser(r.Context(), d.DB, f.StoragePath, u.ID)
+	if err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	docIDs := make([]string, 0, len(docs))
+	for _, doc := range docs {
+		if doc.ConversationID != convID {
+			continue
+		}
+		docIDs = append(docIDs, doc.ID)
+		storagePaths = append(storagePaths, doc.StoragePath)
+	}
+	if err := store.DeleteConversationFileAndDocuments(r.Context(), d.DB, fileID, convID, u.ID, docIDs); err != nil {
+		writeError(w, 500, err)
+		return
+	}
+	// The delete transaction marks matching historical attachments unavailable.
+	// Ensure open transcript caches reload that authoritative state before an
+	// edit, retry, or regenerate can reuse the removed file id.
+	msgcache.Bump(d.Cache, convID)
+	publishUserEvent(d, r, u.ID, "conversation.updated", convID)
+	if f.UserID != u.ID {
+		publishUserEvent(d, r, f.UserID, "conversation.updated", convID)
+	}
+	for _, docID := range docIDs {
+		cleanupRAGDocument(r.Context(), d, docID, "delete conversation file "+fileID)
+	}
+	cleanupStoragePaths(r.Context(), d, storagePaths, "delete conversation file "+fileID)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// stopHandler signals either one generation/message cancel or, for legacy
+// clients with an empty body, a conversation-wide cancel.
+func stopHandler(d Deps, w http.ResponseWriter, r *http.Request) {
+	u := authUser(r)
+	id := pathParam(r, "id")
+	if _, err := store.GetConversation(r.Context(), d.DB, id, u.ID); err != nil {
+		writeError(w, 404, errNotFound)
+		return
+	}
+	var body struct {
+		GenerationID string `json:"generation_id"`
+		MessageID    string `json:"message_id"`
+	}
+	if err := decodeJSON(r, &body); err != nil {
+		writeError(w, 400, errInvalidInput)
+		return
+	}
+	if body.GenerationID != "" && body.MessageID != "" {
+		writeError(w, 400, errors.New("provide generation_id or message_id, not both"))
+		return
+	}
+	if body.GenerationID != "" {
+		if !validGenerationID(body.GenerationID) {
+			writeError(w, 400, errors.New("invalid generation_id"))
+			return
+		}
+		publishScopedStop(d, generationStopTopic(u.ID, id, body.GenerationID))
+		writeJSON(w, 200, map[string]bool{"ok": true})
+		return
+	}
+	if body.MessageID != "" {
+		message, err := store.GetMessage(r.Context(), d.DB, body.MessageID)
+		if err != nil || message.ConversationID != id || message.Role != "assistant" {
+			writeError(w, 404, errNotFound)
+			return
+		}
+		publishScopedStop(d, messageStopTopic(u.ID, id, body.MessageID))
+		writeJSON(w, 200, map[string]bool{"ok": true})
+		return
+	}
+	// Backwards compatibility for clients that do not know the generation/message
+	// selector. Scope the live broadcast to this caller: workspace members share a
+	// conversation, but must not be able to cancel one another's generations. This
+	// intentionally has no durable stop-intent marker, so it cannot affect a later
+	// generation that was not subscribed when Stop was requested.
+	d.Cache.Publish(conversationStopTopic(u.ID, id), "1")
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}

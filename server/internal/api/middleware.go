@@ -1,0 +1,456 @@
+package api
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"errors"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"aivory/server/internal/envcfg"
+	"aivory/server/internal/store"
+)
+
+// Env-overridable defaults (§ config-reference); each falls back to the
+// original hardcoded value when its AIVORY_* variable is unset.
+var (
+	onlinePresenceTouchThrottle        = envcfg.Dur("AIVORY_API_ONLINE_PRESENCE_TOUCH_THROTTLE", time.Minute)
+	concurrentGenSlotSafetyTTL         = envcfg.Dur("AIVORY_API_CONCURRENT_GEN_SLOT_SAFETY_TTL", 30*time.Minute)
+	requestSignatureReplayWindowFuture = envcfg.Int64("AIVORY_API_REQUEST_SIGNATURE_REPLAY_WINDOW_FUTURE", 300)
+	requestSignatureReplayWindowPast   = envcfg.Int64("AIVORY_API_REQUEST_SIGNATURE_REPLAY_WINDOW_PAST", 60)
+)
+
+type handler func(d Deps, w http.ResponseWriter, r *http.Request)
+
+type userCtxKey struct{}
+
+// wrap converts our (d, w, r) handler signature to http.HandlerFunc without
+// requiring auth.
+func wrap(d Deps, h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h(d, w, r)
+	}
+}
+
+// authUser returns the authenticated user from context (panics if missing —
+// only called by the auth wrapper).
+func authUser(r *http.Request) *store.User {
+	u, _ := r.Context().Value(userCtxKey{}).(*store.User)
+	return u
+}
+
+// requireAuth wraps a handler with access-token validation. Token is read from
+// the "auth_token" httpOnly cookie or the Authorization header (Bearer).
+//
+// Named `requireAuth` (not `auth`) so we don't shadow the imported `auth`
+// package — Go won't let a func and an import share a name in the same file.
+func requireAuth(d Deps, h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// §A3 CSRF: cookie-authenticated state-changing requests must originate
+		// from an allowed origin. (SameSite=Lax already blocks most cross-site
+		// cookie sends; this is defense-in-depth. Bearer-only requests are exempt.)
+		if !csrfOK(d.Config.AllowedOrigins, r) {
+			writeError(w, http.StatusForbidden, errors.New("cross-site request blocked"))
+			return
+		}
+		token := readAccessToken(r)
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, errAuthRequired)
+			return
+		}
+		claims, err := d.Auth.ParseAccess(token)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, errAuthRequired)
+			return
+		}
+		state, err := store.GetUserAuthStateForSession(r.Context(), d.DB, claims.UID, claims.SessionID)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, errAuthRequired)
+			return
+		}
+		if state.Status != "active" {
+			writeError(w, http.StatusForbidden, errAccountBlocked)
+			return
+		}
+		if state.TokenVer != claims.TV {
+			writeError(w, http.StatusUnauthorized, errSessionExpired)
+			return
+		}
+		if !state.SessionActive {
+			writeError(w, http.StatusUnauthorized, errSessionExpired)
+			return
+		}
+		user, err := cachedAuthUser(r.Context(), d, claims.UID)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, errAuthRequired)
+			return
+		}
+		// Profile data may be cached, but these fields are authorization inputs and
+		// must always reflect the database read above.
+		user.Role = state.Role
+		user.Status = state.Status
+		user.TokenVer = state.TokenVer
+		if !user.HasPassword && !initialPasswordSetupRequest(r) {
+			policy, policyErr := loadAuthPolicy(d)
+			if policyErr != nil {
+				writeError(w, http.StatusInternalServerError, policyErr)
+				return
+			}
+			if policy.OAuthInitialPasswordPolicy == oauthPasswordRequired {
+				writeError(w, http.StatusPreconditionRequired, errInitialPasswordRequired)
+				return
+			}
+		}
+		// Online status (§ admin → users): record activity at most once per minute
+		// per user (cache-throttled) so it's a single cheap UPDATE, off the
+		// request path. user.LastSeenAt reflects the value before this touch.
+		if d.Cache != nil {
+			if _, fresh := d.Cache.Get("seen:" + user.ID); !fresh {
+				d.Cache.Set("seen:"+user.ID, "1", onlinePresenceTouchThrottle)
+				uid := user.ID
+				go store.TouchLastSeen(context.Background(), d.DB, uid, time.Now().Unix())
+			}
+		}
+		ctx := context.WithValue(r.Context(), userCtxKey{}, user)
+		h(d, w, r.WithContext(ctx))
+	}
+}
+
+// requireAdmin wraps a handler with both auth and admin-role enforcement.
+func requireAdmin(d Deps, h handler) http.HandlerFunc {
+	return requireAuth(d, func(d Deps, w http.ResponseWriter, r *http.Request) {
+		u := authUser(r)
+		if u.Role != "admin" {
+			writeError(w, http.StatusForbidden, errAdminOnly)
+			return
+		}
+		h(d, w, r)
+	})
+}
+
+// csrfOK guards cookie-authenticated, state-changing requests (§A3). Returns
+// true (allow) for: safe methods (GET/HEAD/OPTIONS); requests without an
+// auth_token cookie (Bearer-only — a cross-site page can't set the header);
+// requests with no browser cross-site signal; same-origin requests; and
+// requests whose Origin is in the configured allow-list. Everything else is
+// blocked. Same-origin compares scheme as well as host: an http page on the
+// same hostname is not an https origin and must not be able to drive a
+// cookie-authenticated mutation.
+func csrfOK(allowed []string, r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	if _, err := r.Cookie("auth_token"); err != nil {
+		return true
+	}
+	origin := strings.TrimRight(r.Header.Get("Origin"), "/")
+	if origin == "" {
+		return !strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site")
+	}
+	if sameRequestOrigin(origin, r) {
+		return true
+	}
+	for _, a := range allowed {
+		if strings.TrimRight(a, "/") == origin {
+			return true
+		}
+	}
+	return false
+}
+
+func sameRequestOrigin(origin string, r *http.Request) bool {
+	supplied, err := url.Parse(origin)
+	if err != nil || supplied.User != nil || supplied.Host == "" ||
+		(supplied.Path != "" && supplied.Path != "/") || supplied.RawQuery != "" || supplied.Fragment != "" {
+		return false
+	}
+	expected, err := url.Parse(externalBaseURL(r))
+	if err != nil || expected.User != nil || expected.Host == "" {
+		return false
+	}
+	if (supplied.Scheme != "http" && supplied.Scheme != "https") ||
+		(expected.Scheme != "http" && expected.Scheme != "https") {
+		return false
+	}
+	return strings.EqualFold(supplied.Scheme, expected.Scheme) &&
+		strings.EqualFold(supplied.Host, expected.Host)
+}
+
+func readAccessToken(r *http.Request) string {
+	a := r.Header.Get("Authorization")
+	if strings.HasPrefix(a, "Bearer ") {
+		return strings.TrimPrefix(a, "Bearer ")
+	}
+	if c, err := r.Cookie("auth_token"); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+// clientIP extracts the request's source address. X-Forwarded-For and
+// X-Real-IP are only trusted when the direct peer is a loopback or
+// private-network address (i.e. we are behind a reverse proxy). When the
+// direct peer is a public IP, those headers could be spoofed by any client,
+// so we fall back to RemoteAddr to prevent rate-limit bypass.
+func clientIP(r *http.Request) string {
+	remoteHost, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteHost = r.RemoteAddr
+	}
+	// Only trust forwarding headers from private/loopback peers.
+	if isTrustedPeer(remoteHost) {
+		if h := r.Header.Get("X-Forwarded-For"); h != "" {
+			// A reverse proxy APPENDS the real client to any client-supplied XFF, so
+			// the trustworthy originator is the RIGHT-MOST entry that is not itself a
+			// trusted/private proxy hop. Taking the left-most (as before) let a client
+			// send its own `X-Forwarded-For: <spoofed>` and evade every per-IP limit
+			// (login brute-force, registration cap, captcha throttle).
+			parts := strings.Split(h, ",")
+			for i := len(parts) - 1; i >= 0; i-- {
+				ip := strings.TrimSpace(parts[i])
+				if ip != "" && !isTrustedPeer(ip) {
+					return ip
+				}
+			}
+			// Every hop is trusted/private — use the left-most as the best available.
+			return strings.TrimSpace(parts[0])
+		}
+		if h := r.Header.Get("X-Real-IP"); h != "" {
+			return strings.TrimSpace(h)
+		}
+	}
+	return remoteHost
+}
+
+// isTrustedPeer returns true if the address is loopback or RFC-1918 private,
+// meaning the request came through our own reverse proxy.
+func isTrustedPeer(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	// RFC-1918 / RFC-4193 private ranges.
+	privateRanges := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"fc00::/7",
+	}
+	for _, cidr := range privateRanges {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// rateLimitIP applies a fixed-window per-IP request budget — used to block
+// brute-force attempts on auth endpoints (login/register/refresh). We use the
+// cache's Incr-with-TTL primitive (Redis-backed in prod, in-memory in dev) so
+// the limit is shared across replicas.
+//
+// scope namespaces the counter (e.g. "auth.login"), perWindow is the budget,
+// window is the fixed-window length. Returns true if the request should be
+// allowed.
+func rateLimitIP(d Deps, r *http.Request, scope string, perWindow int, window time.Duration) bool {
+	ip := clientIP(r)
+	if ip == "" {
+		return true
+	}
+	key := "rl:ip:" + scope + ":" + ip + ":" + r.URL.Path
+	n := d.Cache.Incr(key, window)
+	return int(n) <= perWindow
+}
+
+// rateLimitUser applies a fixed-window per-USER request budget — used for
+// expensive authenticated actions (document upload → MinerU OCR + embeddings)
+// where an IP-keyed limit is the wrong unit (NAT) and the actor is known (§C4).
+func rateLimitUser(d Deps, userID, scope string, perWindow int, window time.Duration) bool {
+	if userID == "" {
+		return true
+	}
+	key := "rl:u:" + scope + ":" + userID
+	return int(d.Cache.Incr(key, window)) <= perWindow
+}
+
+// rateLimitedIP wraps a handler with rateLimitIP enforcement.
+func rateLimitedIP(d Deps, scope string, perWindow int, window time.Duration, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !rateLimitIP(d, r, scope, perWindow, window) {
+			writeError(w, http.StatusTooManyRequests, errRateLimited)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// reserveConcurrentGen takes one slot in the per-user concurrent-generation
+// budget (§8 — gen:active). Default cap is 3; admins can override via the
+// `max_concurrent_generations` setting. The returned release MUST be called in
+// a defer once the SSE stream ends, otherwise the slot leaks until restart.
+func reserveConcurrentGen(d Deps, userID string) (release func(), ok bool) {
+	cap := 3
+	if raw, gerr := store.GetSetting(d.DB, "max_concurrent_generations"); gerr == nil {
+		// best-effort: ignore parse errors and keep cap=3
+		_ = jsonUnmarshalInt(raw, &cap)
+	}
+	if cap <= 0 {
+		return func() {}, true
+	}
+	key := "gen:active:" + userID
+	// Incr first; if we're over the cap, decrement immediately and refuse.
+	n := d.Cache.Incr(key, concurrentGenSlotSafetyTTL) // safety TTL so dead slots clear themselves
+	if int(n) > cap {
+		// Over budget — atomically undo the increment.
+		d.Cache.Decr(key)
+		return func() {}, false
+	}
+	released := false
+	return func() {
+		if released {
+			return
+		}
+		released = true
+		d.Cache.Decr(key)
+	}, true
+}
+
+// jsonUnmarshalInt accepts a json.RawMessage holding an integer (or a JSON
+// number cast as int) and writes it into out.
+func jsonUnmarshalInt(raw []byte, out *int) error {
+	if len(raw) == 0 {
+		return errors.New("empty")
+	}
+	n := 0
+	neg := false
+	i := 0
+	if raw[0] == '-' {
+		neg = true
+		i = 1
+	}
+	for ; i < len(raw); i++ {
+		c := raw[i]
+		if c < '0' || c > '9' {
+			return errors.New("not int")
+		}
+		n = n*10 + int(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	*out = n
+	return nil
+}
+
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	out := []byte{}
+	for n > 0 {
+		out = append([]byte{byte('0' + n%10)}, out...)
+		n /= 10
+	}
+	if neg {
+		out = append([]byte{'-'}, out...)
+	}
+	return string(out)
+}
+
+// checkDailyTokenQuota enforces a per-user daily token ceiling (§8 hard rule).
+// Default is 0 (disabled); set settings.daily_token_limit to a positive int to
+// turn it on. Tokens are counted via the durable billing ledger, so pruning
+// analytics rows cannot restore a user's allowance.
+func checkDailyTokenQuota(d Deps, userID string) bool {
+	limit := 0
+	if raw, err := store.GetSetting(d.DB, "daily_token_limit"); err == nil {
+		if jsonUnmarshalInt(raw, &limit) != nil || limit < 0 {
+			return false
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	if limit <= 0 {
+		return true
+	}
+	dayStart := time.Now().Truncate(24 * time.Hour).Unix()
+	used, err := store.BillingTokensSince(context.Background(), d.DB, userID, dayStart)
+	if err != nil {
+		return false
+	}
+	return used < limit
+}
+
+// requireReqSig wraps a handler to validate the per-request HMAC signature.
+//
+// Scheme (mirrors client.ts):
+//  1. Derive an intermediate key: HMAC-SHA256(jwt, hourly_epoch)
+//  2. Sign the message ts\x00nonce\x00path with the derived key
+//  3. Compare base64(sig) with X-Req-Token
+//
+// The hourly epoch makes the derived key rotate every hour; binding the path
+// into the signed message means a token captured from one endpoint is invalid
+// on any other. X-Req-Ts must be within ±5 minutes to prevent replay.
+func requireReqSig(h handler) handler {
+	return func(d Deps, w http.ResponseWriter, r *http.Request) {
+		raw := readAccessToken(r)
+		ts := r.Header.Get("X-Req-Ts")
+		nonce := r.Header.Get("X-Req-Nonce")
+		token := r.Header.Get("X-Req-Token")
+		if raw == "" || ts == "" || nonce == "" || token == "" {
+			writeError(w, http.StatusForbidden, errors.New("missing request signature"))
+			return
+		}
+		tsInt, err := strconv.ParseInt(ts, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusForbidden, errors.New("invalid request signature"))
+			return
+		}
+		diff := time.Now().Unix() - tsInt
+		if diff > requestSignatureReplayWindowFuture || diff < -requestSignatureReplayWindowPast {
+			writeError(w, http.StatusForbidden, errors.New("request signature expired"))
+			return
+		}
+		// Step 1: derive hourly key from jwt + epoch.
+		epoch := tsInt / 3600
+		base := hmac.New(sha256.New, []byte(raw))
+		base.Write([]byte(strconv.FormatInt(epoch, 10)))
+		derivedKey := base.Sum(nil)
+		// Step 2: sign ts\x00nonce\x00path with derived key. The client signs the
+		// LOGICAL path — its fetch prepends API_BASE ("/api") only after signing,
+		// and never includes the query string — so canonicalise r.URL.Path the
+		// same way: trim the mount prefix (a no-op when a reverse proxy already
+		// stripped it). Hashing the raw r.URL.Path was why this route answered
+		// 403 "invalid request signature" ever since it shipped.
+		path := strings.TrimPrefix(r.URL.Path, "/api")
+		msg := ts + "\x00" + nonce + "\x00" + path
+		mac := hmac.New(sha256.New, derivedKey)
+		mac.Write([]byte(msg))
+		expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		if !hmac.Equal([]byte(expected), []byte(token)) {
+			writeError(w, http.StatusForbidden, errors.New("invalid request signature"))
+			return
+		}
+		h(d, w, r)
+	}
+}

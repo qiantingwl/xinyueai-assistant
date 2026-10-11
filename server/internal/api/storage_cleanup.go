@@ -1,0 +1,207 @@
+package api
+
+import (
+	"context"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"aivory/server/internal/envcfg"
+	"aivory/server/internal/fileguard"
+	"aivory/server/internal/sandbox"
+	"aivory/server/internal/storage"
+	"aivory/server/internal/store"
+)
+
+var objectStorageDeleteTimeout = envcfg.Dur("AIVORY_API_OBJECT_STORAGE_DELETE_TIMEOUT_CLEANUP", 30*time.Second)
+
+func cleanupStoragePaths(ctx context.Context, d Deps, paths []string, label string) {
+	if len(paths) == 0 {
+		return
+	}
+	seen := map[string]struct{}{}
+	obj := objectStorageClient(d)
+	for _, raw := range paths {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		if _, err := cleanupOneStoragePath(ctx, d, obj, p); err != nil {
+			logStorageCleanup(d, "%s: cleanup %q: %v", label, p, err)
+		}
+	}
+}
+
+// cleanupOneStoragePath removes one path from local disk and object storage,
+// honouring the reference-count guard. referenced=true means DB rows still
+// point at the path so the bytes were intentionally left alone — the deletion
+// job may forget such a path (it belongs to someone else) while the startup
+// sweep must keep it (its owner's job is still running). err != nil means the
+// removal itself failed and durable cleanup state must be retained.
+func cleanupOneStoragePath(ctx context.Context, d Deps, obj *storage.Client, p string) (referenced bool, err error) {
+	ref, err := store.StoragePathReferenced(ctx, d.DB, p)
+	if err != nil {
+		return false, err
+	}
+	if ref {
+		return true, nil
+	}
+	if looksLocalStoragePath(p) {
+		// ResolveExisting performs the real (symlink-aware) check, but first
+		// establish lexical containment. An attacker-controlled absolute path
+		// that does not exist must still fail closed; treating every ENOENT as a
+		// harmless missing file would make the jail testable only for paths that
+		// happen to exist.
+		lexicalInside := false
+		for _, root := range []string{d.Config.UploadDir, d.Config.ArtifactDir} {
+			if _, relErr := fileguard.Relative(root, p); relErr == nil {
+				lexicalInside = true
+				break
+			}
+		}
+		if !lexicalInside {
+			return false, fileguard.ErrOutsideRoot
+		}
+		safePath, resolveErr := fileguard.ResolveExisting(p, d.Config.UploadDir, d.Config.ArtifactDir)
+		if resolveErr != nil {
+			if os.IsNotExist(resolveErr) {
+				return false, nil
+			}
+			return false, resolveErr
+		}
+		if err := os.Remove(safePath); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+	}
+	if key, ok := objectStorageKey(p, obj); ok {
+		dctx, cancel := context.WithTimeout(context.Background(), objectStorageDeleteTimeout)
+		defer cancel()
+		if err := obj.Delete(dctx, key); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func cleanupRAGDocument(ctx context.Context, d Deps, docID, label string) {
+	docID = strings.TrimSpace(docID)
+	if d.RAG == nil || docID == "" {
+		return
+	}
+	if err := d.RAG.OnDocumentDeleted(ctx, docID); err != nil {
+		logStorageCleanup(d, "%s: drop vectors for document %s: %v", label, docID, err)
+	}
+}
+
+func cleanupRAGKB(ctx context.Context, d Deps, kbID, label string) {
+	kbID = strings.TrimSpace(kbID)
+	if d.RAG == nil || kbID == "" {
+		return
+	}
+	if err := d.RAG.OnKBDeleted(ctx, kbID); err != nil {
+		logStorageCleanup(d, "%s: drop vectors for kb %s: %v", label, kbID, err)
+	}
+}
+
+func cleanupRAGConversation(ctx context.Context, d Deps, convID, label string) {
+	convID = strings.TrimSpace(convID)
+	if d.RAG == nil || convID == "" {
+		return
+	}
+	if err := d.RAG.OnConversationDeleted(ctx, convID); err != nil {
+		logStorageCleanup(d, "%s: drop vectors for conversation %s: %v", label, convID, err)
+	}
+}
+
+func objectStorageClient(d Deps) *storage.Client {
+	cfg := objectStorageConfig(d)
+	if cfg == nil {
+		return nil
+	}
+	base := settingString(d, "sandbox_base_url", d.Config.SandboxBaseURL)
+	key := settingString(d, "sandbox_api_key", d.Config.SandboxAPIKey)
+	return storage.New(base, key, cfg)
+}
+
+func privateObjectStorage(d Deps) *storage.PrivateStore {
+	cfg := objectStorageConfig(d)
+	if cfg == nil {
+		return nil
+	}
+	return storage.NewPrivateStore(cfg, d.Config.LocalStorageDir)
+}
+
+func objectStorageConfig(d Deps) *sandbox.StorageConfig {
+	provider := settingString(d, "storage_provider", "")
+	if provider != "s3" && provider != "aliyun_oss" && provider != "local" {
+		return nil
+	}
+	cfg := &sandbox.StorageConfig{
+		Provider: provider,
+		Prefix:   settingString(d, "storage_prefix", "workspaces/"),
+	}
+	switch provider {
+	case "s3":
+		cfg.S3Bucket = settingString(d, "storage_s3_bucket", "")
+		cfg.S3Region = settingString(d, "storage_s3_region", "")
+		cfg.S3Endpoint = settingString(d, "storage_s3_endpoint", "")
+		cfg.S3AccessKey = settingString(d, "storage_s3_access_key", "")
+		cfg.S3SecretKey = settingString(d, "storage_s3_secret_key", "")
+	case "aliyun_oss":
+		cfg.OSSBucket = settingString(d, "storage_aliyun_bucket", "")
+		cfg.OSSEndpoint = settingString(d, "storage_aliyun_endpoint", "")
+		cfg.OSSAccessKeyID = settingString(d, "storage_aliyun_access_key_id", "")
+		cfg.OSSAccessKeySecret = settingString(d, "storage_aliyun_access_key_secret", "")
+	}
+	if !cfg.Effective() {
+		return nil
+	}
+	return cfg
+}
+
+func objectStorageKey(p string, c *storage.Client) (string, bool) {
+	if c == nil || !c.Enabled() {
+		return "", false
+	}
+	switch {
+	case strings.HasPrefix(p, "storage://"):
+		key := strings.TrimPrefix(p, "storage://")
+		return strings.TrimLeft(key, "/"), strings.TrimSpace(key) != ""
+	case strings.HasPrefix(p, "s3://") || strings.HasPrefix(p, "oss://") || strings.HasPrefix(p, "aliyun_oss://"):
+		u, err := url.Parse(p)
+		if err != nil {
+			return "", false
+		}
+		key := strings.TrimLeft(u.Path, "/")
+		return key, key != ""
+	default:
+		prefix := strings.Trim(c.Storage.Prefix, "/")
+		if prefix != "" && (p == prefix || strings.HasPrefix(p, prefix+"/")) {
+			return p, true
+		}
+		return "", false
+	}
+}
+
+func looksLocalStoragePath(p string) bool {
+	p = strings.TrimSpace(p)
+	if p == "" || strings.Contains(p, "://") {
+		return false
+	}
+	if strings.HasPrefix(p, "s3:") || strings.HasPrefix(p, "oss:") || strings.HasPrefix(p, "aliyun_oss:") || strings.HasPrefix(p, "storage:") {
+		return false
+	}
+	return filepath.IsAbs(p) || strings.HasPrefix(p, ".") || strings.Contains(p, string(filepath.Separator))
+}
+
+func logStorageCleanup(d Deps, format string, args ...any) {
+	if d.Logger != nil {
+		d.Logger.Printf(format, args...)
+	}
+}

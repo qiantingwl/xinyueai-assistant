@@ -1,0 +1,351 @@
+/**
+ * Core chat types — shared by mock runtime, store, and UI.
+ * Designed to be backend-agnostic; a future real adapter can populate
+ * these directly without UI changes.
+ */
+
+export type MessageRole = 'user' | 'assistant' | 'system'
+
+/** Stable backend/UI marker for a generation that failed after output became visible. */
+export const GENERATION_INTERRUPTED_ERROR_CODE = 'generation_interrupted'
+
+export const FEEDBACK_REASON_VALUES = [
+  'incorrect_fact',
+  'not_answered',
+  'instruction_ignored',
+  'outdated',
+  'citation_issue',
+  'tool_file_issue',
+  'incomplete',
+  'poor_format',
+  'unsafe',
+  'other',
+] as const
+
+export type FeedbackReason = (typeof FEEDBACK_REASON_VALUES)[number]
+
+export interface MessageFeedbackInput {
+  feedback: 'like' | 'dislike' | ''
+  reasons?: FeedbackReason[]
+  comment?: string
+}
+
+export interface ToolCall {
+  id: string
+  /** Symbolic tool name, e.g. "web_search", "code_interpreter" */
+  name: string
+  /** Free-form display label, e.g. "Searching the web" */
+  label: string
+  /** Optional administrator-configured display icon, separate from name. */
+  icon?: string
+  /** Tool-specific input arguments */
+  input?: Record<string, unknown>
+  /** Streaming or final output */
+  output?: string
+  status: 'running' | 'complete' | 'error'
+  startedAt: number
+  endedAt?: number
+  /** False after reload when the persisted message has no tool-level timestamps. */
+  timingKnown?: boolean
+}
+
+/**
+ * One ordered step in the assistant's reasoning trace (§7.1-4): either a run of
+ * extended-thinking text or a single tool round. Kept in the exact order they
+ * occurred so the UI can interleave "think → search → think → run" faithfully.
+ */
+export interface ReasoningThinking {
+  kind: 'thinking'
+  id: string
+  text: string
+}
+export interface ReasoningTool {
+  kind: 'tool'
+  id: string
+  tool: ToolCall
+}
+/**
+ * Narration the model writes BEFORE a tool call ("Let me search the news…").
+ * It belongs in the reasoning trace, not the final answer, so the answer stays
+ * the clean last-round text. Captured by flushing in-progress answer text into
+ * the trace when a tool starts (§4.3).
+ */
+export interface ReasoningNarration {
+  kind: 'narration'
+  id: string
+  text: string
+}
+export type ReasoningItem = ReasoningThinking | ReasoningTool | ReasoningNarration
+
+export interface Citation {
+  id: string
+  index: number
+  title: string
+  url: string
+  domain: string
+  snippet?: string
+  /** Origin of the citation: 'web' for an external page, 'kb' for an attached
+   *  knowledge base, and 'document' for a file uploaded directly to a chat. */
+  source?: 'web' | 'kb' | 'document'
+}
+
+/** Retrieval lifecycle values emitted by both the legacy document path and the
+ * knowledge-base multi-round path. The string escape hatch preserves forward
+ * compatibility with newer servers while keeping known states discoverable. */
+export type RagInjectionStrategy =
+  | 'retrieve'
+  | 'full_text'
+  | 'full_doc'
+  | 'none'
+  | 'warning'
+  | 'indexing'
+  | 'indexing_done'
+  | 'searching'
+  | 'expanding'
+  | 'found'
+  | 'partial'
+  | 'no_hit'
+  | 'error'
+  | (string & {})
+
+/** Live (and persisted) state of a Deep Research turn (§ deep-research mode). */
+export interface ResearchTask {
+  id: string
+  question: string
+  status: 'pending' | 'researching' | 'partial' | 'done'
+  round?: number
+}
+export interface ResearchSource {
+  id: string
+  url: string
+  title: string
+  domain: string
+  status: 'found' | 'read' | 'kept' | 'failed'
+  verdict?: string
+}
+export interface ResearchState {
+  title: string
+  tasks: ResearchTask[]
+  sources: ResearchSource[]
+  rounds?: number
+}
+
+/** Verify mode (§verify): one issue the auditor model flagged in the answer. */
+export interface VerifyFinding {
+  severity: 'error' | 'warning' | 'note'
+  /** Verbatim quote of the offending sentence from the primary answer. */
+  quote: string
+  /** What's wrong with it. */
+  issue: string
+}
+
+/** Verify mode (§verify): the secondary-auditor result for an assistant turn.
+ *  `status` is the LIVE lifecycle ('running' while auditing); `verdict` is the
+ *  settled outcome (also persisted). A reloaded message has `verdict` but no
+ *  `status`. */
+export interface VerifyResult {
+  status?: 'running' | 'clean' | 'issues'
+  verdict?: 'clean' | 'issues'
+  findings: VerifyFinding[]
+  auditorModelId?: string
+  auditorLabel?: string
+}
+
+export interface Attachment {
+  id: string
+  /** Display name */
+  name: string
+  /** Mime-type bucket: image, pdf, doc, sheet, code, other */
+  kind: 'image' | 'pdf' | 'doc' | 'sheet' | 'code' | 'other'
+  /** Approximate size in bytes; just for display */
+  size: number
+  /** Optional preview URL (data URL for mock) */
+  previewUrl?: string
+  /** Server-side RAG document id for doc-like uploads. */
+  documentId?: string
+  /** The referenced conversation file was deleted after this message was sent. */
+  deleted?: boolean
+}
+
+/** A file a tool produced (sandbox output, generated image), §4.5/§4.12. */
+export interface ArtifactRef {
+  id: string
+  filename: string
+  url: string
+  mimeType: string
+}
+
+export interface Message {
+  id: string
+  /** Client-only optimistic row whose id has not been assigned by the server.
+   *  Such ids must never be sent back as message references (for example,
+   *  conversations.active_leaf_id). Omitted for every API-backed message. */
+  localOnly?: boolean
+  /** Parent id in the conversation tree (§4.15). Empty for root. Needed by the
+   *  composer so "edit a past question" opens a sibling branch under the same
+   *  parent instead of appending to the active leaf. */
+  parentId?: string
+  role: MessageRole
+  /** Original text content. Assistant content is rendered as markdown; user content can opt into the same renderer. */
+  content: string
+  createdAt: number
+  /** True while the model is producing tokens. */
+  streaming?: boolean
+  /** The user deliberately stopped this generation. A stopped reply may have
+   *  partial content or be completely empty when stopped before the first token. */
+  stopped?: boolean
+  /** §4.20 image-mode: the drawing phase, driving the dedicated generating UI
+   *  (distinct from the chat thinking/tool-call trace). Set by the `image_status`
+   *  SSE event; cleared once the image artifact arrives. */
+  imageStatus?: 'optimizing' | 'generating'
+  /** Ordered, interleaved reasoning trace — thinking runs + tool rounds in the
+   *  exact order they happened (§7.1-4), so the UI can render them woven
+   *  together instead of "all thinking, then all tools". */
+  reasoning?: ReasoningItem[]
+  /** Total observable model reasoning time, restored from the persisted thinking block. */
+  thinkingMs?: number
+  /** Deep Research progress/state (plan, sources) for the research panel. */
+  research?: ResearchState
+  /** Turn mode — 'deep-research' renders the research panel + badge. */
+  mode?: 'default' | 'deep-research' | 'canvas'
+  /** Files produced by tools during this turn (downloadable). */
+  artifacts?: ArtifactRef[]
+  /** Set when the model declined to answer (content filter). */
+  refused?: boolean
+  /** Set when the turn failed (API/provider/stream error). Drives a red
+   *  "reply failed — retry" banner + a retry (regenerate) button. */
+  error?: string
+  /** Stable machine-readable error marker. Display copy is resolved through i18n. */
+  errorCode?: string
+  /** Set when the prompt was blocked by content moderation (§ moderation) —
+   *  rendered as a prominent red notice asking the user to re-edit. */
+  moderation?: boolean
+  /** Set when the turn was refused because the user's group ran out of quota for
+   *  this model (§ user groups) — rendered as a "quota reached → upgrade" card. */
+  quotaExceeded?: boolean
+  /** Model that generated this assistant message (§7.2-6 “由 … 生成”). §fast-mode:
+   *  blanked by the server for a fast turn — the client renders "快速" instead. */
+  modelId?: string
+  /** Snapshot of the model's display name at message creation time. Used as fallback when the model has been deleted. */
+  modelLabel?: string
+  /** §fast-mode: this turn ran in fast mode. The real model is hidden — render
+   *  the localized "快速" label + a generic bolt icon everywhere the model would show. */
+  fast?: boolean
+  /** When the user is editing a previously sent message. */
+  editing?: boolean
+  /** Reactions. */
+  liked?: boolean
+  disliked?: boolean
+  /** Optional structured context supplied after a dislike. */
+  feedbackReasons?: FeedbackReason[]
+  feedbackComment?: string
+  /** Citations attached to this assistant turn. */
+  citations?: Citation[]
+  /** Verify mode (§verify): the secondary-auditor result for this assistant
+   *  turn — drives the trust badge + expandable findings report. */
+  verify?: VerifyResult
+  /** RAG retrieval lifecycle event surfaced live during streaming so the UI
+   *  can render "📚 retrieved 4 sources from KB" or "Injected full document". */
+  ragInjection?: {
+    strategy: RagInjectionStrategy
+    summary: string
+    sourceCount?: number
+    at: number
+  }
+  /** Cost the user spent on this assistant turn (chat + tools + images). §8.3 */
+  cost?: number
+  /** Credits charged for this assistant turn (user-facing; undefined = none). */
+  credits?: number
+  /** Wall-clock generation time for this assistant turn, in ms. */
+  genMs?: number
+  /** Currency code for `cost`, e.g. "USD" or "CNY". */
+  currency?: string
+  /** Attachments on a user turn. */
+  attachments?: Attachment[]
+  /** Branch index when message has alternates. */
+  branchIndex?: number
+  /** Total branches for this position. */
+  branchCount?: number
+  /** §workspaces: author of a user turn in a shared conversation. */
+  authorId?: string
+  authorName?: string
+  authorAvatar?: string
+  /** Sibling message ids at this branch position (parents share). */
+  siblings?: string[]
+}
+
+export interface Conversation {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  modelId: string
+  /** §fast-mode: the 快速/进阶 picker selection. true = fast (model resolved
+   *  server-side + hidden); false/undefined = advanced with `modelId`. */
+  fast?: boolean
+  pinned?: boolean
+  starred?: boolean
+  archived?: boolean
+  /** Project this conversation belongs to. Free chats leave this undefined. */
+  projectId?: string
+  /** Last param_controls selection, remembered so regenerate reuses it (§2.3-G). */
+  lastParams?: Record<string, unknown>
+  /** Knowledge bases bound to this conversation (§7.2-7 composer 📚 selector). */
+  kbIds?: string[]
+  /** Set when this is a text-selection sub-conversation anchored to a quoted
+   *  excerpt of a message in another conversation. Such conversations are hidden
+   *  from the sidebar / search and rendered in the inline-thread drawer. */
+  inline?: { sourceConvId: string; messageId: string; quote: string }
+  /** Reverse-pagination state for the active path: true while older messages
+   *  remain on the server (loaded latest-first; older fetched on scroll-up). */
+  hasOlder?: boolean
+  /** §workspaces: set when the conversation lives in a workspace. */
+  workspaceId?: string
+  /** Workspace visibility. False/undefined is creator-private; personal
+   *  conversations remain owner-only regardless of this field. */
+  isPublic?: boolean
+  /** §workspaces: creator display identity for shared-history rows. */
+  creatorName?: string
+  creatorAvatar?: string
+  /** Creator user id (conversations.user_id) — drives "only the creator may
+   *  delete" affordances client-side (server enforces regardless). */
+  creatorId?: string
+  /** Cursor (oldest loaded message id) for the next older page. */
+  olderCursor?: string
+  messages: Message[]
+}
+
+/**
+ * Compact project context passed into the runtime so the assistant can
+ * "see" the project's instructions + file index without the UI having to
+ * resend the whole project payload every turn.
+ */
+export interface ProjectContext {
+  id: string
+  name: string
+  instructions: string
+  files: Array<{ id: string; name: string; kind: string; excerpt?: string }>
+}
+
+export interface SendMessageInput {
+  conversationId: string
+  text: string
+  modelId: string
+  attachments?: Attachment[]
+  /** Conversation history shape; passed by store. */
+  history: Message[]
+  /** Optional armed mode such as "deep-research" or "canvas". */
+  mode?: 'default' | 'deep-research' | 'canvas'
+  /** Resolved project context for project-scoped conversations. */
+  project?: ProjectContext
+  /** Abort signal for stopping a stream. */
+  signal?: AbortSignal
+}
+
+export type MessageChunk =
+  | { type: 'text'; delta: string }
+  | { type: 'tool_call'; toolCall: ToolCall }
+  | { type: 'tool_update'; id: string; output?: string; status?: ToolCall['status'] }
+  | { type: 'citation'; citation: Citation }
+  | { type: 'done' }
+  | { type: 'error'; message: string }

@@ -1,0 +1,215 @@
+/**
+ * SharedConversation — the public, unauthenticated read-only view of a shared
+ * conversation (§ sharing). Renders a frozen snapshot served by
+ * /api/public/shared/:token. No chat stores, no auth — safe to render to anyone
+ * with the link. The owner can revoke the share at any time, which 404s this.
+ */
+import { useEffect, useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import { sharedApi, ApiError } from '@/api'
+import type { ApiAttachment, ApiBlock, ApiSharedConversation } from '@/api/types'
+import { Markdown } from '@/components/chat/markdown'
+import { MathText } from '@/components/chat/math-text'
+import { hasMathContent } from '@/lib/math-content'
+import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
+import { SharedMessageIdentity } from './shared-message-identity'
+import { FileText, Ghost, Link2 } from 'lucide-react'
+
+function messageText(blocks: ApiBlock[]): string {
+  return blocks
+    .filter((b) => b.kind === 'text' && b.text)
+    .map((b) => b.text as string)
+    .join('\n\n')
+}
+
+// The snapshot's asset URLs point at the OWNER-authenticated routes
+// (/api/files/:id, /api/artifacts/:id) which 401 for anonymous viewers. Rewrite
+// them to the share-scoped public routes — the backend authorises by checking
+// the id against this share's frozen snapshot (§ sharing).
+function shareAssetUrl(token: string, url: string): string {
+  const tok = encodeURIComponent(token)
+  const file = url.match(/^\/api\/files\/([^/?#]+)$/)
+  if (file) return `/api/public/shared/${tok}/files/${file[1]}`
+  const art = url.match(/^\/api\/artifacts\/([^/?#]+)$/)
+  if (art) return `/api/public/shared/${tok}/artifacts/${art[1]}`
+  return url
+}
+
+function isImageAttachment(a: ApiAttachment): boolean {
+  return a.kind === 'image' || (a.mime_type ?? '').startsWith('image/')
+}
+
+// Generated files ride in `artifact` blocks; `summary` carries the mime type
+// (same field toLocalMessage reads). Fall back to the filename extension for
+// older blocks that predate the mime backfill.
+function isImageArtifact(b: ApiBlock): boolean {
+  if ((b.summary ?? '').startsWith('image/')) return true
+  return /\.(png|jpe?g|gif|webp|avif)$/i.test(b.title ?? b.url ?? '')
+}
+
+export default function SharedConversation() {
+  const { token = '' } = useParams<{ token: string }>()
+  const { t } = useTranslation(['subscription', 'chat', 'common'])
+  const [data, setData] = useState<ApiSharedConversation | null>(null)
+  const [status, setStatus] = useState<'loading' | 'ready' | 'missing'>('loading')
+
+  useEffect(() => {
+    let active = true
+    sharedApi
+      .get(token)
+      .then((d) => {
+        if (!active) return
+        setData(d)
+        setStatus('ready')
+      })
+      .catch((e) => {
+        if (!active) return
+        setStatus(e instanceof ApiError && e.status === 404 ? 'missing' : 'missing')
+      })
+    return () => {
+      active = false
+    }
+  }, [token])
+
+  return (
+    <div className="min-h-svh w-full bg-[var(--color-bg)] text-[var(--color-fg)] [--code-toolbar-sticky-top:0rem]">
+      <header className="w-full">
+        <div className="mx-auto flex min-h-14 w-full max-w-[var(--layout-message-max-w)] items-center justify-end gap-3 px-[var(--layout-gutter-mobile)] py-3 sm:px-6 lg:px-8">
+          <div className="flex min-w-0 items-center gap-2">
+            <Button asChild variant="secondary" size="sm">
+              <Link to="/">{t('chat:share.homeCta')}</Link>
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      <main className="w-full pb-20 sm:pb-24">
+        {status === 'loading' ? (
+          <div className="mx-auto w-full max-w-[var(--layout-message-max-w)] px-[var(--layout-gutter-mobile)] py-8 text-sm text-[var(--color-fg-subtle)] sm:px-6 lg:px-8">
+            {t('common:common.loading')}
+          </div>
+        ) : status === 'missing' || !data ? (
+          <div className="mx-auto w-full max-w-[var(--layout-message-max-w)] px-[var(--layout-gutter-mobile)] pt-16 sm:px-6 lg:px-8">
+            <EmptyState
+              icon={<Ghost size={22} aria-hidden />}
+              title={t('chat:share.missingTitle')}
+              description={t('chat:share.missingBody')}
+              action={
+                <Button asChild variant="secondary">
+                  <Link to="/">{t('chat:share.tryCta')}</Link>
+                </Button>
+              }
+            />
+          </div>
+        ) : (
+          <div className="mx-auto w-full max-w-[var(--layout-message-max-w)] px-[var(--layout-gutter-mobile)] sm:px-6 lg:px-8">
+            <section className="pb-7 pt-6 sm:pb-9 sm:pt-10" aria-labelledby="shared-conversation-title">
+              <div className="flex items-center gap-1.5 text-[12px] font-medium text-[var(--color-fg-muted)]">
+                <Link2 size={13} aria-hidden className="shrink-0 text-[var(--color-accent)]" />
+                {t('chat:share.eyebrow')}
+              </div>
+              <h1
+                id="shared-conversation-title"
+                className="mt-3 text-pretty text-[1.625rem] font-semibold leading-tight tracking-normal text-[var(--color-fg)] [overflow-wrap:anywhere] sm:text-[2rem]"
+              >
+                {data.title || t('chat:share.untitled')}
+              </h1>
+            </section>
+            <div className="chat-thread flex w-full flex-col">
+              {data.messages.map((m, i) => {
+                const text = messageText(m.blocks)
+                const atts = m.attachments ?? []
+                const artifacts = m.blocks.filter((b) => b.kind === 'artifact' && b.url)
+                // A message can be attachment-only (an uploaded image) or a pure
+                // generated-image reply — those must still render (§ sharing).
+                if (!text && atts.length === 0 && artifacts.length === 0) return null
+                const isUser = m.role === 'user'
+                return (
+                  <article key={i} className={isUser ? 'flex w-full justify-end' : 'flex w-full justify-start'}>
+                    <div className={isUser ? 'flex min-w-0 max-w-[88%] flex-col items-end sm:max-w-[68%]' : 'flex w-full min-w-0 flex-col items-start'}>
+                      <SharedMessageIdentity
+                        message={m}
+                        userFallback={t('chat:share.roleUser')}
+                        assistantFallback={t('chat:share.roleAssistant')}
+                        fastLabel={t('chat:fastMode.label')}
+                      />
+                      {atts.length > 0 ? (
+                        <div className={isUser ? 'mb-2 flex flex-wrap justify-end gap-2' : 'mb-2 flex flex-wrap gap-2'}>
+                          {atts.map((a) =>
+                            isImageAttachment(a) ? (
+                              <img
+                                key={a.id}
+                                src={shareAssetUrl(token, a.url)}
+                                alt={a.filename}
+                                loading="lazy"
+                                className="max-h-64 max-w-full rounded-[12px] border border-[var(--color-border)] object-contain"
+                              />
+                            ) : (
+                              <a
+                                key={a.id}
+                                href={shareAssetUrl(token, a.url)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex max-w-full items-center gap-1.5 rounded-[10px] border border-[var(--color-border)] bg-[var(--color-surface)] px-2.5 py-1.5 text-[12.5px] text-[var(--color-fg-muted)] hover:text-[var(--color-fg)] interactive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] [overflow-wrap:anywhere]"
+                              >
+                                <FileText size={13} aria-hidden className="shrink-0 text-[var(--color-fg-subtle)]" />
+                                {a.filename}
+                              </a>
+                            ),
+                          )}
+                        </div>
+                      ) : null}
+                      {isUser ? (
+                        text ? (
+                          <div className="max-w-full rounded-[18px] bg-[var(--color-user-bubble)] px-4 py-2.5 text-[length:var(--text-chat-body)] leading-relaxed text-[var(--color-fg)]">
+                            {hasMathContent(text) ? <MathText content={text} /> : <span className="whitespace-pre-wrap break-words">{text}</span>}
+                          </div>
+                        ) : null
+                      ) : (
+                        <>
+                          {text ? (
+                            <div className="w-full text-[length:var(--text-chat-body)] leading-relaxed text-[var(--color-fg)]">
+                              <Markdown content={text} blockKeyPrefix={`share-${i}`} className="prose-full" />
+                            </div>
+                          ) : null}
+                          {artifacts.length > 0 ? (
+                            <div className="flex w-full flex-wrap gap-2">
+                              {artifacts.map((b, j) =>
+                                isImageArtifact(b) ? (
+                                  <img
+                                    key={`${i}-art-${j}`}
+                                    src={shareAssetUrl(token, b.url ?? '')}
+                                    alt={b.title || 'image'}
+                                    loading="lazy"
+                                    className="max-h-96 max-w-full rounded-[12px] border border-[var(--color-border)] object-contain"
+                                  />
+                                ) : (
+                                  <a
+                                    key={`${i}-art-${j}`}
+                                    href={shareAssetUrl(token, b.url ?? '')}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex max-w-full items-center gap-1.5 rounded-[10px] border border-[var(--color-border)] bg-[var(--color-surface)] px-2.5 py-1.5 text-[12.5px] text-[var(--color-fg-muted)] hover:text-[var(--color-fg)] interactive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] [overflow-wrap:anywhere]"
+                                  >
+                                    <FileText size={13} aria-hidden className="shrink-0 text-[var(--color-fg-subtle)]" />
+                                    {b.title || b.url}
+                                  </a>
+                                ),
+                              )}
+                            </div>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}

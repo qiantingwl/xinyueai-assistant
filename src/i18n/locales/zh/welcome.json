@@ -1,0 +1,67 @@
+{
+  "setPassword": {
+    "title": "设置密码",
+    "subtitle": "你是通过第三方账号登录的，目前还没有密码。请现在设置一个密码以保护账户——之后修改设置或直接登录都会用到。",
+    "newLabel": "新密码",
+    "confirmLabel": "确认密码",
+    "hint": "至少 8 个字符。",
+    "mismatch": "两次输入的密码不一致。",
+    "tooShort": "密码至少需要 8 个字符。",
+    "submit": "设置密码并继续",
+    "saved": "密码已设置。",
+    "failed": "设置密码失败，请重试。"
+  },
+  "ready": {
+    "title": "一切就绪",
+    "body": "{{siteName}} 已准备就绪。现在可以开始第一次对话了。",
+    "cta": "开始探索"
+  },
+  "intro": {
+    "eyebrow": "欢迎来到 {{siteName}}",
+    "title": "更安静的思考空间。",
+    "subtitle": "花几秒完成 {{siteName}} 的基本设置，之后也可以随时修改。",
+    "points": {
+      "write": "与你一同思考的写作",
+      "research": "基于真实来源的检索",
+      "own": "对话归你所有，掌控权始终在你手中"
+    }
+  },
+  "config": {
+    "title": "个性化设置",
+    "subtitle": "设置几项偏好，或直接跳过开始使用。"
+  },
+  "fields": {
+    "language": "语言",
+    "theme": "外观",
+    "accent": "强调色",
+    "layout": "聊天宽度",
+    "chatStyle": "回复风格",
+    "chatStyleBody": "默认回答的详细程度。",
+    "memory": "记忆",
+    "memoryBody": "让 {{siteName}} 跨对话记住有用的信息。"
+  },
+  "theme": {
+    "light": "浅色",
+    "dark": "深色",
+    "system": "跟随系统"
+  },
+  "chatStyle": {
+    "concise": "简洁",
+    "balanced": "均衡",
+    "detailed": "详细"
+  },
+  "actions": {
+    "skip": "暂时跳过",
+    "start": "开始使用",
+    "back": "上一步",
+    "next": "下一步"
+  },
+  "stepHints": {
+    "language": "选择界面语言。",
+    "theme": "浅色、深色，或跟随系统。",
+    "accent": "选择应用的强调色。",
+    "layout": "聊天内容居中，或占满整个宽度。",
+    "style": "默认回复的详细程度。",
+    "memory": "让 {{siteName}} 跨对话记住有用的信息。"
+  }
+}

@@ -1,0 +1,686 @@
+// Package store — redeem codes & redemptions (§ redeem codes).
+//
+// Admins create RedeemCodes (a generated string + a target user_group + a
+// duration). Users redeem them through the subscription page, which records a
+// RedeemRedemption row and bumps their users.group_id / group_expires_at.
+//
+// Codes are single-use by default (max_uses=1); used_count is updated in the
+// same transaction as the redemption insert so concurrent redemptions of the
+// same code can't all win.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+)
+
+// redeemCodeUniquenessRetries bounds the per-code collision-retry loop in
+// BulkGenerateRedeemCodes; overridable via env, defaults to the original 5.
+var redeemCodeUniquenessRetries = 5
+
+// Redeem-code kinds. 'group' codes grant a user_group for a duration; 'credits'
+// codes add a fixed amount of permanent (non-expiring) credits. A credits code
+// keeps the default group in group_id purely to satisfy the FK — it is never
+// applied to the redeemer.
+const (
+	RedeemKindGroup   = "group"
+	RedeemKindCredits = "credits"
+)
+
+// RedeemCode is a single row in redeem_codes.
+type RedeemCode struct {
+	ID           string  `json:"id"`
+	Code         string  `json:"code"`
+	Kind         string  `json:"kind"`
+	GroupID      string  `json:"group_id"`
+	DurationDays int     `json:"duration_days"`
+	Credits      float64 `json:"credits"`
+	MaxUses      int     `json:"max_uses"`
+	UsedCount    int     `json:"used_count"`
+	ExpiresAt    int64   `json:"expires_at"`
+	Enabled      bool    `json:"enabled"`
+	Note         string  `json:"note"`
+	BatchName    string  `json:"batch_name"`
+	CreatedBy    string  `json:"created_by"`
+	CreatedAt    int64   `json:"created_at"`
+}
+
+// RedeemRedemption is one row in redeem_redemptions.
+type RedeemRedemption struct {
+	ID              string  `json:"id"`
+	CodeID          string  `json:"code_id"`
+	UserID          string  `json:"user_id"`
+	GroupID         string  `json:"group_id"`
+	PreviousGroupID string  `json:"previous_group_id"`
+	Credits         float64 `json:"credits"`
+	GrantedAt       int64   `json:"granted_at"`
+	ExpiresAt       int64   `json:"expires_at"`
+}
+
+// ErrRedeemCodeExists is returned by CreateRedeemCode when the generated code
+// collides with an existing row (extremely unlikely with 60 bits of entropy,
+// but a defined error helps the bulk-generate loop retry deterministically).
+var ErrRedeemCodeExists = errors.New("redeem code already exists")
+
+const redeemCodeCols = `id, code, kind, group_id, duration_days, credits, max_uses, used_count, expires_at, enabled, note, batch_name, created_by, created_at`
+
+func scanRedeemCode(s scanner) (RedeemCode, error) {
+	var rc RedeemCode
+	var enabled int
+	if err := s.Scan(&rc.ID, &rc.Code, &rc.Kind, &rc.GroupID, &rc.DurationDays, &rc.Credits, &rc.MaxUses, &rc.UsedCount, &rc.ExpiresAt, &enabled, &rc.Note, &rc.BatchName, &rc.CreatedBy, &rc.CreatedAt); err != nil {
+		return rc, err
+	}
+	rc.Enabled = enabled != 0
+	return rc, nil
+}
+
+// CreateRedeemCode inserts one code. When rc.Code is empty a new code is
+// generated. When rc.ID is empty an ID is minted. Newly created codes default
+// to enabled=true unless rc.Enabled is explicitly set false on a row that
+// already has a CreatedAt (caller is replaying with an existing timestamp).
+func CreateRedeemCode(ctx context.Context, db *sql.DB, rc RedeemCode) (*RedeemCode, error) {
+	if rc.Kind == "" {
+		rc.Kind = RedeemKindGroup
+	}
+	switch rc.Kind {
+	case RedeemKindCredits:
+		creditMicros, err := CreditsToMicros(rc.Credits)
+		if err != nil || creditMicros <= 0 {
+			return nil, errors.New("credits must be greater than 0")
+		}
+		// FK-satisfying placeholder — never applied to the redeemer.
+		rc.GroupID = DefaultGroupID
+		rc.DurationDays = 0
+	case RedeemKindGroup:
+		rc.Credits = 0
+		if _, err := redeemDurationSeconds(rc.DurationDays); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(rc.GroupID) == "" {
+			return nil, errors.New("group_id required")
+		}
+		if _, err := GetUserGroup(ctx, db, rc.GroupID); err != nil {
+			return nil, fmt.Errorf("group not found: %w", err)
+		}
+	default:
+		return nil, errors.New("kind must be 'group' or 'credits'")
+	}
+	if rc.ExpiresAt < 0 || rc.UsedCount < 0 {
+		return nil, ErrRedeemCodeInvalid
+	}
+	if rc.ID == "" {
+		rc.ID = genID("rc")
+	}
+	if rc.Code == "" {
+		rc.Code = GenRedeemCode()
+	} else {
+		rc.Code = NormalizeRedeemCode(rc.Code)
+	}
+	if rc.MaxUses <= 0 {
+		rc.MaxUses = 1
+	}
+	if rc.UsedCount > rc.MaxUses {
+		return nil, ErrRedeemCodeInvalid
+	}
+	en := 1
+	if !rc.Enabled && rc.CreatedAt > 0 {
+		// Only honour an explicit false when caller is rehydrating an existing
+		// row (carries the original CreatedAt); fresh inserts default to true.
+		en = 0
+	}
+	if rc.CreatedAt == 0 {
+		rc.CreatedAt = time.Now().Unix()
+	}
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO redeem_codes(`+redeemCodeCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		rc.ID, rc.Code, rc.Kind, rc.GroupID, rc.DurationDays, rc.Credits, rc.MaxUses, rc.UsedCount, rc.ExpiresAt, en, rc.Note, rc.BatchName, rc.CreatedBy, rc.CreatedAt)
+	if err != nil {
+		low := strings.ToLower(err.Error())
+		if strings.Contains(low, "unique") || strings.Contains(low, "duplicate") {
+			return nil, ErrRedeemCodeExists
+		}
+		return nil, err
+	}
+	return GetRedeemCode(ctx, db, rc.ID)
+}
+
+// BulkGenerateRedeemCodes creates `count` codes sharing the same group +
+// duration + expiry + batch_name. Codes are generated with high-entropy
+// crypto/rand; collisions are retried up to 5 times each.
+func BulkGenerateRedeemCodes(ctx context.Context, db *sql.DB, template RedeemCode, count int) ([]RedeemCode, error) {
+	if count <= 0 {
+		count = 1
+	}
+	if count > 1000 {
+		count = 1000
+	}
+	out := make([]RedeemCode, 0, count)
+	for i := 0; i < count; i++ {
+		var created *RedeemCode
+		for attempt := 0; attempt < redeemCodeUniquenessRetries; attempt++ {
+			tpl := template
+			tpl.ID = ""
+			tpl.Code = ""
+			tpl.UsedCount = 0
+			tpl.Enabled = true
+			tpl.CreatedAt = 0
+			row, err := CreateRedeemCode(ctx, db, tpl)
+			if err == nil {
+				created = row
+				break
+			}
+			if errors.Is(err, ErrRedeemCodeExists) {
+				continue
+			}
+			return out, err
+		}
+		if created == nil {
+			return out, errors.New("could not generate a unique code after 5 attempts")
+		}
+		out = append(out, *created)
+	}
+	return out, nil
+}
+
+// GetRedeemCode returns one row by id.
+func GetRedeemCode(ctx context.Context, db *sql.DB, id string) (*RedeemCode, error) {
+	rc, err := scanRedeemCode(db.QueryRowContext(ctx, `SELECT `+redeemCodeCols+` FROM redeem_codes WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rc, nil
+}
+
+// FindRedeemCodeByCode looks up a row by its public code string. Used by the
+// user-facing redeem endpoint.
+func FindRedeemCodeByCode(ctx context.Context, db *sql.DB, code string) (*RedeemCode, error) {
+	norm := NormalizeRedeemCode(code)
+	rc, err := scanRedeemCode(db.QueryRowContext(ctx, `SELECT `+redeemCodeCols+` FROM redeem_codes WHERE code=?`, norm))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rc, nil
+}
+
+// RedeemCodeFilter narrows ListRedeemCodes.
+type RedeemCodeFilter struct {
+	BatchName string // exact match if set
+	Status    string // "" | "unused" | "partial" | "used" | "invalid"
+	Limit     int
+	Offset    int
+}
+
+// ListRedeemCodes returns rows newest-first, with optional filters.
+func ListRedeemCodes(ctx context.Context, db *sql.DB, f RedeemCodeFilter) ([]RedeemCode, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	q := `SELECT ` + redeemCodeCols + ` FROM redeem_codes WHERE 1=1`
+	args := []any{}
+	if f.BatchName != "" {
+		q += ` AND batch_name=?`
+		args = append(args, f.BatchName)
+	}
+	switch f.Status {
+	case "unused":
+		q += ` AND used_count=0 AND enabled=1 AND (expires_at=0 OR expires_at>=?)`
+		args = append(args, time.Now().Unix())
+	case "partial":
+		q += ` AND used_count>0 AND used_count<max_uses AND enabled=1 AND (expires_at=0 OR expires_at>=?)`
+		args = append(args, time.Now().Unix())
+	case "used", "redeemed": // "redeemed" is retained for older API clients.
+		q += ` AND used_count>=max_uses AND enabled=1 AND (expires_at=0 OR expires_at>=?)`
+		args = append(args, time.Now().Unix())
+	case "invalid":
+		q += ` AND (enabled=0 OR (expires_at>0 AND expires_at<?))`
+		args = append(args, time.Now().Unix())
+	case "disabled":
+		q += ` AND enabled=0`
+	case "expired":
+		q += ` AND expires_at>0 AND expires_at<?`
+		args = append(args, time.Now().Unix())
+	}
+	q += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RedeemCode{}
+	for rows.Next() {
+		rc, err := scanRedeemCode(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rc)
+	}
+	return out, rows.Err()
+}
+
+// RedeemCodePatch carries selective edits — admin can flip enabled, change the
+// note/batch, or extend the code-expiry deadline.
+type RedeemCodePatch struct {
+	Enabled   *bool   `json:"enabled"`
+	Note      *string `json:"note"`
+	BatchName *string `json:"batch_name"`
+	ExpiresAt *int64  `json:"expires_at"`
+	MaxUses   *int    `json:"max_uses"`
+}
+
+// UpdateRedeemCode applies a patch.
+func UpdateRedeemCode(ctx context.Context, db *sql.DB, id string, p RedeemCodePatch) (*RedeemCode, error) {
+	parts := []string{}
+	args := []any{}
+	if p.Enabled != nil {
+		parts = append(parts, "enabled=?")
+		v := 0
+		if *p.Enabled {
+			v = 1
+		}
+		args = append(args, v)
+	}
+	if p.Note != nil {
+		parts = append(parts, "note=?")
+		args = append(args, *p.Note)
+	}
+	if p.BatchName != nil {
+		parts = append(parts, "batch_name=?")
+		args = append(args, *p.BatchName)
+	}
+	if p.ExpiresAt != nil {
+		parts = append(parts, "expires_at=?")
+		args = append(args, *p.ExpiresAt)
+	}
+	if p.MaxUses != nil {
+		parts = append(parts, "max_uses=?")
+		args = append(args, *p.MaxUses)
+	}
+	if len(parts) == 0 {
+		return GetRedeemCode(ctx, db, id)
+	}
+	args = append(args, id)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("UPDATE redeem_codes SET %s WHERE id=?", strings.Join(parts, ", ")), args...); err != nil {
+		return nil, err
+	}
+	return GetRedeemCode(ctx, db, id)
+}
+
+// DeleteRedeemCode removes the row. Redemptions cascade-delete via FK, so
+// already-redeemed codes also lose their audit row; if you want to preserve
+// the audit trail prefer setting enabled=false.
+func DeleteRedeemCode(ctx context.Context, db *sql.DB, id string) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM redeem_codes WHERE id=?`, id)
+	return err
+}
+
+// DeleteRedeemBatch removes every code in a named batch. Useful for revoking a
+// whole campaign at once. Returns the number of codes removed.
+func DeleteRedeemBatch(ctx context.Context, db *sql.DB, batchName string) (int64, error) {
+	if batchName == "" {
+		return 0, errors.New("batch_name required")
+	}
+	res, err := db.ExecContext(ctx, `DELETE FROM redeem_codes WHERE batch_name=?`, batchName)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// Sentinel errors for the redeem flow — handlers map these to user-readable
+// strings + i18n keys via the API layer.
+var (
+	ErrRedeemCodeInvalid  = errors.New("redeem code invalid")
+	ErrRedeemCodeUsed     = errors.New("redeem code already used")
+	ErrRedeemCodeExpired  = errors.New("redeem code expired")
+	ErrRedeemCodeDisabled = errors.New("redeem code disabled")
+	ErrRedeemAlreadyOwned = errors.New("you already redeemed this code")
+	// ErrRedeemNeedsConfirm is returned (with the preview redemption + current
+	// user state, and the transaction rolled back) when the code grants a group
+	// DIFFERENT from the user's current one and the caller didn't pass confirm.
+	// Switching groups overrides the current membership immediately (resets the
+	// window from now — it is NOT a renewal), so the UI must confirm first.
+	ErrRedeemNeedsConfirm = errors.New("redeem needs confirmation")
+)
+
+// RedeemCodeForUser atomically validates the code and applies its grant to the
+// user. Group codes set the user's group_id to the code's group_id with
+// group_expires_at = now()+duration_days (0 for permanent codes); credits codes
+// add the configured amount to the user's permanent credit balance. On success
+// returns the redemption row and the updated user.
+//
+// If the user is already on a non-default tier, that tier becomes
+// previous_group_id so it can be restored after expiry.
+func RedeemCodeForUser(ctx context.Context, db *sql.DB, userID, raw string, confirm bool) (*RedeemRedemption, *User, error) {
+	code := NormalizeRedeemCode(raw)
+	if code == "" {
+		return nil, nil, ErrRedeemCodeInvalid
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
+	var rc RedeemCode
+	var enabled int
+	err = tx.QueryRowContext(ctx,
+		`SELECT `+redeemCodeCols+` FROM redeem_codes WHERE code=?`, code).
+		Scan(&rc.ID, &rc.Code, &rc.Kind, &rc.GroupID, &rc.DurationDays, &rc.Credits, &rc.MaxUses, &rc.UsedCount, &rc.ExpiresAt, &enabled, &rc.Note, &rc.BatchName, &rc.CreatedBy, &rc.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, ErrRedeemCodeInvalid
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	rc.Enabled = enabled != 0
+	if rc.Kind != RedeemKindCredits && rc.Kind != RedeemKindGroup || rc.ExpiresAt < 0 || rc.UsedCount < 0 || rc.MaxUses <= 0 {
+		return nil, nil, ErrRedeemCodeInvalid
+	}
+	if !rc.Enabled {
+		return nil, nil, ErrRedeemCodeDisabled
+	}
+	if rc.ExpiresAt > 0 && time.Now().Unix() > rc.ExpiresAt {
+		return nil, nil, ErrRedeemCodeExpired
+	}
+	if rc.UsedCount >= rc.MaxUses {
+		return nil, nil, ErrRedeemCodeUsed
+	}
+
+	// Verify the group still exists (admin could have deleted it after issue).
+	// Credits codes only carry a placeholder group, so skip the check for them.
+	if rc.Kind != RedeemKindCredits {
+		var groupExists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM user_groups WHERE id=?`, rc.GroupID).Scan(&groupExists); err != nil {
+			return nil, nil, err
+		}
+		if groupExists == 0 {
+			return nil, nil, ErrRedeemCodeInvalid
+		}
+	}
+
+	// Look up the user's current state.
+	var u User
+	var settings string
+	var totpEnabled int
+	var passwordSet int
+	userQuery := `SELECT id, email, name, role, status, token_ver, settings, group_id, group_expires_at, previous_group_id, totp_secret, totp_enabled, password_set,
+		CASE WHEN COALESCE(credits_permanent_micros,0)=0 AND COALESCE(credits_permanent,0)<>0
+		     THEN CAST(ROUND(credits_permanent*1000000) AS BIGINT) ELSE COALESCE(credits_permanent_micros,0) END,
+		sort_order, created_at FROM users WHERE id=?`
+	if usePostgres {
+		userQuery += ` FOR UPDATE`
+	}
+	var permanentMicros int64
+	err = tx.QueryRowContext(ctx, userQuery, userID).Scan(
+		&u.ID, &u.Email, &u.Name, &u.Role, &u.Status, &u.TokenVer, &settings, &u.GroupID,
+		&u.GroupExpiresAt, &u.PreviousGroupID, &u.TotpSecret, &totpEnabled, &passwordSet,
+		&permanentMicros, &u.SortOrder, &u.CreatedAt,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	u.TotpEnabled = totpEnabled != 0
+	// Without this the returned user serialises has_password=false, which would
+	// wrongly pop the set-password gate after redeeming a code (§ chat uploads /
+	// third-party login). Carry the real flag.
+	u.HasPassword = passwordSet != 0
+	u.Settings = json.RawMessage(settings)
+	u.CreditsPermanent = creditsFromMicros(permanentMicros)
+
+	// Prevent the same user from redeeming the same code twice (matches the
+	// UNIQUE(code_id, user_id) index — checked here for a clean error).
+	var prior int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM redeem_redemptions WHERE code_id=? AND user_id=?`, rc.ID, userID).Scan(&prior); err != nil {
+		return nil, nil, err
+	}
+	if prior > 0 {
+		return nil, nil, ErrRedeemAlreadyOwned
+	}
+
+	now := time.Now().Unix()
+
+	// Credits codes are purely additive: no group switch, no confirmation
+	// round-trip. Record the redemption, bump used_count, and add the amount to
+	// the user's permanent balance — all inside the same transaction.
+	if rc.Kind == RedeemKindCredits {
+		creditMicros, err := CreditsToMicros(rc.Credits)
+		if err != nil || creditMicros <= 0 {
+			return nil, nil, ErrRedeemCodeInvalid
+		}
+		red := RedeemRedemption{
+			ID:              genID("rd"),
+			CodeID:          rc.ID,
+			UserID:          userID,
+			GroupID:         u.GroupID,
+			PreviousGroupID: u.PreviousGroupID,
+			Credits:         rc.Credits,
+			GrantedAt:       now,
+			ExpiresAt:       0,
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO redeem_redemptions(id, code_id, user_id, group_id, previous_group_id, credits, granted_at, expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+			red.ID, red.CodeID, red.UserID, red.GroupID, red.PreviousGroupID, red.Credits, red.GrantedAt, red.ExpiresAt); err != nil {
+			return nil, nil, err
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE redeem_codes SET used_count=used_count+1 WHERE id=? AND used_count<max_uses`,
+			rc.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, nil, ErrRedeemCodeUsed
+		}
+		if err := addPermanentCreditsMicrosTx(ctx, tx, userID, creditMicros); err != nil {
+			return nil, nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, nil, err
+		}
+		u.CreditsPermanent += rc.Credits
+		return &red, &u, nil
+	}
+
+	durationSeconds, err := redeemDurationSeconds(rc.DurationDays)
+	if err != nil {
+		return nil, nil, ErrRedeemCodeInvalid
+	}
+	var newExpiresAt int64
+	if rc.DurationDays > 0 {
+		// If the user is already on the same group with time left, stack the
+		// duration on top of their existing expiry. Otherwise start the window
+		// from now.
+		base := now
+		if u.GroupID == rc.GroupID && u.GroupExpiresAt > now {
+			base = u.GroupExpiresAt
+		}
+		newExpiresAt, err = checkedRedeemExpiry(base, durationSeconds)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	// previous_group_id: keep what's already there if the user is moving to a
+	// new tier from a non-default one; reset to "" when granting permanent
+	// access; record the current tier when upgrading from default.
+	prevGroup := u.PreviousGroupID
+	if u.GroupID != rc.GroupID {
+		// Upgrading to a different tier — remember what to fall back to.
+		if u.GroupID != DefaultGroupID {
+			prevGroup = u.GroupID
+		} else {
+			prevGroup = ""
+		}
+	}
+	// If we're granting permanent access, the previous-group fallback is moot.
+	if rc.DurationDays == 0 {
+		prevGroup = ""
+	}
+
+	red := RedeemRedemption{
+		ID:              genID("rd"),
+		CodeID:          rc.ID,
+		UserID:          userID,
+		GroupID:         rc.GroupID,
+		PreviousGroupID: prevGroup,
+		GrantedAt:       now,
+		ExpiresAt:       newExpiresAt,
+	}
+
+	// Switching to a DIFFERENT group overrides the current membership and starts
+	// the window from now (not a renewal). Require explicit confirmation so the
+	// user doesn't unknowingly forfeit time left on their current group. The tx
+	// rolls back here, so nothing is consumed; we return the preview + current
+	// state for the confirm dialog. Same-group redemptions renew/stack silently.
+	if rc.GroupID != u.GroupID && !confirm {
+		return &red, &u, ErrRedeemNeedsConfirm
+	}
+
+	// Bump the code's used_count, guarding the cap atomically inside the TX.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE redeem_codes SET used_count=used_count+1 WHERE id=? AND used_count<max_uses`,
+		rc.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Someone else won the race for the last slot.
+		return nil, nil, ErrRedeemCodeUsed
+	}
+
+	// Flip the user's group + expiry. Same-group finite grants extend the value
+	// currently stored in the row, not the earlier Go snapshot. This matters on
+	// SQLite, where FOR UPDATE is unavailable: two concurrent redemptions can no
+	// longer overwrite one another with the same precomputed expiry.
+	startingExpiry, err := checkedRedeemExpiry(now, durationSeconds)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users
+		    SET credit_cycle_anchor=CASE
+		            WHEN group_id<>? OR (group_expires_at>0 AND group_expires_at<=?) THEN
+		                CASE WHEN credit_cycle_anchor>=? THEN credit_cycle_anchor+1 ELSE ? END
+		            ELSE credit_cycle_anchor
+		        END,
+		        quota_cycle_anchor=CASE
+		            WHEN group_id<>? OR (group_expires_at>0 AND group_expires_at<=?) THEN
+		                CASE WHEN quota_cycle_anchor>=? THEN quota_cycle_anchor+1 ELSE ? END
+		            ELSE quota_cycle_anchor
+		        END,
+		        previous_group_id=CASE
+		            WHEN ?=0 THEN ''
+		            WHEN group_id<>? THEN ?
+		            ELSE previous_group_id
+		        END,
+		        group_expires_at=CASE
+		            WHEN ?=0 THEN 0
+		            WHEN group_id=? AND group_expires_at>? THEN group_expires_at+?
+		            ELSE ?
+		        END,
+		        group_id=?
+		  WHERE id=?`,
+		rc.GroupID, now, now, now, rc.GroupID, now, now, now,
+		durationSeconds, rc.GroupID, prevGroup,
+		durationSeconds, rc.GroupID, now, durationSeconds, startingExpiry,
+		rc.GroupID, userID); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT group_expires_at, previous_group_id FROM users WHERE id=?`, userID).
+		Scan(&red.ExpiresAt, &red.PreviousGroupID); err != nil {
+		return nil, nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO redeem_redemptions(id, code_id, user_id, group_id, previous_group_id, credits, granted_at, expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+		red.ID, red.CodeID, red.UserID, red.GroupID, red.PreviousGroupID, red.Credits, red.GrantedAt, red.ExpiresAt); err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+
+	u.GroupID = rc.GroupID
+	u.GroupExpiresAt = red.ExpiresAt
+	u.PreviousGroupID = red.PreviousGroupID
+	return &red, &u, nil
+}
+
+func redeemDurationSeconds(days int) (int64, error) {
+	if days < 0 || int64(days) > math.MaxInt64/86400 {
+		return 0, ErrRedeemCodeInvalid
+	}
+	return int64(days) * 86400, nil
+}
+
+func checkedRedeemExpiry(base, durationSeconds int64) (int64, error) {
+	if durationSeconds < 0 || base > math.MaxInt64-durationSeconds {
+		return 0, ErrRedeemCodeInvalid
+	}
+	return base + durationSeconds, nil
+}
+
+// ListRedemptionsForUser returns the audit trail for a single user (most
+// recent first). Used by the admin user-detail view and potentially the user's
+// own subscription history (future work).
+func ListRedemptionsForUser(ctx context.Context, db *sql.DB, userID string) ([]RedeemRedemption, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, code_id, user_id, group_id, previous_group_id, credits, granted_at, expires_at FROM redeem_redemptions WHERE user_id=? ORDER BY granted_at DESC`,
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RedeemRedemption{}
+	for rows.Next() {
+		var r RedeemRedemption
+		if err := rows.Scan(&r.ID, &r.CodeID, &r.UserID, &r.GroupID, &r.PreviousGroupID, &r.Credits, &r.GrantedAt, &r.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListRedemptionsForCode returns every redemption of one code (admin audit).
+func ListRedemptionsForCode(ctx context.Context, db *sql.DB, codeID string) ([]RedeemRedemption, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, code_id, user_id, group_id, previous_group_id, credits, granted_at, expires_at FROM redeem_redemptions WHERE code_id=? ORDER BY granted_at DESC`,
+		codeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RedeemRedemption{}
+	for rows.Next() {
+		var r RedeemRedemption
+		if err := rows.Scan(&r.ID, &r.CodeID, &r.UserID, &r.GroupID, &r.PreviousGroupID, &r.Credits, &r.GrantedAt, &r.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

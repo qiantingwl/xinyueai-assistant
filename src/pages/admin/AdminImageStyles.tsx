@@ -1,0 +1,358 @@
+/**
+ * AdminImageStyles — manage §4.20 image styles. Each style has a name, an example
+ * thumbnail, and a HIDDEN prompt that's composed into the final image prompt
+ * server-side (users never see it). The composer's style picker shows the
+ * enabled styles' name + thumbnail only.
+ */
+import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { Plus, Trash2, Palette } from 'lucide-react'
+import { adminApi, ApiError } from '@/api'
+import type { ApiImageStyle, ApiModel } from '@/api/types'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import { Switch } from '@/components/ui/switch'
+import { Field, Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { IconUploader } from '@/components/admin/icon-uploader'
+import { toast } from '@/hooks/use-toast'
+import { PanelFallback } from '@/components/ui/panel-fallback'
+import { AdminSortableList } from '@/components/admin/AdminSortableList'
+
+export default function AdminImageStyles() {
+  const { t } = useTranslation(['admin', 'common'])
+  const [styles, setStyles] = useState<ApiImageStyle[]>([])
+  const [models, setModels] = useState<ApiModel[]>([])
+  const [imagePromptModelId, setImagePromptModelId] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [savingPromptModel, setSavingPromptModel] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const creatingRef = useRef(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  async function load() {
+    setLoading(true)
+    try {
+      const [nextStyles, settings, chatModels] = await Promise.all([
+        adminApi.imageStyles(),
+        adminApi.settings(),
+        adminApi.models('chat'),
+      ])
+      setStyles(nextStyles)
+      setModels(chatModels)
+      setImagePromptModelId(typeof settings.image_prompt_model_id === 'string' ? settings.image_prompt_model_id : '')
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : t('admin:common.failed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+  useEffect(() => {
+    void load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  async function savePromptModel() {
+    setSavingPromptModel(true)
+    try {
+      await adminApi.updateSettings({ image_prompt_model_id: imagePromptModelId })
+      toast.success(t('admin:settings.saved'))
+    } catch (error) {
+      toast.error(error instanceof ApiError ? error.message : t('admin:common.failed'))
+    } finally {
+      setSavingPromptModel(false)
+    }
+  }
+
+  async function create() {
+    if (creatingRef.current) return
+    const name = newName.trim()
+    if (!name) return
+    creatingRef.current = true
+    setCreating(true)
+    try {
+      const st = await adminApi.createImageStyle({ name, enabled: true, sort_order: styles.length })
+      setStyles((s) => [...s, st])
+      setNewName('')
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast.error(t('admin:common.nameExists', { defaultValue: 'A record with this name already exists.' }))
+      } else {
+        toast.error(e instanceof ApiError ? e.message : t('admin:common.failed'))
+      }
+    } finally {
+      creatingRef.current = false
+      setCreating(false)
+    }
+  }
+
+  async function remove(id: string) {
+    if (busyId) return
+    setBusyId(id)
+    try {
+      await adminApi.removeImageStyle(id)
+      setStyles((s) => s.filter((x) => x.id !== id))
+    } catch (e) {
+      toast.error(e instanceof ApiError ? e.message : t('admin:common.failed'))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  function patchLocal(id: string, patch: Partial<ApiImageStyle>) {
+    setStyles((s) => s.map((x) => (x.id === id ? { ...x, ...patch } : x)))
+  }
+
+  function setOrderedStyles(next: ApiImageStyle[]) {
+    setStyles(next.map((style, sortOrder) => ({ ...style, sort_order: sortOrder })))
+  }
+
+  function persistOrder(next: ApiImageStyle[], previous: ApiImageStyle[]) {
+    void adminApi.reorderImageStyles(next.map((style) => style.id)).catch((error) => {
+      setStyles(previous)
+      toast.error(error instanceof ApiError ? error.message : t('admin:common.reorderFailed'))
+    })
+  }
+
+  return (
+    <div className="mx-auto max-w-[76rem]">
+      <header>
+        <h1 className="font-serif text-2xl tracking-tight text-[var(--color-fg)] sm:text-3xl">
+          {t('admin:imageStyles.title', { defaultValue: 'Image styles' })}
+        </h1>
+        <p className="mt-2 max-w-2xl text-sm text-[var(--color-fg-muted)]">
+          {t('admin:imageStyles.lead', {
+            defaultValue: 'Looks users can pick when drawing. The style prompt is hidden from users.',
+          })}
+        </p>
+      </header>
+
+      {!loading ? (
+        <section className="mt-8 flex items-end gap-3 border-y border-[var(--color-divider)] py-4 max-sm:flex-col max-sm:items-stretch">
+          <Field
+            className="min-w-0 flex-1"
+            label={t('admin:settings.fields.imagePromptModel')}
+            htmlFor="image-prompt-model"
+            hint={t('admin:settings.fields.imagePromptModelHint')}
+          >
+            <Select
+              value={imagePromptModelId || 'none'}
+              onValueChange={(value) => setImagePromptModelId(value === 'none' ? '' : value)}
+            >
+              <SelectTrigger id="image-prompt-model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">{t('admin:settings.fields.fallbackNone')}</SelectItem>
+                {models.map((model) => (
+                  <SelectItem key={model.id} value={model.id}>{model.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Button
+            variant="secondary"
+            className="w-full sm:w-auto"
+            loading={savingPromptModel}
+            onClick={() => void savePromptModel()}
+          >
+            {t('common:actions.save')}
+          </Button>
+        </section>
+      ) : null}
+
+      <section className="mt-8">
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input
+            value={newName}
+            disabled={creating}
+            wrapperClassName="w-full min-w-0 sm:flex-1"
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder={t('admin:imageStyles.namePlaceholder', { defaultValue: 'Style name (e.g. Watercolor)' })}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                void create()
+              }
+            }}
+          />
+          <Button
+            className="w-full sm:w-auto"
+            onClick={() => void create()}
+            loading={creating}
+            leadingIcon={<Plus size={14} aria-hidden />}
+          >
+            {t('admin:imageStyles.add', { defaultValue: 'Add style' })}
+          </Button>
+        </div>
+
+        {loading ? (
+          <PanelFallback />
+        ) : styles.length === 0 ? (
+          <div className="mt-6 rounded-[12px] border border-[var(--color-border)] bg-[var(--color-surface)] px-5 py-8 text-center text-sm text-[var(--color-fg-muted)]">
+            {t('admin:imageStyles.empty', { defaultValue: 'No styles yet. Add one above.' })}
+          </div>
+        ) : (
+          <AdminSortableList
+            items={styles}
+            onItemsChange={setOrderedStyles}
+            onOrderCommit={persistOrder}
+            dragHandleLabel={t('admin:common.dragHandle')}
+            moveUpLabel={t('admin:common.moveUp')}
+            moveDownLabel={t('admin:common.moveDown')}
+            mobileDragOnly
+            listClassName="mt-6"
+            rowClassName="grid grid-cols-[2.75rem_minmax(0,1fr)] items-start gap-2 p-3 md:grid-cols-[auto_auto_minmax(0,1fr)] md:gap-3 md:p-4"
+            renderItem={(st) => (
+              <StyleCard
+                style={st}
+                removing={busyId === st.id}
+                onPatch={(p) => patchLocal(st.id, p)}
+                onRemove={() => void remove(st.id)}
+              />
+            )}
+          />
+        )}
+      </section>
+    </div>
+  )
+}
+
+function StyleCard({
+  style,
+  removing,
+  onPatch,
+  onRemove,
+}: {
+  style: ApiImageStyle
+  removing: boolean
+  onPatch: (patch: Partial<ApiImageStyle>) => void
+  onRemove: () => void
+}) {
+  const { t } = useTranslation(['admin', 'common'])
+  const [saving, setSaving] = useState(false)
+
+  async function save() {
+    const name = style.name.trim()
+    if (!name) {
+      toast.error(t('admin:imageStyles.nameRequired', { defaultValue: 'Name is required.' }))
+      return
+    }
+    setSaving(true)
+    try {
+      const upd = await adminApi.updateImageStyle(style.id, {
+        name,
+        example_image_url: style.example_image_url,
+        hidden_prompt: style.hidden_prompt ?? '',
+        enabled: style.enabled,
+        sort_order: style.sort_order,
+      })
+      onPatch(upd)
+      toast.success(t('admin:common.saved', { defaultValue: 'Saved' }))
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast.error(t('admin:common.nameExists', { defaultValue: 'A record with this name already exists.' }))
+      } else {
+        toast.error(e instanceof ApiError ? e.message : t('admin:common.failed'))
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="min-w-0">
+      <div className="flex flex-col gap-4 sm:flex-row">
+        {/* Example thumbnail */}
+        <div className="size-20 shrink-0 overflow-hidden rounded-[10px] border border-[var(--color-border-subtle)] bg-[var(--color-bg-muted)]">
+          {style.example_image_url ? (
+            <img src={style.example_image_url} alt="" className="size-full object-cover" />
+          ) : (
+            <span className="grid size-full place-items-center text-[var(--color-fg-faint)]">
+              <Palette size={20} aria-hidden />
+            </span>
+          )}
+        </div>
+
+        <div className="flex min-w-0 flex-1 flex-col gap-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="min-w-0 flex-1 sm:min-w-[12rem]">
+              <Label htmlFor={`name-${style.id}`}>{t('admin:imageStyles.name', { defaultValue: 'Name' })}</Label>
+              <Input
+                id={`name-${style.id}`}
+                value={style.name}
+                onChange={(e) => onPatch({ name: e.target.value })}
+                className="mt-1 h-9"
+              />
+            </div>
+            <div className="flex items-center gap-2 pb-1.5">
+              <Switch
+                checked={style.enabled}
+                onCheckedChange={(v) => onPatch({ enabled: v })}
+                aria-label={t('admin:imageStyles.enabled', { defaultValue: 'Enabled' })}
+              />
+              <span className="text-sm text-[var(--color-fg-muted)]">
+                {t('admin:imageStyles.enabled', { defaultValue: 'Enabled' })}
+              </span>
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor={`img-${style.id}`}>
+              {t('admin:imageStyles.example', { defaultValue: 'Example image' })}
+            </Label>
+            <div className="mt-1">
+              <IconUploader
+                id={`img-${style.id}`}
+                value={style.example_image_url}
+                onChange={(v) => onPatch({ example_image_url: v })}
+                placeholder={t('admin:imageStyles.examplePlaceholder', { defaultValue: 'Image URL or upload' })}
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label htmlFor={`prompt-${style.id}`}>
+              {t('admin:imageStyles.hiddenPrompt', { defaultValue: 'Style prompt (hidden from users)' })}
+            </Label>
+            <Textarea
+              id={`prompt-${style.id}`}
+              value={style.hidden_prompt ?? ''}
+              onChange={(e) => onPatch({ hidden_prompt: e.target.value })}
+              rows={3}
+              placeholder={t('admin:imageStyles.hiddenPromptPlaceholder', {
+                defaultValue: 'e.g. soft watercolor, textured paper, muted palette, hand-painted edges',
+              })}
+              className="mt-1"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={onRemove}
+              disabled={removing}
+              aria-busy={removing || undefined}
+              aria-label={t('common:actions.delete', { defaultValue: 'Delete' })}
+              className="inline-flex size-11 items-center justify-center rounded-[8px] text-[var(--color-fg-subtle)] hover:bg-[var(--color-danger-soft)] hover:text-[var(--color-danger)] interactive disabled:opacity-50 disabled:cursor-not-allowed disabled:pointer-events-none sm:size-9"
+            >
+              {removing ? (
+                <span
+                  className="inline-block size-3.5 rounded-full border-2 border-current border-r-transparent animate-[spin_700ms_linear_infinite]"
+                  aria-hidden
+                />
+              ) : (
+                <Trash2 size={15} aria-hidden />
+              )}
+            </button>
+            <Button onClick={() => void save()} loading={saving} size="sm">
+              {t('common:actions.save', { defaultValue: 'Save' })}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}

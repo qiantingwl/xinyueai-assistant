@@ -1,0 +1,1565 @@
+/**
+ * High-level endpoint wrappers. Each function returns the same shape the
+ * backend returns, with a small typed helper signature. Group by feature so
+ * the call sites stay readable.
+ */
+import { api, apiUrl, getAccessToken, ApiError, apiUpload, assertNetworkOnline, withAuthSessionLock, type UploadProgress } from './client'
+import { withRequestActivity, type RequestActivityMode } from '@/lib/request-activity'
+import type {
+  ApiAdminMessageFeedbackPage,
+  ApiAdminUserFeedbackPage,
+  ApiAdminFile,
+  ApiAdminGeneratedImagePage,
+  ApiAdminGeneratedImageResource,
+  ApiAdminKnowledgeBaseResource,
+  ApiAdminKnowledgeBaseResourceDetail,
+  ApiAdminLoginHistoryPage,
+  ApiAdminProjectConversation,
+  ApiAdminProjectResource,
+  ApiAdminProjectResourceDetail,
+  ApiAdminResourcePage,
+  ApiWorkspace,
+  ApiWorkspaceMember,
+  ApiWorkspaceMemberPermissions,
+  ApiWorkspaceKnowledgeBaseMemberPermission,
+  ApiWorkspaceRole,
+  ApiWorkspaceInvite,
+  ApiWorkspacePolicy,
+  ApiWorkspaceUsageRow,
+  ApiWorkspaceAuditLog,
+  ApiAnalytics,
+  ApiAuthPolicy,
+  ApiAuthResponse,
+  ApiAuthSessionResponse,
+  ApiBuiltinTool,
+  ApiChannel,
+  ApiChannelModelDiscoveryResult,
+  ApiChannelModelImportResult,
+  ApiConversation,
+  ApiConversationFile,
+  ApiCreditPackage,
+  ApiCreditAdjustmentNotification,
+  ApiCredits,
+  ApiDocument,
+  ApiKnowledgeBase,
+  ApiAdminKnowledgeBase,
+  ApiKnowledgeBaseShare,
+  ApiKnowledgeBaseUploader,
+  ApiGroupUsersPage,
+  ApiMemory,
+  ApiMessage,
+  ApiModel,
+  ApiSelectableTool,
+  ApiModelTag,
+  ApiModelQuota,
+  ApiImageStyle,
+  ApiAdminImage,
+  ApiOAuthProvider,
+  ApiProject,
+  ApiCanvas,
+  ApiRedeemCode,
+  ApiRedeemRedemption,
+  ApiRedeemResult,
+  ApiSession,
+  ApiUserGroup,
+  ApiPublicOAuthProvider,
+  ApiOAuthIdentity,
+  ApiPaymentChannel,
+  ApiPaymentCheckoutAction,
+  ApiPaymentMethod,
+  ApiPaymentOrder,
+  ApiPaymentOrderStatus,
+  ApiPaymentProvider,
+  ApiPaymentTargetType,
+  ApiPublicPaymentMethod,
+  ApiPublicSkill,
+  ApiUserPaymentOrder,
+  ApiPrompt,
+  ApiLibraryCatalog,
+  ApiShareInfo,
+  ApiSharedConversation,
+  ApiSkill,
+  ApiSkillAsset,
+  ApiUserPrompt,
+  ApiUserSkill,
+  ApiUsageRecord,
+  ApiUser,
+} from './types'
+import { envNum } from '@/lib/env-config'
+import type { FeedbackReason, MessageFeedbackInput } from '@/types/chat'
+
+export interface AdminAnalyticsParams {
+  days?: number
+  user?: string
+  model?: string
+  workspace?: string
+  purpose?: string
+  channel?: string
+}
+
+/** Admin-only metadata for one method discovered from a Streamable HTTP MCP server. */
+export interface ApiMCPTool {
+  name: string
+  title?: string
+  description?: string
+  inputSchema?: Record<string, unknown>
+}
+
+/** An administrator-managed Streamable HTTP MCP connection. Request headers
+ * may contain masked values in read responses; they are never exposed by the
+ * signed-in user tool catalog. */
+export interface ApiMCPServer {
+  id: string
+  name: string
+  icon: string
+  description: string
+  url: string
+  headers: Record<string, string>
+  enabled: boolean
+  protocol_version?: string
+  discovered_tools?: ApiMCPTool[]
+  last_error?: string
+  last_synced_at?: number
+  created_at?: number
+  updated_at?: number
+}
+
+export type ApiMCPServerInput = Pick<
+  ApiMCPServer,
+  'name' | 'icon' | 'description' | 'url' | 'headers' | 'enabled'
+>
+
+// ----- Auth ----------------------------------------------------------------
+
+export const authApi = {
+  signupOpen: () =>
+    api<{ open: boolean; captcha_required: boolean; login_captcha_required: boolean }>('/public/signup-open'),
+  /** Public operator contact and optional Markdown policy overrides. */
+  legalConfig: () =>
+    api<{ contact_email: string; terms_text: string; privacy_text: string }>('/public/legal-config'),
+  /** Public deployment branding, available before authentication. */
+  siteConfig: () => api<{ title: string; description: string }>('/public/site-config'),
+  /** Fetch a fresh slider-puzzle captcha (drag the piece into the gap). */
+  captcha: (purpose: 'login' | 'register') =>
+    api<{
+      id: string
+      background: string
+      piece: string
+      w: number
+      h: number
+      piece_size: number
+      piece_y: number
+    }>(`/public/captcha?purpose=${encodeURIComponent(purpose)}`),
+  /** Whether the deployment still needs its first-run setup (zero users). */
+  needsSetup: () => api<{ needs_setup: boolean }>('/public/needs-setup'),
+  authPolicy: () => api<ApiAuthPolicy>('/public/auth-policy'),
+  /** Restore an existing cookie session; signed-out is a successful normal state. */
+  session: () => withAuthSessionLock(() => api<ApiAuthSessionResponse>('/auth/session', { method: 'POST' })),
+  /** Create the first account (admin) on a fresh deployment, then sign in. */
+  setup: (name: string, email: string, password: string) =>
+    api<ApiAuthResponse>('/setup', { method: 'POST', body: { name, email, password } }),
+  me: () => api<ApiUser>('/me'),
+  /** § user files page: storage meter + unified upload inventory. */
+  myStorage: () => api<{ used_bytes: number; quota_bytes: number }>('/me/storage'),
+  myFiles: (params: { search?: string; origin?: string; type?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.search) qs.set('search', params.search)
+    if (params.origin && params.origin !== 'all') qs.set('origin', params.origin)
+    if (params.type && params.type !== 'all') qs.set('type', params.type)
+    if (params.sort) qs.set('sort', params.sort)
+    if (params.order) qs.set('order', params.order)
+    if (params.limit) qs.set('limit', String(params.limit))
+    if (params.offset) qs.set('offset', String(params.offset))
+    return api<{ files: ApiAdminFile[]; total: number; limit: number; offset: number }>(
+      `/me/files${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  deleteMyFiles: (items: Array<{ source: 'file' | 'document'; id: string }>) =>
+    api<{ deleted: number }>('/me/files/delete', { method: 'POST', body: { items } }),
+  myFileContentBlob: async (source: 'file' | 'document', id: string, signal?: AbortSignal): Promise<Blob> => {
+    assertNetworkOnline()
+    const token = getAccessToken()
+    const res = await fetch(apiUrl(`/me/files/content?source=${source}&id=${encodeURIComponent(id)}`), {
+      credentials: 'include',
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal,
+    })
+    if (!res.ok) throw new ApiError(res.status, `preview failed (${res.status})`, null)
+    return res.blob()
+  },
+  /** Credit balance (timed pool + permanent pool) for the subscription page. */
+  credits: () => api<ApiCredits>('/me/credits'),
+  /** Atomically claim the oldest permanent-credit adjustment notice. */
+  claimCreditAdjustmentNotification: () =>
+    api<{ notification: ApiCreditAdjustmentNotification | null }>('/me/credit-adjustments/claim', { method: 'POST' }),
+  login: (email: string, password: string, captchaToken?: string) =>
+    api<ApiAuthResponse | { totp_required: true; ticket: string }>('/auth/login', {
+      method: 'POST',
+      body: { email, password, captcha_token: captchaToken },
+    }),
+  /** Complete a 2FA-gated login with the ticket from the password step. */
+  loginTwoFactor: (ticket: string, code: string) =>
+    api<ApiAuthResponse>('/auth/login/2fa', { method: 'POST', body: { ticket, code } }),
+  /** Begin 2FA setup — returns the secret + otpauth URI for the authenticator. */
+  setup2fa: () => api<{ secret: string; otpauth_url: string }>('/me/2fa/setup', { method: 'POST' }),
+  enable2fa: (code: string) => api<{ ok: true }>('/me/2fa/enable', { method: 'POST', body: { code } }),
+  disable2fa: (code: string) => api<{ ok: true }>('/me/2fa/disable', { method: 'POST', body: { code } }),
+  register: (email: string, password: string, name: string, captchaToken?: string) =>
+    api<ApiAuthResponse | { verification_required: boolean; email: string; retry_after: number; email_sent?: boolean }>('/auth/register', {
+      method: 'POST',
+      body: { email, password, name, captcha_token: captchaToken },
+    }),
+  // Verify a slider-puzzle solution; on success returns a single-use,
+  // purpose-bound pass token for the pending login or registration request.
+  captchaVerify: (
+    id: string,
+    solution: {
+      fraction: number
+      interaction: { mode: 'pointer' | 'keyboard'; points: Array<{ x: number; t: number }> }
+    },
+  ) => api<{ ok: boolean; token?: string }>('/public/captcha/verify', {
+    method: 'POST',
+    body: { id, ...solution },
+  }),
+  refresh: () => api<ApiAuthResponse>('/auth/refresh', { method: 'POST' }),
+  logout: () => api<{ ok: true }>('/auth/logout', { method: 'POST' }),
+  updateProfile: (patch: { name?: string; email?: string }) =>
+    api<ApiUser>('/me', { method: 'PATCH', body: patch }),
+  changePassword: (current_password: string, new_password: string) =>
+    api<{ ok: true }>('/me/password', { method: 'PATCH', body: { current_password, new_password } }),
+  /** Set the FIRST password for an OAuth account that has none (no current
+   *  password required; the session stays valid). */
+  setPassword: (new_password: string) =>
+    api<{ ok: true }>('/me/password/set', { method: 'POST', body: { new_password } }),
+  /** Upload a profile avatar (PNG/JPG). Returns the served URL to store in
+   *  the user's settings (avatar_url). */
+  uploadAvatar: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api<{ url: string; filename: string }>('/me/avatar', { method: 'POST', body: fd })
+  },
+  getSettings: () => api<Record<string, unknown>>('/me/settings'),
+  updateSettings: (patch: Record<string, unknown>) =>
+    api<Record<string, unknown>>('/me/settings', { method: 'PATCH', body: patch }),
+  // Global announcement (§ announcement). enabled=false when none is active.
+  // Pinned top bar (bar_*) is independent of the popup.
+  announcement: () =>
+    api<{
+      enabled: boolean
+      title: string
+      body: string
+      image_url: string
+      remember_dismiss: boolean
+      require_read: boolean
+      updated_at: number
+      bar_enabled: boolean
+      bar_html: string
+      bar_updated_at: number
+    }>('/announcement'),
+  // Cost is intentionally NOT exposed to users — only message volume.
+  usage: () => api<{ days: number; messages: number }>('/me/usage'),
+  // Active sessions (§ account → active sessions). `current` is the stable
+  // family id making the request, so the UI can mark "This device".
+  sessions: () => api<{ sessions: ApiSession[]; current: string }>('/auth/sessions'),
+  revokeSession: (id: string) =>
+    api<{ ok: true }>(`/auth/sessions/${encodeURIComponent(id)}/revoke`, { method: 'POST' }),
+  revokeOtherSessions: () =>
+    api<{ ok: true }>('/auth/sessions/revoke-others', { method: 'POST' }),
+  /** Permanently delete the user's account and all data. Requires password confirmation. */
+  deleteAccount: (password: string) =>
+    api<{ ok: true }>('/me', { method: 'DELETE', body: { password } }),
+  // Email verification
+  verifyEmail: (email: string, code: string) =>
+    api<ApiAuthResponse>('/auth/verify-email', { method: 'POST', body: { email, code } }),
+  sendCode: (email: string, purpose: 'verify' | 'reset') =>
+    api<{ ok: true; retry_after: number }>('/auth/send-code', { method: 'POST', body: { email, purpose } }),
+  // Password reset
+  forgotPassword: (email: string) =>
+    api<{ ok: true; retry_after: number }>('/auth/forgot-password', { method: 'POST', body: { email } }),
+  resetPassword: (email: string, code: string, new_password: string) =>
+    api<{ ok: true }>('/auth/reset-password', { method: 'POST', body: { email, code, new_password } }),
+  // Enabled social-login providers for the login screen (no secrets). Empty
+  // array → the UI hides the OAuth section entirely.
+  oauthProviders: () => api<ApiPublicOAuthProvider[]>('/public/oauth-providers'),
+
+  // ----- Identity linking (§ account → identity sources) -----
+  /** Third-party accounts bound to the current user. */
+  identities: () => api<ApiOAuthIdentity[]>('/me/identities'),
+  /**
+   * Begin a bind flow: returns the provider authorize URL for the SPA to
+   * navigate to. The caller's identity is stashed server-side in the OAuth
+   * state, so the shared callback links instead of logging in.
+   */
+  linkIdentityStart: (providerId: string) =>
+    api<{ authorize_url: string }>(`/me/identities/${encodeURIComponent(providerId)}/link`, { method: 'POST' }),
+  /** Remove a bound identity by its (provider, subject) key. */
+  unlinkIdentity: (providerId: string, subject: string) =>
+    api<{ ok: true }>(
+      `/me/identities?provider_id=${encodeURIComponent(providerId)}&subject=${encodeURIComponent(subject)}`,
+      { method: 'DELETE' },
+    ),
+}
+
+// ----- Models / skills -----------------------------------------------------
+
+export const modelsApi = {
+  /** §workspace RBAC: a workspace scope filters the list to the models that
+   *  workspace's policy allows (presentation only — turns re-check server-side). */
+  list: (workspaceId?: string) =>
+    api<{
+      models: ApiModel[]
+      default_id: string
+      verify_available?: boolean
+      fast_available?: boolean
+      /** Anonymous capability only; the hidden fast model identity stays server-side. */
+      fast_vision?: boolean
+    }>(`/models${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  listImage: () => api<{ models: ApiModel[]; default_id: string }>('/image-models'),
+  /** Model tags for the picker's filter chips (§ model tags). */
+  tags: () => api<ApiModelTag[]>('/model-tags'),
+}
+
+export const toolsApi = {
+  list: (modelId: string, workspaceId?: string) =>
+    api<ApiSelectableTool[]>(
+      `/tools?model_id=${encodeURIComponent(modelId)}${workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : ''}`,
+    ),
+}
+
+// ----- Image generation (§4.20) --------------------------------------------
+
+export const imageApi = {
+  /** Enabled styles for the composer style picker (hidden prompt stripped). */
+  styles: () => api<ApiImageStyle[]>('/image/styles'),
+  /** The signed-in user's own generated-image gallery (§4.20). */
+  myImages: (
+    limit = envNum('VITE_AIVORY_IMAGE_API_MY_IMAGES_LIMIT', 60),
+    offset = 0,
+  ) => api<ApiAdminImage[]>(`/me/images?limit=${limit}&offset=${offset}`),
+}
+
+export const skillsApi = {
+  list: () => api<ApiPublicSkill[]>('/skills'),
+}
+
+export const libraryApi = {
+  catalog: (workspaceId?: string) =>
+    api<ApiLibraryCatalog>(`/library/catalog${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  skills: (workspaceId?: string) =>
+    api<ApiUserSkill[]>(`/me/skills${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  createSkill: (body: Pick<ApiUserSkill, 'name' | 'description' | 'instructions'>, workspaceId?: string) =>
+    api<ApiUserSkill>('/me/skills', { method: 'POST', body: { ...body, workspace_id: workspaceId } }),
+  updateSkill: (id: string, body: Partial<Pick<ApiUserSkill, 'name' | 'description' | 'instructions'>>, workspaceId?: string) =>
+    api<ApiUserSkill>(`/me/skills/${encodeURIComponent(id)}${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`, { method: 'PATCH', body }),
+  removeSkill: (id: string, workspaceId?: string) =>
+    api<{ ok: true }>(`/me/skills/${encodeURIComponent(id)}${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`, { method: 'DELETE' }),
+  addCatalogSkill: (sourceId: string, workspaceId?: string) =>
+    api<ApiUserSkill>('/me/skills/from-catalog', { method: 'POST', body: { source_id: sourceId, workspace_id: workspaceId } }),
+  prompts: (workspaceId?: string) =>
+    api<ApiUserPrompt[]>(`/me/prompts${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  createPrompt: (body: Pick<ApiUserPrompt, 'name' | 'description' | 'content'>, workspaceId?: string) =>
+    api<ApiUserPrompt>('/me/prompts', { method: 'POST', body: { ...body, workspace_id: workspaceId } }),
+  updatePrompt: (id: string, body: Partial<Pick<ApiUserPrompt, 'name' | 'description' | 'content'>>, workspaceId?: string) =>
+    api<ApiUserPrompt>(`/me/prompts/${encodeURIComponent(id)}${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`, { method: 'PATCH', body }),
+  removePrompt: (id: string, workspaceId?: string) =>
+    api<{ ok: true }>(`/me/prompts/${encodeURIComponent(id)}${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`, { method: 'DELETE' }),
+  addCatalogPrompt: (sourceId: string, workspaceId?: string) =>
+    api<ApiUserPrompt>('/me/prompts/from-catalog', { method: 'POST', body: { source_id: sourceId, workspace_id: workspaceId } }),
+}
+
+// ----- User groups (membership tiers) --------------------------------------
+
+export const groupsApi = {
+  /** Groups visible to the signed-in user (subscription page). */
+  list: () => api<ApiUserGroup[]>('/user-groups'),
+  /** Public membership tiers for the landing page (no auth required). */
+  publicList: () => api<ApiUserGroup[]>('/public/user-groups'),
+}
+
+// ----- Permanent-credit packages ------------------------------------------
+
+export const creditPackagesApi = {
+  /** Enabled packages visible to signed-in members. */
+  list: () => api<ApiCreditPackage[]>('/credit-packages'),
+}
+
+// ----- Payments -----------------------------------------------------------
+
+export const paymentsApi = {
+  /** Enabled, valid payment choices for the selected catalog target. */
+  methods: (targetType: ApiPaymentTargetType, signal?: AbortSignal) =>
+    api<{ methods: ApiPublicPaymentMethod[]; card_purchase_url: string }>(
+      `/payment-methods?target_type=${encodeURIComponent(targetType)}`,
+      { signal },
+    ),
+  checkout: (body: {
+    payment_method_id: string
+    target_type: ApiPaymentTargetType
+    target_id: string
+    billing_cycle?: 'monthly' | 'yearly'
+  }, signal?: AbortSignal) =>
+    api<{ order_id: string; action: ApiPaymentCheckoutAction }>('/payments/checkout', {
+      method: 'POST',
+      body,
+      signal,
+    }),
+  /** Returns only the current user's order; server-side status names are
+   * normalized for the buyer-facing flow. */
+  order: (id: string, signal?: AbortSignal) =>
+    api<ApiUserPaymentOrder>(`/payments/orders/${encodeURIComponent(id)}`, { signal }),
+  /** Resume a valid provider session, or create a new EPay merchant attempt
+   * that still belongs to the same unfinished Aivory order. */
+  resumeOrder: (id: string, signal?: AbortSignal) =>
+    api<{ order_id: string; action: ApiPaymentCheckoutAction }>(
+      `/payments/orders/${encodeURIComponent(id)}/resume`,
+      { method: 'POST', signal },
+    ),
+  /** Paginated payment history for the signed-in buyer. */
+  orders: (limit = 10, offset = 0) => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    return api<{ orders: ApiUserPaymentOrder[]; total: number; limit: number; offset: number }>(
+      `/payments/orders?${qs}`,
+    )
+  },
+}
+
+// ----- Redeem codes (§ redeem codes) ---------------------------------------
+
+export const redeemApi = {
+  /** Apply a code on behalf of the signed-in user. Throws ApiError on failure
+   *  with `error` field one of: code_invalid | code_expired | code_used |
+   *  code_already_owned | code_disabled.
+   *
+   *  When the code grants a group DIFFERENT from the user's current one, the
+   *  first call (confirm omitted) returns `{ requires_confirmation: true, … }`
+   *  WITHOUT applying anything — call again with `confirm: true` to override the
+   *  current group immediately (not a renewal). */
+  redeem: (code: string, confirm = false) =>
+    api<ApiRedeemResult>('/me/redeem', { method: 'POST', body: { code, confirm } }),
+}
+
+// ----- Audio (speech-to-text) ----------------------------------------------
+
+export const audioApi = {
+  /** Which STT provider is active — "gpt" (record then transcribe) or "volcano"
+   *  (live streaming). Lets the composer pick the right mic flow. */
+  capabilities: () => api<{ provider: string; streaming: boolean; enabled: boolean }>('/audio/capabilities'),
+  /** Transcribe a recorded audio blob via the admin-configured voice model. */
+  transcribe: (file: Blob, filename = 'audio.webm') => {
+    const fd = new FormData()
+    fd.append('file', file, filename)
+    return api<{ text: string }>('/audio/transcriptions', { method: 'POST', body: fd })
+  },
+}
+
+// ----- Projects ------------------------------------------------------------
+
+export const projectsApi = {
+  list: (workspaceId?: string) =>
+    api<ApiProject[]>(`/projects${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  get: (id: string) =>
+    api<{ project: ApiProject; documents: ApiDocument[]; conversations: ApiConversation[] }>(
+      `/projects/${encodeURIComponent(id)}`,
+    ),
+  create: (body: Partial<ApiProject>) => api<ApiProject>('/projects', { method: 'POST', body }),
+  update: (id: string, patch: Partial<ApiProject>) =>
+    api<ApiProject>(`/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch }),
+  remove: (id: string) => api<{ ok: true }>(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  listDocs: (id: string) => api<ApiDocument[]>(`/projects/${encodeURIComponent(id)}/documents`),
+  addDoc: (id: string, body: { filename: string; content: string; mime_type?: string }) =>
+    api<ApiDocument>(`/projects/${encodeURIComponent(id)}/documents`, { method: 'POST', body }),
+  /** Upload a real file (multipart) into the project's knowledge library. */
+  uploadDoc: (
+    id: string,
+    file: File,
+    opts: { onProgress?: (progress: UploadProgress) => void; signal?: AbortSignal } = {},
+  ) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return apiUpload<ApiDocument>(`/projects/${encodeURIComponent(id)}/documents`, fd, opts)
+  },
+  removeDoc: (id: string, docId: string) =>
+    api<{ ok: true }>(`/projects/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`, {
+      method: 'DELETE',
+    }),
+  renameDoc: (id: string, docId: string, filename: string) =>
+    api<{ ok: true }>(`/projects/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`, {
+      method: 'PATCH',
+      body: { filename },
+    }),
+}
+
+// ----- AI canvases --------------------------------------------------------
+
+export const canvasesApi = {
+  list: () => api<ApiCanvas[]>('/canvases'),
+  create: (name?: string) => api<ApiCanvas>('/canvases', { method: 'POST', body: name ? { name } : {} }),
+  get: (id: string) => api<ApiCanvas>(`/canvases/${encodeURIComponent(id)}`),
+  update: (id: string, patch: Partial<Pick<ApiCanvas, 'name' | 'data' | 'thumbnail_url' | 'viewport_x' | 'viewport_y' | 'zoom'>>) =>
+    api<ApiCanvas>(`/canvases/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch }),
+  remove: (id: string) => api<{ ok: true }>(`/canvases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+}
+
+// ----- Search --------------------------------------------------------------
+export interface SearchHit {
+  conversation_id: string
+  title: string
+  message_id?: string
+  role?: string
+  snippet?: string
+  created_at: number
+  updated_at: number
+}
+
+// ----- Workspaces (§workspaces) ---------------------------------------------
+
+export const workspacesApi = {
+  list: () => api<{ workspaces: ApiWorkspace[] }>('/workspaces'),
+  create: (name: string) => api<ApiWorkspace>('/workspaces', { method: 'POST', body: { name } }),
+  remove: (id: string) => api<{ ok: true }>(`/workspaces/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  members: (id: string) => api<{ members: ApiWorkspaceMember[] }>(`/workspaces/${encodeURIComponent(id)}/members`),
+  updateMemberPermissions: (id: string, userId: string, body: ApiWorkspaceMemberPermissions) =>
+    api<ApiWorkspaceMember>(
+      `/workspaces/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}/permissions`,
+      { method: 'PATCH', body },
+    ),
+  updateMemberRole: (id: string, userId: string, role: ApiWorkspaceRole) =>
+    api<ApiWorkspaceMember>(
+      `/workspaces/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}/role`,
+      { method: 'PATCH', body: { role } },
+    ),
+  transferOwnership: (id: string, userId: string) =>
+    api<ApiWorkspace>(`/workspaces/${encodeURIComponent(id)}/transfer`, { method: 'POST', body: { user_id: userId } }),
+  listInvites: (id: string) =>
+    api<{ invites: ApiWorkspaceInvite[] }>(`/workspaces/${encodeURIComponent(id)}/invites`),
+  createInvite: (id: string, body: { role: ApiWorkspaceRole; email?: string; expires_at?: number; max_uses?: number }) =>
+    api<ApiWorkspaceInvite>(`/workspaces/${encodeURIComponent(id)}/invites`, { method: 'POST', body }),
+  revokeInvite: (id: string, inviteId: string) =>
+    api<{ ok: true }>(`/workspaces/${encodeURIComponent(id)}/invites/${encodeURIComponent(inviteId)}`, { method: 'DELETE' }),
+  getPolicy: (id: string) =>
+    api<ApiWorkspacePolicy>(`/workspaces/${encodeURIComponent(id)}/policy`),
+  updatePolicy: (id: string, body: Partial<Omit<ApiWorkspacePolicy, 'WorkspaceID' | 'UpdatedBy' | 'UpdatedAt'>>) =>
+    api<ApiWorkspacePolicy>(`/workspaces/${encodeURIComponent(id)}/policy`, { method: 'PATCH', body }),
+  usage: (id: string, days = 30) =>
+    api<{ days: number; usage: ApiWorkspaceUsageRow[] }>(
+      `/workspaces/${encodeURIComponent(id)}/usage?days=${days}`,
+    ),
+  audit: (id: string, limit = 100, offset = 0) =>
+    api<{ logs: ApiWorkspaceAuditLog[] }>(
+      `/workspaces/${encodeURIComponent(id)}/audit?limit=${limit}&offset=${offset}`,
+    ),
+  kick: (id: string, userId: string) =>
+    api<{ ok: true }>(`/workspaces/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' }),
+  leave: (id: string) => api<{ ok: true }>(`/workspaces/${encodeURIComponent(id)}/leave`, { method: 'POST' }),
+  rotateInvite: (id: string) =>
+    api<{ invite_token: string }>(`/workspaces/${encodeURIComponent(id)}/invite/rotate`, { method: 'POST' }),
+  inviteInfo: (token: string) =>
+    api<{ id: string; name: string; owner_name: string; member_count: number }>(
+      `/workspaces/join/${encodeURIComponent(token)}`,
+    ),
+  join: (token: string) =>
+    api<{ id: string; name: string }>(`/workspaces/join/${encodeURIComponent(token)}`, { method: 'POST' }),
+  adminList: (
+    limit = envNum('VITE_AIVORY_WORKSPACES_API_ADMIN_LIST_LIMIT', 200),
+    offset = 0,
+  ) => api<{ workspaces: ApiWorkspace[] }>(`/admin/workspaces?limit=${limit}&offset=${offset}`),
+  adminDetail: (id: string) =>
+    api<{
+      workspace: ApiWorkspace
+      members: ApiWorkspaceMember[]
+      conversations: ApiConversation[]
+      projects: ApiProject[]
+      kbs: ApiKnowledgeBase[]
+    }>(`/admin/workspaces/${encodeURIComponent(id)}`),
+  adminRemove: (id: string) =>
+    api<{ ok: true }>(`/admin/workspaces/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+}
+
+export const searchApi = {
+  /** Full-text search over conversation titles + message content — scoped to the
+   *  active workspace when one is set (§workspaces). */
+  query: (q: string, workspaceId?: string) =>
+    api<{ query: string; titles: SearchHit[]; messages: SearchHit[] }>(
+      `/search?q=${encodeURIComponent(q)}${workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : ''}`,
+    ),
+}
+
+// ----- Conversations + messages -------------------------------------------
+
+export interface ConversationCompactionResult {
+  compacted: boolean
+  reason:
+    | 'compacted'
+    | 'nothing_to_compact'
+    | 'disabled'
+    | 'generation_in_progress'
+    | 'conversation_changed'
+    | 'compaction_failed'
+    | 'persistence_failed'
+    | 'timed_out'
+  dropped_messages: number
+  kept_messages: number
+  summary_tokens: number
+}
+
+export const conversationsApi = {
+  list: (
+    projectId?: string,
+    limit = envNum('VITE_AIVORY_CONVERSATIONS_API_LIST_LIMIT', 200),
+    offset = 0,
+    workspaceId?: string,
+  ) =>
+    api<{ conversations: ApiConversation[]; limit: number; offset: number; has_more: boolean }>(
+      `/conversations?limit=${limit}&offset=${offset}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ''}${workspaceId ? `&workspace_id=${encodeURIComponent(workspaceId)}` : ''}`,
+    ),
+  listArchived: (
+    limit = envNum('VITE_AIVORY_CONVERSATIONS_API_LIST_ARCHIVED_LIMIT', 200),
+    offset = 0,
+  ) =>
+    api<{ conversations: ApiConversation[]; limit: number; offset: number; has_more: boolean }>(
+      `/conversations?archived=only&limit=${limit}&offset=${offset}`,
+    ),
+  get: (id: string, opts?: { limit?: number; before?: string }) => {
+    const qs = new URLSearchParams()
+    if (opts?.limit) qs.set('limit', String(opts.limit))
+    if (opts?.before) qs.set('before', opts.before)
+    const q = qs.toString()
+    return api<{ conversation: ApiConversation; messages: ApiMessage[]; has_more?: boolean; next_before?: string }>(
+      `/conversations/${encodeURIComponent(id)}${q ? `?${q}` : ''}`,
+    )
+  },
+  create: (body: { model_id?: string; project_id?: string; title?: string; workspace_id?: string; fast?: boolean }) =>
+    api<ApiConversation>('/conversations', { method: 'POST', body }),
+  compact: (id: string) =>
+    api<ConversationCompactionResult>(`/conversations/${encodeURIComponent(id)}/compact`, { method: 'POST' }),
+  // Bulk-import conversation trees from another platform's export OR our own
+  // privacy-page "Export all data" file. History + titles (+ model for our own
+  // format) only; the server bypasses the orchestrator (no model calls / quota).
+  importConversations: (body: {
+    conversations: {
+      title: string
+      active_leaf_id: string
+      messages: { id: string; parent_id: string; role: string; content: string }[]
+      model_id?: string
+    }[]
+  }) =>
+    api<{ imported: number; failed: number; conversation_ids: string[] }>('/conversations/import', {
+      method: 'POST',
+      body,
+    }),
+  update: (id: string, patch: Partial<ApiConversation>) =>
+    api<ApiConversation>(`/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch }),
+  remove: (id: string) => api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  messages: (id: string, mode: 'path' | 'tree' = 'path') =>
+    api<ApiMessage[]>(
+      `/conversations/${encodeURIComponent(id)}/messages${mode === 'tree' ? '?mode=tree' : ''}`,
+    ),
+  editMessage: (id: string, msgId: string, text: string) =>
+    api<ApiMessage>(
+      `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}`,
+      { method: 'PATCH', body: { text } },
+    ),
+  // Delete one round (the user message + all its assistant answers) by any
+  // message id inside it; branch-safe. Returns the refreshed active path.
+  deleteMessage: (id: string, msgId: string) =>
+    api<{ ok: true; active_leaf_id: string; messages: ApiMessage[] }>(
+      `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}`,
+      { method: 'DELETE' },
+    ),
+  feedback: (id: string, msgId: string, input: MessageFeedbackInput) =>
+    api<{
+      ok: true
+      feedback?: MessageFeedbackInput['feedback']
+      feedback_reasons?: FeedbackReason[]
+      feedback_comment?: string
+    }>(
+      `/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(msgId)}/feedback`,
+      { method: 'POST', body: input },
+    ),
+  stop: (id: string, target?: { generation_id?: string; message_id?: string }) =>
+    api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}/stop`, { method: 'POST', body: target }),
+  setActiveLeaf: (id: string, leaf_id: string) =>
+    api<{ conversation: ApiConversation; messages: ApiMessage[] }>(
+      `/conversations/${encodeURIComponent(id)}/active-leaf`,
+      { method: 'PATCH', body: { leaf_id } },
+    ),
+  fork: (id: string, body: { leaf_id?: string; title?: string }) =>
+    api<ApiConversation>(`/conversations/${encodeURIComponent(id)}/fork`, { method: 'POST', body }),
+  // Inline (text-selection) sub-conversations anchored to a quoted excerpt of a
+  // message. The list drives the inline-thread markers; create opens a new one.
+  inlineThreads: (id: string) =>
+    api<ApiConversation[]>(`/conversations/${encodeURIComponent(id)}/inline-threads`),
+  createInlineThread: (id: string, body: { message_id: string; quote: string }) =>
+    api<ApiConversation>(`/conversations/${encodeURIComponent(id)}/inline-threads`, { method: 'POST', body }),
+  promoteDoc: (id: string, docId: string) =>
+    api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}/promote`, {
+      method: 'POST',
+    }),
+  retryDoc: (id: string, docId: string) =>
+    api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}/retry`, {
+      method: 'POST',
+    }),
+  // Conversation-scoped documents + their ingest status — polled by the composer
+  // to show upload/parse progress and block the first send until 'ready'.
+  listDocs: (id: string) =>
+    api<ApiDocument[]>(`/conversations/${encodeURIComponent(id)}/documents`),
+  // Conversation files drawer (§ conversation files): the authoritative set of
+  // files the conversation references, and remove (detach + drop RAG).
+  listFiles: (id: string) =>
+    api<ApiConversationFile[]>(`/conversations/${encodeURIComponent(id)}/files`),
+  listDraftFiles: (id: string) =>
+    api<ApiConversationFile[]>(`/conversations/${encodeURIComponent(id)}/files?draft=1`),
+  removeFile: (id: string, fileId: string) =>
+    api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`, {
+      method: 'DELETE',
+    }),
+  // Public read-only sharing (§ sharing).
+  getShare: (id: string) =>
+    api<{ share: ApiShareInfo | null }>(`/conversations/${encodeURIComponent(id)}/share`),
+  createShare: (id: string) =>
+    api<ApiShareInfo>(`/conversations/${encodeURIComponent(id)}/share`, { method: 'POST' }),
+  deleteShare: (id: string) =>
+    api<{ ok: true }>(`/conversations/${encodeURIComponent(id)}/share`, { method: 'DELETE' }),
+}
+
+// ----- Public share view (no auth) ----------------------------------------
+
+export const sharedApi = {
+  get: (token: string) => api<ApiSharedConversation>(`/public/shared/${encodeURIComponent(token)}`),
+  clone: (token: string) =>
+    api<ApiConversation>(`/shared/${encodeURIComponent(token)}/clone`, { method: 'POST' }),
+}
+
+// ----- Knowledge bases ----------------------------------------------------
+
+export const kbsApi = {
+  list: (workspaceId?: string) =>
+    api<ApiKnowledgeBase[]>(`/kbs${workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : ''}`),
+  get: (id: string) => api<ApiKnowledgeBase>(`/kbs/${encodeURIComponent(id)}`),
+  create: (body: { name: string; description?: string; workspace_id?: string; is_public?: boolean }) =>
+    api<ApiKnowledgeBase>('/kbs', { method: 'POST', body }),
+  update: (id: string, body: { is_public: boolean }) =>
+    api<ApiKnowledgeBase>(`/kbs/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  remove: (id: string) => api<{ ok: true }>(`/kbs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  listDocs: (id: string, params: { search?: string; uploaded_by_user_id?: string } = {}) => {
+    const query = new URLSearchParams()
+    if (params.search?.trim()) query.set('search', params.search.trim())
+    if (params.uploaded_by_user_id?.trim()) query.set('uploaded_by_user_id', params.uploaded_by_user_id.trim())
+    const suffix = query.toString() ? `?${query}` : ''
+    return api<ApiDocument[]>(`/kbs/${encodeURIComponent(id)}/documents${suffix}`)
+  },
+  uploaders: (id: string) => api<ApiKnowledgeBaseUploader[]>(`/kbs/${encodeURIComponent(id)}/uploaders`),
+  shares: (id: string) => api<ApiKnowledgeBaseShare[]>(`/kbs/${encodeURIComponent(id)}/shares`),
+  shareCandidates: (id: string, search: string) =>
+    api<ApiKnowledgeBaseShare[]>(
+      `/kbs/${encodeURIComponent(id)}/share-candidates?search=${encodeURIComponent(search)}`,
+    ),
+  // The server resolves the target by complete email; user_id is intentionally
+  // not accepted for share mutations to prevent bypassing account discovery.
+  upsertShare: (id: string, body: { email: string; role: 'read' | 'write' }) =>
+    api<ApiKnowledgeBaseShare>(`/kbs/${encodeURIComponent(id)}/shares`, { method: 'PUT', body }),
+  removeShare: (id: string, userId: string) =>
+    api<{ ok: true }>(`/kbs/${encodeURIComponent(id)}/shares/${encodeURIComponent(userId)}`, { method: 'DELETE' }),
+  workspaceMembers: (id: string) =>
+    api<ApiWorkspaceKnowledgeBaseMemberPermission[]>(`/kbs/${encodeURIComponent(id)}/workspace-members`),
+  updateWorkspaceMember: (
+    id: string,
+    userId: string,
+    body: { can_add_files: boolean; can_delete_content: boolean },
+  ) =>
+    api<ApiWorkspaceKnowledgeBaseMemberPermission>(
+      `/kbs/${encodeURIComponent(id)}/workspace-members/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body },
+    ),
+  addDoc: (
+    id: string,
+    body: { filename: string; content: string; mime_type?: string },
+    signal?: AbortSignal,
+  ) =>
+    api<ApiDocument>(`/kbs/${encodeURIComponent(id)}/documents`, { method: 'POST', body, signal }),
+  retryDoc: (id: string, docId: string) =>
+    api<{ ok: true }>(`/kbs/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}/retry`, { method: 'POST' }),
+  renameDoc: (id: string, docId: string, filename: string) =>
+    api<{ ok: true }>(`/kbs/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`, {
+      method: 'PATCH',
+      body: { filename },
+    }),
+  removeDoc: (id: string, docId: string) =>
+    api<{ ok: true }>(`/kbs/${encodeURIComponent(id)}/documents/${encodeURIComponent(docId)}`, { method: 'DELETE' }),
+}
+
+// ----- Memories -----------------------------------------------------------
+
+export const memoriesApi = {
+  list: (status?: string) =>
+    api<ApiMemory[]>(`/me/memories${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  create: (body: { memory_text: string; slot?: string; value?: string }) =>
+    api<ApiMemory>('/me/memories', { method: 'POST', body }),
+  update: (id: string, body: { memory_text?: string; status?: string; reason?: string }) =>
+    api<ApiMemory>(`/me/memories/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  remove: (id: string) => api<{ ok: true }>(`/me/memories/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+}
+
+// ----- Product issue feedback --------------------------------------------
+
+export interface IssueFeedbackInput {
+  messageId: string
+  description: string
+  pagePath: string
+  viewportWidth: number
+  viewportHeight: number
+  screenshot?: Blob
+}
+
+export const issueFeedbackApi = {
+  submit: (input: IssueFeedbackInput) => {
+    const form = new FormData()
+    form.append('message_id', input.messageId)
+    form.append('description', input.description)
+    form.append('page_path', input.pagePath)
+    form.append('viewport_width', String(input.viewportWidth))
+    form.append('viewport_height', String(input.viewportHeight))
+    if (input.screenshot) {
+      const extension = input.screenshot.type === 'image/png' ? 'png' : 'jpg'
+      form.append('screenshot', input.screenshot, `page-screenshot.${extension}`)
+    }
+    return api<{ ok: true; id: string; created_at: number }>('/user-feedback', {
+      method: 'POST',
+      body: form,
+    })
+  },
+}
+
+// ----- Admin --------------------------------------------------------------
+
+export const adminApi = {
+  channels: () => api<ApiChannel[]>('/admin/channels'),
+  createChannel: (body: Partial<ApiChannel> & { api_key?: string }) =>
+    api<ApiChannel>('/admin/channels', { method: 'POST', body }),
+  discoverChannelModels: (id: string) =>
+    api<ApiChannelModelDiscoveryResult>(`/admin/channels/${encodeURIComponent(id)}/models/discover`),
+  importChannelModels: (id: string, requestIds?: string[]) =>
+    api<ApiChannelModelImportResult>(`/admin/channels/${encodeURIComponent(id)}/models/import`, {
+      method: 'POST',
+      body: requestIds === undefined ? undefined : { request_ids: requestIds },
+    }),
+  reorderChannels: (ids: string[]) =>
+    api<{ ok: true }>('/admin/channels/reorder', { method: 'PATCH', body: { ids } }),
+  updateChannel: (id: string, body: Partial<ApiChannel> & { api_key?: string }) =>
+    api<ApiChannel>(`/admin/channels/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeChannel: (id: string) =>
+    api<{ ok: true }>(`/admin/channels/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // Payment channels keep protocol credentials in the database. Masked values
+  // returned by the server can be sent back unchanged to preserve the secret.
+  paymentChannels: () => api<ApiPaymentChannel[]>('/admin/payment-channels'),
+  preparePaymentChannel: () =>
+    api<Pick<ApiPaymentChannel, 'id' | 'webhook_url'>>('/admin/payment-channels/prepare', { method: 'POST' }),
+  createPaymentChannel: (body: Pick<ApiPaymentChannel, 'id' | 'name' | 'provider' | 'environment' | 'config' | 'enabled' | 'sort_order'>) =>
+    api<ApiPaymentChannel>('/admin/payment-channels', { method: 'POST', body }),
+  reorderPaymentChannels: (ids: string[]) =>
+    api<{ ok: true }>('/admin/payment-channels/reorder', { method: 'PATCH', body: { ids } }),
+  updatePaymentChannel: (
+    id: string,
+    body: Partial<Pick<ApiPaymentChannel, 'name' | 'provider' | 'environment' | 'config' | 'enabled' | 'sort_order'>>,
+  ) => api<ApiPaymentChannel>(`/admin/payment-channels/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removePaymentChannel: (id: string) =>
+    api<{ ok: true }>(`/admin/payment-channels/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  paymentMethods: () => api<ApiPaymentMethod[]>('/admin/payment-methods'),
+  createPaymentMethod: (
+    body: Pick<ApiPaymentMethod, 'name' | 'icon' | 'channel_id' | 'provider_method_config' | 'enabled' | 'sort_order'>,
+  ) => api<ApiPaymentMethod>('/admin/payment-methods', { method: 'POST', body }),
+  updatePaymentMethod: (
+    id: string,
+    body: Partial<Pick<ApiPaymentMethod, 'name' | 'icon' | 'channel_id' | 'provider_method_config' | 'enabled' | 'sort_order'>>,
+  ) => api<ApiPaymentMethod>(`/admin/payment-methods/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  reorderPaymentMethods: (ids: string[]) =>
+    api<{ ok: true }>('/admin/payment-methods/reorder', { method: 'PATCH', body: { ids } }),
+  removePaymentMethod: (id: string) =>
+    api<{ ok: true }>(`/admin/payment-methods/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  paymentOrders: (
+    params: {
+      status?: ApiPaymentOrderStatus
+      provider?: ApiPaymentProvider
+      search?: string
+      limit?: number
+      offset?: number
+    } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.status) qs.set('status', params.status)
+    if (params.provider) qs.set('provider', params.provider)
+    if (params.search) qs.set('search', params.search)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<{ orders: ApiPaymentOrder[]; total: number }>(
+      `/admin/payment-orders${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  reconcilePaymentOrder: (
+    id: string,
+    body: {
+      action: 'reconcile' | 'close'
+      confirm?: boolean
+      reason?: string
+    },
+  ) => api<ApiPaymentOrder>(`/admin/payment-orders/${encodeURIComponent(id)}/reconcile`, {
+    method: 'POST',
+    body,
+  }),
+  deletePaymentOrder: (id: string, gatewayFinalAcknowledged = false) => {
+    const query = gatewayFinalAcknowledged ? '?gateway_final_acknowledged=true' : ''
+    return api<{ ok: true }>(`/admin/payment-orders/${encodeURIComponent(id)}${query}`, { method: 'DELETE' })
+  },
+
+  models: (kind?: 'chat' | 'image' | 'embedding') =>
+    api<ApiModel[]>(`/admin/models${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`),
+  builtinTools: () => api<ApiBuiltinTool[]>('/admin/tools/builtins'),
+  mcpServers: () => api<ApiMCPServer[]>('/admin/mcp'),
+  createMCPServer: (body: ApiMCPServerInput) =>
+    api<ApiMCPServer>('/admin/mcp', { method: 'POST', body }),
+  updateMCPServer: (id: string, body: Partial<ApiMCPServerInput>) =>
+    api<ApiMCPServer>(`/admin/mcp/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeMCPServer: (id: string) =>
+    api<{ ok: true }>(`/admin/mcp/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  testMCPServer: (id: string) =>
+    api<ApiMCPServer | { ok: true }>(`/admin/mcp/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  syncMCPServer: (id: string) =>
+    api<ApiMCPServer | { ok: true }>(`/admin/mcp/${encodeURIComponent(id)}/sync`, { method: 'POST' }),
+  createModel: (body: Partial<ApiModel>) => api<ApiModel>('/admin/models', { method: 'POST', body }),
+  // Persist a new model order: `ids` is the full list in the desired order.
+  reorderModels: (ids: string[]) =>
+    api<{ ok: true }>('/admin/models/reorder', { method: 'PATCH', body: { ids } }),
+  updateModel: (id: string, body: Partial<ApiModel>) =>
+    api<ApiModel>(`/admin/models/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeModel: (id: string) => api<{ ok: true }>(`/admin/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  setModelSkills: (id: string, skillIds: string[]) =>
+    api<{ ok: true }>(`/admin/models/${encodeURIComponent(id)}/skills`, {
+      method: 'PUT',
+      body: { skill_ids: skillIds },
+    }),
+  // §fast-mode: mark (or clear) THE fast model. Only one model is fast at a time;
+  // the server clears the flag on all others and forces Deep Research off on it.
+  setFastModel: (id: string, fast: boolean) =>
+    api<{ ok: true; fast: boolean }>(`/admin/models/${encodeURIComponent(id)}/fast`, {
+      method: 'PUT',
+      body: { fast },
+    }),
+
+  // Model tags (§ model tags): admin CRUD of the assignable label set.
+  modelTags: () => api<ApiModelTag[]>('/admin/model-tags'),
+  createModelTag: (name: string, sortOrder = 0) =>
+    api<ApiModelTag>('/admin/model-tags', { method: 'POST', body: { name, sort_order: sortOrder } }),
+  reorderModelTags: (ids: string[]) =>
+    api<{ ok: true }>('/admin/model-tags/reorder', { method: 'PATCH', body: { ids } }),
+  updateModelTag: (id: string, body: { name: string; sort_order?: number }) =>
+    api<ApiModelTag>(`/admin/model-tags/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeModelTag: (id: string) =>
+    api<{ ok: true }>(`/admin/model-tags/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // §4.20 Image styles — full row incl. hidden_prompt (admin only).
+  imageStyles: () => api<ApiImageStyle[]>('/admin/image-styles'),
+  createImageStyle: (body: Partial<ApiImageStyle>) =>
+    api<ApiImageStyle>('/admin/image-styles', { method: 'POST', body }),
+  reorderImageStyles: (ids: string[]) =>
+    api<{ ok: true }>('/admin/image-styles/reorder', { method: 'PATCH', body: { ids } }),
+  updateImageStyle: (id: string, body: Partial<ApiImageStyle>) =>
+    api<ApiImageStyle>(`/admin/image-styles/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeImageStyle: (id: string) =>
+    api<{ ok: true }>(`/admin/image-styles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  skills: () => api<ApiSkill[]>('/admin/skills'),
+  createSkill: (body: Partial<ApiSkill>) => api<ApiSkill>('/admin/skills', { method: 'POST', body }),
+  reorderSkills: (ids: string[]) =>
+    api<{ ok: true }>('/admin/skills/reorder', { method: 'PATCH', body: { ids } }),
+  updateSkill: (id: string, body: Partial<ApiSkill>) =>
+    api<ApiSkill>(`/admin/skills/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeSkill: (id: string) => api<{ ok: true }>(`/admin/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // Upload one skill asset (template/script/data). Returns the descriptor to push
+  // into the skill's `assets` array; storage_path is server-controlled (§4.17).
+  uploadSkillAsset: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api<ApiSkillAsset>('/admin/skills/assets', { method: 'POST', body: fd })
+  },
+
+  prompts: () => api<ApiPrompt[]>('/admin/prompts'),
+  createPrompt: (body: Partial<ApiPrompt>) => api<ApiPrompt>('/admin/prompts', { method: 'POST', body }),
+  reorderPrompts: (ids: string[]) =>
+    api<{ ok: true }>('/admin/prompts/reorder', { method: 'PATCH', body: { ids } }),
+  updatePrompt: (id: string, body: Partial<ApiPrompt>) =>
+    api<ApiPrompt>(`/admin/prompts/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removePrompt: (id: string) =>
+    api<{ ok: true }>(`/admin/prompts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // OAuth / social login providers. client_secret is write-only — send it on
+  // create/update, never expect it back (has_secret flags whether one is set).
+  oauthProviders: () => api<ApiOAuthProvider[]>('/admin/oauth-providers'),
+  prepareOAuthProvider: () =>
+    api<Pick<ApiOAuthProvider, 'id' | 'redirect_uri'>>('/admin/oauth-providers/prepare', { method: 'POST' }),
+  createOAuthProvider: (body: Partial<ApiOAuthProvider> & { client_secret?: string }) =>
+    api<ApiOAuthProvider>('/admin/oauth-providers', { method: 'POST', body }),
+  reorderOAuthProviders: (ids: string[]) =>
+    api<{ ok: true }>('/admin/oauth-providers/reorder', { method: 'PATCH', body: { ids } }),
+  updateOAuthProvider: (id: string, body: Partial<ApiOAuthProvider> & { client_secret?: string }) =>
+    api<ApiOAuthProvider>(`/admin/oauth-providers/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeOAuthProvider: (id: string) =>
+    api<{ ok: true }>(`/admin/oauth-providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  // User groups + per-model quotas (§ user groups).
+  userGroups: () => api<ApiUserGroup[]>('/admin/user-groups'),
+  createUserGroup: (body: Partial<ApiUserGroup>) =>
+    api<ApiUserGroup>('/admin/user-groups', { method: 'POST', body }),
+  reorderUserGroups: (ids: string[]) =>
+    api<{ ok: true }>('/admin/user-groups/reorder', { method: 'PATCH', body: { ids } }),
+  updateUserGroup: (id: string, body: Partial<ApiUserGroup>) =>
+    api<ApiUserGroup>(`/admin/user-groups/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeUserGroup: (id: string) =>
+    api<{ ok: true }>(`/admin/user-groups/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  userGroupUsers: (id: string, search = '', limit = 20, offset = 0) =>
+    api<ApiGroupUsersPage>(
+      `/admin/user-groups/${encodeURIComponent(id)}/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
+    ),
+  creditPackages: () => api<ApiCreditPackage[]>('/admin/credit-packages'),
+  createCreditPackage: (body: Partial<ApiCreditPackage>) =>
+    api<ApiCreditPackage>('/admin/credit-packages', { method: 'POST', body }),
+  reorderCreditPackages: (ids: string[]) =>
+    api<{ ok: true }>('/admin/credit-packages/reorder', { method: 'PATCH', body: { ids } }),
+  updateCreditPackage: (id: string, body: Partial<ApiCreditPackage>) =>
+    api<ApiCreditPackage>(`/admin/credit-packages/${encodeURIComponent(id)}`, { method: 'PATCH', body }),
+  removeCreditPackage: (id: string) =>
+    api<{ ok: true }>(`/admin/credit-packages/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Assign a membership group; group_expires_at is unix seconds (0 = permanent). */
+  setUserGroup: (id: string, group_id: string, group_expires_at = 0) =>
+    api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/group`, {
+      method: 'POST',
+      body: { group_id, group_expires_at },
+    }),
+  /** Add to or remove from a user's permanent (non-expiring) credit balance. */
+  adjustUserCredits: (
+    id: string,
+    body: {
+      operation: 'add' | 'remove'
+      amount: number
+      notify_user: boolean
+      reason: string
+    },
+  ) =>
+    api<{
+      ok: true
+      operation: 'add' | 'remove'
+      amount: number
+      delta: number
+      credits_permanent: number
+      notification_id?: string
+    }>(`/admin/users/${encodeURIComponent(id)}/credits`, {
+      method: 'POST',
+      body,
+    }),
+  modelQuotas: (id: string) => api<ApiModelQuota[]>(`/admin/models/${encodeURIComponent(id)}/quotas`),
+  setModelQuotas: (id: string, quotas: ApiModelQuota[]) =>
+    api<{ ok: true }>(`/admin/models/${encodeURIComponent(id)}/quotas`, { method: 'PUT', body: { quotas } }),
+
+  // Redeem codes (§ redeem codes).
+  redeemCodes: (params?: { batch?: string; status?: 'unused' | 'partial' | 'used' | 'invalid'; limit?: number; offset?: number }) => {
+    const q = new URLSearchParams()
+    if (params?.batch) q.set('batch', params.batch)
+    if (params?.status) q.set('status', params.status)
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    const qs = q.toString()
+    return api<ApiRedeemCode[]>(`/admin/redeem-codes${qs ? `?${qs}` : ''}`)
+  },
+  createRedeemCode: (body: {
+    /** Defaults to 'group'. 'credits' codes add permanent credits instead. */
+    kind?: 'group' | 'credits'
+    /** Required for 'group' codes; ignored for 'credits' codes. */
+    group_id?: string
+    duration_days?: number
+    /** Required (> 0) for 'credits' codes. */
+    credits?: number
+    max_uses?: number
+    expires_at?: number
+    note?: string
+    batch_name?: string
+    code?: string
+    /** When > 1 a bulk batch is generated. */
+    quantity?: number
+  }) => api<ApiRedeemCode | ApiRedeemCode[]>('/admin/redeem-codes', { method: 'POST', body }),
+  updateRedeemCode: (id: string, patch: {
+    enabled?: boolean
+    note?: string
+    batch_name?: string
+    expires_at?: number
+    max_uses?: number
+  }) => api<ApiRedeemCode>(`/admin/redeem-codes/${encodeURIComponent(id)}`, { method: 'PATCH', body: patch }),
+  removeRedeemCode: (id: string) =>
+    api<{ ok: true }>(`/admin/redeem-codes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  redeemCodeRedemptions: (id: string) =>
+    api<ApiRedeemRedemption[]>(`/admin/redeem-codes/${encodeURIComponent(id)}/redemptions`),
+  removeRedeemBatch: (name: string) =>
+    api<{ ok: true; removed: number }>(`/admin/redeem-batches/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  users: (
+    search = '',
+    limit = envNum('VITE_AIVORY_ADMIN_API_USERS_LIMIT', 50),
+    offset = 0,
+    activity: RequestActivityMode = 'foreground',
+  ) =>
+    api<{ users: ApiUser[]; total: number; limit: number; offset: number }>(
+      `/admin/users?search=${encodeURIComponent(search)}&limit=${limit}&offset=${offset}`,
+      { activity },
+    ),
+  user: (id: string, activity: RequestActivityMode = 'foreground') =>
+    api<ApiUser>(`/admin/users/${encodeURIComponent(id)}`, { activity }),
+  /** Successful sign-in audit trail for one user (newest first). */
+  userLoginHistory: (id: string, limit = 50, offset = 0) =>
+    api<ApiAdminLoginHistoryPage>(
+      `/admin/users/${encodeURIComponent(id)}/login-history?limit=${limit}&offset=${offset}`,
+    ),
+  reorderUsers: (ids: string[]) =>
+    api<{ ok: true }>('/admin/users/reorder', { method: 'PATCH', body: { ids } }),
+  createUser: (body: { email: string; name: string; password: string; role: 'user' | 'admin' }) =>
+    api<ApiUser>('/admin/users', { method: 'POST', body }),
+  setUserPassword: (id: string, new_password: string) =>
+    api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/password`, { method: 'POST', body: { new_password } }),
+  /** Change a user's login email (admin-only; the server normalizes it). */
+  setUserEmail: (id: string, email: string) =>
+    api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/email`, {
+      method: 'POST',
+      body: { email },
+    }),
+  setUserRole: (id: string, role: 'user' | 'admin') =>
+    api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/role`, { method: 'POST', body: { role } }),
+  banUser: (id: string) => api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/ban`, { method: 'POST' }),
+  unbanUser: (id: string) => api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/unban`, { method: 'POST' }),
+  /** Permanently delete a user and all their data (§ admin → users). */
+  deleteUser: (id: string) =>
+    api<{ ok: true; status?: string }>(`/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Background deletion jobs (§async user delete) — poll while a purge runs. */
+  userDeletions: (activity: RequestActivityMode = 'foreground') =>
+    api<{ jobs: Array<{ user_id: string; email: string; status: string; progress: string; error?: string }> }>(
+      '/admin/users/deletions',
+      { activity },
+    ),
+  /** Reset (turn off) a user's 2FA — recovery for a lost authenticator (§ 2FA). */
+  disableUser2fa: (id: string) =>
+    api<{ ok: true }>(`/admin/users/${encodeURIComponent(id)}/2fa/disable`, { method: 'POST' }),
+  // §8.1 abuse-triage drill-down. Returns one user's conversations (all
+  // statuses — admin can still inspect archived/banned content) and the
+  // full message timeline of any single conversation, both bypassing the
+  // per-user ownership filter on the server side.
+  userConversations: (id: string) =>
+    api<ApiConversation[]>(`/admin/users/${encodeURIComponent(id)}/conversations`),
+  userProjects: (id: string) =>
+    api<ApiProject[]>(`/admin/users/${encodeURIComponent(id)}/projects`),
+  // §4.20 a user's generated-image gallery (admin drill-down).
+  userImages: (
+    id: string,
+    limit = envNum('VITE_AIVORY_ADMIN_API_USER_IMAGES_LIMIT', 60),
+    offset = 0,
+  ) => api<ApiAdminImage[]>(`/admin/users/${encodeURIComponent(id)}/images?limit=${limit}&offset=${offset}`),
+  userKbs: (id: string) =>
+    api<ApiAdminKnowledgeBase[]>(`/admin/users/${encodeURIComponent(id)}/kbs`),
+  adminKnowledgeBases: (
+    params: { search?: string; user?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.search) qs.set('search', params.search)
+    if (params.user) qs.set('user', params.user)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<ApiAdminResourcePage<ApiAdminKnowledgeBaseResource>>(
+      `/admin/resources/knowledge-bases${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  adminKnowledgeBase: (id: string) =>
+    api<{ item: ApiAdminKnowledgeBaseResourceDetail }>(
+      `/admin/resources/knowledge-bases/${encodeURIComponent(id)}`,
+    ),
+  adminProjects: (
+    params: { search?: string; user?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.search) qs.set('search', params.search)
+    if (params.user) qs.set('user', params.user)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<ApiAdminResourcePage<ApiAdminProjectResource>>(
+      `/admin/resources/projects${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  adminProject: (id: string) =>
+    api<{ item: ApiAdminProjectResourceDetail }>(
+      `/admin/resources/projects/${encodeURIComponent(id)}`,
+    ),
+  adminProjectConversations: (id: string, limit = 50, offset = 0) => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+    return api<ApiAdminResourcePage<ApiAdminProjectConversation>>(
+      `/admin/resources/projects/${encodeURIComponent(id)}/conversations?${qs}`,
+    )
+  },
+  adminGeneratedImages: (
+    params: { user?: string; model_id?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.user) qs.set('user', params.user)
+    if (params.model_id) qs.set('model_id', params.model_id)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<ApiAdminGeneratedImagePage>(
+      `/admin/resources/images${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  adminGeneratedImage: (id: string) =>
+    api<ApiAdminGeneratedImageResource>(`/admin/resources/images/${encodeURIComponent(id)}`),
+  /** Read-only long-term memory inventory for one user (admin drill-down). */
+  userMemories: (id: string) =>
+    api<ApiMemory[]>(`/admin/users/${encodeURIComponent(id)}/memories`),
+  kbDocuments: (kbId: string) =>
+    api<ApiDocument[]>(`/admin/kbs/${encodeURIComponent(kbId)}/documents`),
+  conversation: (id: string) =>
+    api<ApiConversation>(`/admin/conversations/${encodeURIComponent(id)}`),
+  conversationMessages: (id: string, mode?: 'tree') =>
+    api<ApiMessage[]>(
+      `/admin/conversations/${encodeURIComponent(id)}/messages${mode ? `?mode=${mode}` : ''}`,
+    ),
+  deleteConversation: (id: string) =>
+    api<{ ok: true }>(`/admin/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // Sandbox inspector (§ admin tools): list / preview / clear a conversation's
+  // sandbox workspace files.
+  sandboxFiles: (id: string) =>
+    api<{ session: string; files: { path: string; size: number }[] }>(
+      `/admin/conversations/${encodeURIComponent(id)}/sandbox`,
+    ),
+  sandboxFileUrl: (id: string, path: string) =>
+    apiUrl(`/admin/conversations/${encodeURIComponent(id)}/sandbox/file?path=${encodeURIComponent(path)}`),
+  clearSandbox: (id: string) =>
+    api<{ ok: true }>(`/admin/conversations/${encodeURIComponent(id)}/sandbox`, { method: 'DELETE' }),
+
+  // Per-record usage list (one row per API call), filtered + paginated.
+  usage: (params: { days?: number; user?: string; model?: string; status?: string; purpose?: string; page?: number; pageSize?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.days) qs.set('days', String(params.days))
+    if (params.user) qs.set('user', params.user)
+    if (params.model) qs.set('model', params.model)
+    if (params.status) qs.set('status', params.status)
+    if (params.purpose) qs.set('purpose', params.purpose)
+    if (params.page) qs.set('page', String(params.page))
+    if (params.pageSize) qs.set('page_size', String(params.pageSize))
+    return api<{ records: ApiUsageRecord[]; total: number; total_cost: number; page: number; page_size: number }>(
+      `/admin/usage${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  deleteUsageRecord: (id: number) => api<{ ok: true }>(`/admin/usage/${id}`, { method: 'DELETE' }),
+  deleteUsageFiltered: (params: { days?: number; user?: string; model?: string; status?: string; purpose?: string }) => {
+    const qs = new URLSearchParams()
+    if (params.days) qs.set('days', String(params.days))
+    if (params.user) qs.set('user', params.user)
+    if (params.model) qs.set('model', params.model)
+    if (params.status) qs.set('status', params.status)
+    if (params.purpose) qs.set('purpose', params.purpose)
+    return api<{ deleted: number }>(`/admin/usage${qs.toString() ? `?${qs}` : ''}`, { method: 'DELETE' })
+  },
+  files: (params: { search?: string; userId?: string; user?: string; origin?: string; type?: string; sort?: string; order?: string; limit?: number; offset?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.search) qs.set('search', params.search)
+    if (params.userId) qs.set('user_id', params.userId)
+    if (params.user) qs.set('user', params.user)
+    if (params.origin && params.origin !== 'all') qs.set('origin', params.origin)
+    if (params.type && params.type !== 'all') qs.set('type', params.type)
+    if (params.sort) qs.set('sort', params.sort)
+    if (params.order) qs.set('order', params.order)
+    if (params.limit) qs.set('limit', String(params.limit))
+    if (params.offset) qs.set('offset', String(params.offset))
+    return api<{ files: ApiAdminFile[]; total: number; limit: number; offset: number }>(
+      `/admin/files${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  deleteFiles: (items: Array<{ source: 'file' | 'document'; id: string }>) =>
+    api<{ deleted: number }>('/admin/files/delete', { method: 'POST', body: { items } }),
+  // Raw bytes for the preview dialog. The object URL created by the caller
+  // cannot carry an auth header, so the authenticated fetch happens first.
+  fileContentBlob: (source: 'file' | 'document', id: string, signal?: AbortSignal): Promise<Blob> =>
+    withRequestActivity(async () => {
+      assertNetworkOnline()
+      const token = getAccessToken()
+      const res = await fetch(apiUrl(`/admin/files/content?source=${source}&id=${encodeURIComponent(id)}`), {
+        credentials: 'include',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        signal,
+      })
+      if (!res.ok) throw new ApiError(res.status, `preview failed (${res.status})`, null)
+      return res.blob()
+    }),
+  analytics: (params: AdminAnalyticsParams = {}) => {
+    const qs = new URLSearchParams()
+    qs.set('days', String(params.days ?? envNum('VITE_AIVORY_ADMIN_API_ANALYTICS', 30)))
+    if (params.user) qs.set('user', params.user)
+    if (params.model) qs.set('model', params.model)
+    if (params.workspace) qs.set('workspace', params.workspace)
+    if (params.purpose) qs.set('purpose', params.purpose)
+    if (params.channel) qs.set('channel', params.channel)
+    return api<ApiAnalytics>(`/admin/analytics?${qs}`)
+  },
+  messageFeedback: (
+    params: {
+      days?: number
+      rating?: '' | 'like' | 'dislike'
+      modelId?: string
+      reason?: FeedbackReason
+      limit?: number
+      offset?: number
+    } = {},
+  ) => {
+    const qs = new URLSearchParams()
+    if (params.days) qs.set('days', String(params.days))
+    if (params.rating) qs.set('rating', params.rating)
+    if (params.modelId) qs.set('model_id', params.modelId)
+    if (params.reason) qs.set('reason', params.reason)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<ApiAdminMessageFeedbackPage>(
+      `/admin/message-feedback${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  userFeedback: (params: { q?: string; limit?: number; offset?: number } = {}) => {
+    const qs = new URLSearchParams()
+    if (params.q) qs.set('q', params.q)
+    if (params.limit !== undefined) qs.set('limit', String(params.limit))
+    if (params.offset !== undefined) qs.set('offset', String(params.offset))
+    return api<ApiAdminUserFeedbackPage>(
+      `/admin/user-feedback${qs.toString() ? `?${qs}` : ''}`,
+    )
+  },
+  userFeedbackScreenshotBlob: (id: string, signal?: AbortSignal): Promise<Blob> =>
+    withRequestActivity(async () => {
+      assertNetworkOnline()
+      const token = getAccessToken()
+      const res = await fetch(apiUrl(`/admin/user-feedback/${encodeURIComponent(id)}/screenshot`), {
+        credentials: 'include',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        signal,
+        cache: 'no-store',
+      })
+      if (!res.ok) throw new ApiError(res.status, `screenshot failed (${res.status})`, null)
+      return res.blob()
+    }),
+
+  settings: () => api<Record<string, unknown>>('/admin/settings'),
+  updateSettings: (patch: Record<string, unknown>) =>
+    api<Record<string, unknown>>('/admin/settings', { method: 'PATCH', body: patch }),
+  testEmail: (email: string) =>
+    api<{ ok: true }>('/admin/settings/email/test', { method: 'POST', body: { email } }),
+
+  // Icon upload — returns { url, filename } where `url` is a path the model's
+  // icon column can store directly (e.g. "/api/icons/abc123.png"). Backend
+  // enforces a 256 KiB cap, png/jpg/jpeg only, header sniff + structural
+  // decode to reject polyglots — see admin_uploads.go.
+  uploadIcon: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api<{ url: string; filename: string }>('/admin/icons', { method: 'POST', body: fd })
+  },
+
+  // Database backup / migration (§ admin → data migration). Export streams a
+  // .zip the browser saves; import uploads one and REPLACES all data. The blob
+  // path can't use the JSON `api()` helper, so it hand-rolls the fetch (still
+  // sending the cookie + Bearer the rest of the client uses).
+  backupExport: (includeFiles: boolean): Promise<Blob> =>
+    withRequestActivity(async () => {
+      assertNetworkOnline()
+      const token = getAccessToken()
+      const res = await fetch(apiUrl(`/admin/backup/export${includeFiles ? '?files=1' : ''}`), {
+        credentials: 'include',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) {
+        let msg = `export failed (${res.status})`
+        try {
+          const j = (await res.json()) as { error?: string }
+          if (j?.error) msg = j.error
+        } catch {
+          /* non-JSON error body */
+        }
+        throw new ApiError(res.status, msg, null)
+      }
+      return res.blob()
+    }),
+  backupExportStart: (includeFiles: boolean) =>
+    api<BackupExportState>('/admin/backup/export-jobs', {
+      method: 'POST',
+      body: { include_files: includeFiles },
+    }),
+  backupExportState: (activity: RequestActivityMode = 'foreground') =>
+    api<BackupExportState>('/admin/backup/export-jobs', { activity }),
+  backupArchiveDownload: (name: string): Promise<Blob> =>
+    withRequestActivity(async () => {
+      assertNetworkOnline()
+      const token = getAccessToken()
+      const res = await fetch(apiUrl(`/admin/backup/archives/${encodeURIComponent(name)}`), {
+        credentials: 'include',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) {
+        let msg = `download failed (${res.status})`
+        try {
+          const j = (await res.json()) as { error?: string }
+          if (j?.error) msg = j.error
+        } catch {
+          /* non-JSON error body */
+        }
+        throw new ApiError(res.status, msg, null)
+      }
+      return res.blob()
+    }),
+  backupArchiveDelete: (name: string) =>
+    api<{ deleted: string }>(`/admin/backup/archives/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  backupImport: (file: File) => {
+    const fd = new FormData()
+    fd.append('confirm', 'REPLACE')
+    fd.append('file', file)
+    return api<BackupImportResult>('/admin/backup/import', { method: 'POST', body: fd })
+  },
+
+  // Configuration backup / migration. This is lighter than the full backup:
+  // it exports admin configuration tables (settings, channels, models, skills,
+  // OAuth providers, groups, image styles) plus admin assets, and imports by
+  // upsert, leaving users, conversations, user uploads, KBs, sessions,
+  // workspaces, and logs untouched.
+  configExport: (): Promise<Blob> =>
+    withRequestActivity(async () => {
+      assertNetworkOnline()
+      const token = getAccessToken()
+      const res = await fetch(apiUrl('/admin/config/export'), {
+        credentials: 'include',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      })
+      if (!res.ok) {
+        let msg = `export failed (${res.status})`
+        try {
+          const j = (await res.json()) as { error?: string }
+          if (j?.error) msg = j.error
+        } catch {
+          /* non-JSON error body */
+        }
+        throw new ApiError(res.status, msg, null)
+      }
+      return res.blob()
+    }),
+  configImport: (file: File) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api<ConfigImportResult>('/admin/config/import', { method: 'POST', body: fd })
+  },
+
+  // Vector index maintenance. Checks DB chunks against Qdrant and can rebuild
+  // missing/empty vectors asynchronously.
+  vectorMaintenanceState: (activity: RequestActivityMode = 'foreground') =>
+    api<VectorMaintenanceState>('/admin/vectors/jobs', { activity }),
+  vectorCheckStart: () => api<VectorMaintenanceState>('/admin/vectors/check', { method: 'POST' }),
+  vectorRebuildMissingStart: () =>
+    api<VectorMaintenanceState>('/admin/vectors/rebuild-missing', { method: 'POST' }),
+}
+
+/** Result of a successful database import (§ admin → data migration). */
+export interface BackupImportResult {
+  ok: true
+  /** Row count restored per table. */
+  tables: Record<string, number>
+  files_restored: number
+  includes_files: boolean
+  qdrant_restored?: number
+  qdrant_error?: string
+  /** The admin's session was invalidated by the restore — re-login required. */
+  relogin_required: boolean
+}
+
+/** Async Docker/full backup export state. */
+export interface BackupExportJob {
+  id: string
+  status: 'running' | 'completed' | 'failed'
+  progress: string
+  filename?: string
+  error?: string
+  started_at: number
+  completed_at?: number
+  size_bytes?: number
+  include_files: boolean
+  include_qdrant: boolean
+  qdrant_points?: number
+}
+
+export interface BackupArchiveFile {
+  name: string
+  size_bytes: number
+  created_at: number
+}
+
+export interface BackupExportState {
+  running: BackupExportJob | null
+  jobs: BackupExportJob[]
+  archives: BackupArchiveFile[]
+}
+
+export interface VectorIssue {
+  chunk_id: string
+  document_id: string
+  kb_id?: string
+  conversation_id?: string
+  filename: string
+  embedding_model: string
+  dim?: number
+  reason: string
+}
+
+export interface VectorAuditModel {
+  embedding_model: string
+  dim: number
+  total: number
+  present: number
+  missing: number
+  empty: number
+  skipped: number
+}
+
+export interface VectorAuditReport {
+  total: number
+  present: number
+  missing: number
+  empty: number
+  skipped: number
+  models: VectorAuditModel[]
+  issues: VectorIssue[]
+}
+
+export interface VectorMaintenanceJob {
+  id: string
+  type: 'check' | 'rebuild'
+  status: 'running' | 'completed' | 'failed'
+  progress: string
+  error?: string
+  started_at: number
+  completed_at?: number
+  report?: VectorAuditReport
+  rebuilt?: number
+  failed?: number
+}
+
+export interface VectorMaintenanceState {
+  running: VectorMaintenanceJob | null
+  jobs: VectorMaintenanceJob[]
+}
+
+/** Result of a successful configuration import (§ admin → configuration migration). */
+export interface ConfigImportResult {
+  ok: true
+  /** Row count merged per config table. */
+  tables: Record<string, number>
+  /** Admin-managed icon / skill-asset files restored from the archive. */
+  assets_restored: number
+  merge_mode: 'upsert' | 'settings'
+  relogin_required: false
+}

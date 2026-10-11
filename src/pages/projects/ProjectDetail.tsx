@@ -1,0 +1,1340 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import {
+  Lock,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  PinOff,
+  Plus,
+  Sparkles,
+  Unlock,
+  Trash2,
+  Save,
+  Upload,
+  X,
+} from 'lucide-react'
+import type { Attachment, Conversation } from '@/types/chat'
+import type { ProjectAccent } from '@/types/project'
+import type { ToolMode } from '@/lib/tool-mode'
+import { useProjects } from '@/store/projects'
+import { useConversations, sameConvListShape } from '@/store/conversations'
+import { useModels } from '@/store/models'
+import { useAuth } from '@/store/auth'
+import { useSettings } from '@/store/settings'
+import { useWorkspaces } from '@/store/workspaces'
+import { accentClasses, fileKindIcon, formatFileSize, PROJECT_ACCENT_OPTIONS } from '@/lib/project-helpers'
+import { Composer } from '@/components/chat/composer'
+import { ContentHeader } from '@/components/layout/content-header'
+import { MoveToProjectSub } from '@/components/projects/move-to-project-menu'
+import { Button } from '@/components/ui/button'
+import { ProgressRing } from '@/components/ui/progress-ring'
+import { Textarea } from '@/components/ui/textarea'
+import { Input } from '@/components/ui/input'
+import { Field } from '@/components/ui/label'
+import { Tooltip } from '@/components/ui/tooltip'
+import { Switch } from '@/components/ui/switch'
+import { EmptyState } from '@/components/ui/empty-state'
+import { Skeleton } from '@/components/ui/skeleton'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { toast } from '@/hooks/use-toast'
+import { cn, formatRelativeDate, truncate } from '@/lib/utils'
+import { persistUserSettings } from '@/lib/user-settings'
+import {
+  clearPendingConversation,
+  pendingConversationKey,
+  readPendingConversation,
+  writePendingConversation,
+} from '@/lib/pending-conversation'
+import { conversationsApi } from '@/api/endpoints'
+import type { ApiConversation } from '@/api/types'
+import { resolveNewConversationFastMode } from '@/lib/chat-defaults'
+import { userCan } from '@/lib/user-permissions'
+import { subscribeAccessInvalidation } from '@/lib/access-events'
+
+type ProjectUploadHandlers = {
+  onFileStart: (file: File) => void
+  onProgress: (file: File, percent: number) => void
+  onProcessing: (file: File) => void
+  signal: AbortSignal
+}
+
+export default function ProjectDetail() {
+  const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+  const { t } = useTranslation(['projects', 'chat', 'common', 'kb'])
+  const user = useAuth((s) => s.user)
+  const canUseKnowledgeBases = userCan(user, 'allow_knowledge_bases')
+  const canUseKnowledgeBasesRef = useRef(canUseKnowledgeBases)
+  canUseKnowledgeBasesRef.current = canUseKnowledgeBases
+
+  const project = useProjects((s) => s.projects.find((p) => p.id === id))
+  const loadOne = useProjects((s) => s.loadOne)
+  const updateProject = useProjects((s) => s.updateProject)
+  const renameProject = useProjects((s) => s.renameProject)
+  const togglePin = useProjects((s) => s.togglePin)
+  const deleteProject = useProjects((s) => s.deleteProject)
+  const setProjectVisibility = useProjects((s) => s.setVisibility)
+  const uploadFile = useProjects((s) => s.uploadFile)
+  const removeFile = useProjects((s) => s.removeFile)
+  const renameFile = useProjects((s) => s.renameFile)
+  const [resolvingProject, setResolvingProject] = useState(
+    () => Boolean(id && !useProjects.getState().getProject(id)),
+  )
+
+  // Project documents come from the project's knowledge library and are only
+  // returned by GET /projects/:id — hydrate them whenever the id changes so the
+  // file list (and count) is correct on a fresh load.
+  useEffect(() => {
+    if (!id) {
+      setResolvingProject(false)
+      return
+    }
+    let current = true
+    if (!useProjects.getState().getProject(id)) setResolvingProject(true)
+    void loadOne(id).finally(() => {
+      if (current) setResolvingProject(false)
+    })
+    return () => {
+      current = false
+    }
+  }, [canUseKnowledgeBases, id, loadOne])
+
+  // Summary-only subscription so a streaming conversation's per-token updates
+  // don't re-render this page (same fix as sidebar/command-menu).
+  const allConversations = useConversations((s) => s.conversations, sameConvListShape)
+  const loadProjectConversations = useConversations((s) => s.loadProjectConversations)
+  const createConversation = useConversations((s) => s.createConversation)
+  const adoptConversation = useConversations((s) => s.adoptConversation)
+  const defaultModelId = useModels((s) => s.defaultId)
+  const fastAvailable = useModels((s) => s.fastAvailable)
+  const userId = user?.id
+  const workspaceId = useWorkspaces((s) => s.activeId ?? undefined)
+  const setGlobalDefaultModel = useModels((s) => s.setDefaultId)
+  const [projectComposerModelId, setProjectComposerModelId] = useState('')
+  const [pickedFast, setPickedFast] = useState<boolean | null>(null)
+  const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<string[]>([])
+  const [loadingProjectChats, setLoadingProjectChats] = useState(Boolean(id))
+  const effectiveProjectModelId = projectComposerModelId || defaultModelId
+  const projectFast =
+    pickedFast ?? resolveNewConversationFastMode(user?.settings, fastAvailable)
+
+  useEffect(() => {
+    if (!id) {
+      setLoadingProjectChats(false)
+      return
+    }
+    let current = true
+    setLoadingProjectChats(true)
+    void loadProjectConversations(id).finally(() => {
+      if (current) setLoadingProjectChats(false)
+    })
+    return () => {
+      current = false
+    }
+  }, [id, loadProjectConversations])
+
+  const projectChats = useMemo<Conversation[]>(
+    () =>
+      project
+        ? allConversations
+            .filter((c) => c.projectId === project.id && !c.archived)
+            .slice()
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+        : [],
+    [allConversations, project],
+  )
+
+  const [editingInstructions, setEditingInstructions] = useState(false)
+  const [instructionsDraft, setInstructionsDraft] = useState('')
+  const [savingInstructions, setSavingInstructions] = useState(false)
+
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [renameDraft, setRenameDraft] = useState('')
+  const [editOpen, setEditOpen] = useState(false)
+  const [editDraft, setEditDraft] = useState<{
+    name: string
+    description: string
+    accent: ProjectAccent
+    emoji: string
+    autoAddUploads: boolean
+  }>({ name: '', description: '', accent: 'violet', emoji: '', autoAddUploads: false })
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const deletingRef = useRef(false)
+  const [deleting, setDeleting] = useState(false)
+  const [addFileOpen, setAddFileOpen] = useState(false)
+  const [renameFileState, setRenameFileState] = useState<{ id: string; draft: string } | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const [savingDetails, setSavingDetails] = useState(false)
+  const [fileMutationID, setFileMutationID] = useState<string | null>(null)
+  const pendingConvRef = useRef<ApiConversation | null>(null)
+  const pendingCreateRef = useRef<Promise<string | undefined> | null>(null)
+  const pendingConsumedRef = useRef(false)
+  // Set when the composer drains its last attachment while the lazy create is
+  // still in flight — the create then discards its own conversation on landing
+  // ("Untitled ghost" fix, same as ChatHome).
+  const draftAbandonedRef = useRef(false)
+  const activeProjectIdRef = useRef<string | undefined>(project?.id)
+  activeProjectIdRef.current = project?.id
+  const pendingStorageKey = useMemo(
+    () => pendingConversationKey(userId, `project:${project?.id || id || 'unknown'}`, workspaceId),
+    [id, project?.id, userId, workspaceId],
+  )
+  const [pendingConversationId, setPendingConversationId] = useState<string | undefined>(() =>
+    readPendingConversation(pendingStorageKey),
+  )
+  const pendingStorageKeyRef = useRef(pendingStorageKey)
+  pendingStorageKeyRef.current = pendingStorageKey
+
+  const canUploadProjectFiles = canUseKnowledgeBases && project?.canUploadFiles === true
+  const canDeleteProjectContent = canUseKnowledgeBases && project?.canDeleteContent === true
+  const canDeleteProject = project?.canDelete === true
+  // §workspace RBAC: the project creator or a workspace admin may flip the
+  // private/shared scope; personal projects have no scope.
+  const workspaceRole = useWorkspaces((s) => (project?.workspaceId ? s.workspaces.find((w) => w.id === project.workspaceId)?.role : undefined))
+  const canChangeProjectVisibility = Boolean(
+    project?.workspaceId && (project.userId === userId || workspaceRole === 'admin'),
+  )
+  const [visibilityBusy, setVisibilityBusy] = useState(false)
+  async function toggleProjectVisibility() {
+    if (!project || visibilityBusy) return
+    setVisibilityBusy(true)
+    const ok = await setProjectVisibility(project.id, !project.isPublic)
+    setVisibilityBusy(false)
+    if (ok) {
+      toast.success(project.isPublic
+        ? t('projects:detail.visibilityPrivate', { defaultValue: 'Project is now private to you and workspace admins.' })
+        : t('projects:detail.visibilityShared', { defaultValue: 'Project is now shared with the workspace.' }))
+    }
+  }
+  const canUploadProjectFilesRef = useRef(canUploadProjectFiles)
+  canUploadProjectFilesRef.current = canUploadProjectFiles
+
+  useEffect(() => {
+    if (canUploadProjectFiles) return
+    setAddFileOpen(false)
+  }, [canUploadProjectFiles])
+
+  useEffect(() => {
+    if (canDeleteProjectContent) return
+    setRenameFileState(null)
+  }, [canDeleteProjectContent])
+
+  useEffect(() => {
+    if (canDeleteProject) return
+    setConfirmDelete(false)
+  }, [canDeleteProject])
+
+  useEffect(
+    () =>
+      subscribeAccessInvalidation((event) => {
+        if (!id || (event.kind !== 'account' && event.kind !== 'workspace' && event.kind !== 'knowledge-base')) return
+        // Remove stale mutation capabilities before the refetch resolves. This
+        // also unmounts AddFileDialog, whose cleanup aborts any active upload.
+        useProjects.setState((state) => ({
+          projects: state.projects.map((item) =>
+            item.id === id
+              ? { ...item, canUploadFiles: undefined, canDeleteContent: undefined, canDelete: undefined }
+              : item,
+          ),
+        }))
+        setAddFileOpen(false)
+        setRenameFileState(null)
+        setConfirmDelete(false)
+        void loadOne(id)
+      }),
+    [id, loadOne],
+  )
+
+  useEffect(() => {
+    if (canUseKnowledgeBases) return
+    draftAbandonedRef.current = true
+    setSelectedKnowledgeBaseIds([])
+    const pending = pendingConvRef.current
+    pendingConvRef.current = null
+    clearPendingConversation(pendingStorageKey)
+    setPendingConversationId(undefined)
+    if (pending) void conversationsApi.remove(pending.id).catch(() => {})
+  }, [canUseKnowledgeBases, pendingStorageKey])
+
+  useEffect(() => {
+    pendingConvRef.current = null
+    pendingCreateRef.current = null
+    pendingConsumedRef.current = false
+    setPendingConversationId(readPendingConversation(pendingStorageKey))
+    setProjectComposerModelId('')
+    setSelectedKnowledgeBaseIds([])
+  }, [pendingStorageKey])
+
+  // Project composers use the same durable draft handoff as the chat home.
+  // Refreshing keeps the hidden conversation and lets Composer restore its files.
+  useEffect(() => {
+    if (!project?.id || !canUseKnowledgeBases) return
+    const savedID = readPendingConversation(pendingStorageKey)
+    setPendingConversationId(savedID)
+    if (!savedID) return
+    let cancelled = false
+    const recovery = (async () => {
+      try {
+        const loaded = await conversationsApi.get(savedID, { limit: 1 })
+        if (loaded.messages.length > 0 || loaded.conversation.project_id !== project.id) {
+          clearPendingConversation(pendingStorageKey)
+          if (!cancelled) setPendingConversationId(undefined)
+          return undefined
+        }
+        if (cancelled) return savedID
+        pendingConvRef.current = loaded.conversation
+        setPendingConversationId(savedID)
+        return savedID
+      } catch {
+        clearPendingConversation(pendingStorageKey)
+        if (!cancelled) setPendingConversationId(undefined)
+        return undefined
+      }
+    })()
+    pendingCreateRef.current = recovery
+    void recovery.finally(() => {
+      if (pendingCreateRef.current === recovery) pendingCreateRef.current = null
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [canUseKnowledgeBases, pendingStorageKey, project?.id])
+
+  function ensureProjectConversation(): Promise<string | undefined> {
+    if (!project || !canUseKnowledgeBasesRef.current) return Promise.resolve(undefined)
+    // A fresh attach revives an abandoned draft scope (see discardDraftConversation).
+    draftAbandonedRef.current = false
+    if (pendingConvRef.current) return Promise.resolve(pendingConvRef.current.id)
+    if (!pendingCreateRef.current) {
+      const projectId = project.id
+      const storageKey = pendingStorageKey
+      const creation = (async () => {
+        try {
+          const created = await conversationsApi.create({
+            model_id: effectiveProjectModelId || undefined,
+            project_id: projectId,
+            workspace_id: workspaceId,
+            fast: projectFast,
+          })
+          if (
+            pendingConsumedRef.current ||
+            draftAbandonedRef.current ||
+            !canUseKnowledgeBasesRef.current ||
+            activeProjectIdRef.current !== projectId ||
+            pendingStorageKeyRef.current !== storageKey
+          ) {
+            void conversationsApi.remove(created.id).catch(() => {})
+            return undefined
+          }
+          writePendingConversation(storageKey, created.id)
+          pendingConvRef.current = created
+          setPendingConversationId(created.id)
+          return created.id
+        } catch {
+          return undefined
+        }
+      })()
+      pendingCreateRef.current = creation
+      void creation.finally(() => {
+        if (pendingCreateRef.current === creation) pendingCreateRef.current = null
+      })
+    }
+    return pendingCreateRef.current
+  }
+
+  // Same "Untitled ghost" cleanup as ChatHome: the last attachment left the
+  // composer, so the upload-scoped draft conversation has no reason to exist.
+  function discardDraftConversation() {
+    if (pendingConsumedRef.current) return
+    draftAbandonedRef.current = true
+    const pending = pendingConvRef.current
+    pendingConvRef.current = null
+    clearPendingConversation(pendingStorageKey)
+    setPendingConversationId(undefined)
+    if (pending) void conversationsApi.remove(pending.id).catch(() => {})
+  }
+
+  if (!project && resolvingProject) {
+    return <ProjectDetailSkeleton label={t('common:common.loading')} />
+  }
+
+  if (!project) {
+    return (
+      <div className="flex-1 grid place-items-center">
+        <EmptyState
+          title={t('projects:detail.notFoundTitle')}
+          description={t('projects:detail.notFoundBody')}
+          action={<Button onClick={() => navigate('/projects')}>{t('projects:detail.goToProjects')}</Button>}
+        />
+      </div>
+    )
+  }
+
+  function startInstructionsEdit() {
+    if (!project) return
+    setInstructionsDraft(project.instructions)
+    setEditingInstructions(true)
+  }
+  async function saveInstructions() {
+    if (!project) return
+    setSavingInstructions(true)
+    try {
+      const saved = await updateProject(project.id, { instructions: instructionsDraft })
+      if (saved) {
+        setEditingInstructions(false)
+        toast.success(t('projects:detail.instructionsSaved'))
+      }
+    } finally {
+      setSavingInstructions(false)
+    }
+  }
+
+  function openRename() {
+    if (!project) return
+    setRenameDraft(project.name)
+    setRenameOpen(true)
+  }
+  async function submitRename() {
+    if (!project || renaming || !renameDraft.trim()) return
+    setRenaming(true)
+    try {
+      if (await renameProject(project.id, renameDraft)) {
+        setRenameOpen(false)
+        toast.success(t('projects:detail.renamed'))
+      }
+    } finally {
+      setRenaming(false)
+    }
+  }
+
+  function openEdit() {
+    if (!project) return
+    setEditDraft({
+      name: project.name,
+      description: project.description ?? '',
+      accent: project.accent,
+      emoji: project.emoji ?? '',
+      autoAddUploads: project.autoAddUploads ?? false,
+    })
+    setEditOpen(true)
+  }
+  async function submitEdit() {
+    if (!project || savingDetails) return
+    // Send empty strings (not undefined) so clearing the description/marker is
+    // actually transmitted — JSON.stringify drops undefined fields, which would
+    // silently keep the old value on the backend.
+    const patch: Parameters<typeof updateProject>[1] = {
+      name: editDraft.name.trim() || project.name,
+      description: editDraft.description.trim(),
+      accent: editDraft.accent,
+      emoji: editDraft.emoji.trim().slice(0, 2),
+    }
+    if (canUploadProjectFiles) {
+      patch.autoAddUploads = editDraft.autoAddUploads
+    }
+    setSavingDetails(true)
+    try {
+      if (await updateProject(project.id, patch)) {
+        setEditOpen(false)
+        toast.success(t('projects:detail.edited'))
+      }
+    } finally {
+      setSavingDetails(false)
+    }
+  }
+
+  async function submitDelete() {
+    if (!project || !canDeleteProject) return
+    if (deletingRef.current) return
+    deletingRef.current = true
+    setDeleting(true)
+    try {
+      if (!(await deleteProject(project.id))) return
+      // The backend atomically detaches conversations while deleting. Mirror
+      // that committed result locally without issuing pre-delete mutations.
+      useConversations.setState((state) => ({
+        conversations: state.conversations.map((conversation) =>
+          conversation.projectId === project.id
+            ? { ...conversation, projectId: undefined }
+            : conversation,
+        ),
+      }))
+      setConfirmDelete(false)
+      toast.success(t('projects:detail.deleted'))
+      navigate('/projects')
+    } finally {
+      deletingRef.current = false
+      setDeleting(false)
+    }
+  }
+
+  async function startProjectChat(
+    text: string,
+    attachments: Attachment[],
+    opts: {
+      mode?: 'default' | 'deep-research' | 'canvas'
+      params?: Record<string, unknown>
+      verify?: boolean
+      toolMode: ToolMode
+      webSearch?: boolean
+      selectedUserSkillIds?: string[]
+      selectedToolIds?: string[]
+      fast?: boolean
+    },
+  ) {
+    if (!project || !canUseKnowledgeBasesRef.current) {
+      toast.error(t('kb:groupPermissionRequired'))
+      return
+    }
+    if (!pendingConvRef.current && pendingCreateRef.current) {
+      await pendingCreateRef.current
+    }
+    if (!canUseKnowledgeBasesRef.current) {
+      toast.error(t('kb:groupPermissionRequired'))
+      return
+    }
+    pendingConsumedRef.current = true
+    const pending = pendingConvRef.current
+    pendingConvRef.current = null
+    setPendingConversationId(undefined)
+    clearPendingConversation(pendingStorageKey)
+    const conv = pending
+      ? adoptConversation(pending)
+      : await createConversation(effectiveProjectModelId, project.id, opts.fast === true)
+    if (!conv) {
+      pendingConsumedRef.current = false
+      return
+    }
+    if (!opts.fast && effectiveProjectModelId && conv.modelId !== effectiveProjectModelId) {
+      void useConversations.getState().setModel(conv.id, effectiveProjectModelId)
+    }
+    void useConversations.getState().setKBs(conv.id, selectedKnowledgeBaseIds)
+    navigate(`/chat/${conv.id}`)
+    void useConversations.getState().sendMessage({
+      conversationId: conv.id,
+      text,
+      modelId: effectiveProjectModelId,
+      attachments,
+      mode: opts.mode,
+      params: opts.params,
+      verify: opts.verify,
+      toolMode: opts.toolMode,
+      webSearch: opts.webSearch,
+      selectedUserSkillIds: opts.selectedUserSkillIds,
+      selectedToolIds: opts.selectedToolIds,
+      fast: opts.fast,
+    })
+  }
+
+  return (
+    <div className="flex-1 min-h-0 flex flex-col bg-[var(--color-bg)] text-[var(--color-fg)]">
+      <ContentHeader
+        title={project.name}
+        backTo="/projects"
+        backLabel={t('projects:detail.back')}
+        actions={
+          <DropdownMenu>
+            <Tooltip content={t('chat:actions.more')}>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={t('chat:actions.more')}
+                  className="inline-flex size-9 items-center justify-center rounded-[10px] text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg)] interactive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] max-lg:size-[var(--tap-min)]"
+                >
+                  <MoreHorizontal size={15} aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+            </Tooltip>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={openRename}>
+                <Pencil size={13} aria-hidden />
+                {t('projects:detail.menu.rename')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={openEdit}>
+                <Sparkles size={13} aria-hidden />
+                {t('projects:detail.menu.edit')}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => togglePin(project.id)}>
+                {project.pinned ? <PinOff size={13} aria-hidden /> : <Pin size={13} aria-hidden />}
+                {project.pinned ? t('projects:detail.menu.unpin') : t('projects:detail.menu.pin')}
+              </DropdownMenuItem>
+              {canChangeProjectVisibility ? (
+                <DropdownMenuItem
+                  disabled={visibilityBusy}
+                  onSelect={() => void toggleProjectVisibility()}
+                >
+                  {project.isPublic ? <Lock size={13} aria-hidden /> : <Unlock size={13} aria-hidden />}
+                  {project.isPublic
+                    ? t('projects:detail.menu.makePrivate', { defaultValue: 'Make private' })
+                    : t('projects:detail.menu.makeShared', { defaultValue: 'Share with workspace' })}
+                </DropdownMenuItem>
+              ) : null}
+              {canDeleteProject ? (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem destructive onSelect={() => setConfirmDelete(true)}>
+                    <Trash2 size={13} aria-hidden />
+                    {t('projects:detail.menu.delete')}
+                  </DropdownMenuItem>
+                </>
+              ) : null}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        }
+      />
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[var(--layout-content-max-w)] px-5 sm:px-8 py-8 pb-24">
+          {/* Project description and metadata. The name itself lives in the
+              header above, so it is not repeated. */}
+          <div className="min-w-0">
+            {project.description ? (
+              <p className="max-w-[60ch] text-[15px] leading-relaxed text-[var(--color-fg-muted)] sm:text-[17px]">
+                {project.description}
+              </p>
+            ) : null}
+            <dl className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11.5px] text-[var(--color-fg-subtle)] tabular-nums">
+              {canUseKnowledgeBases ? (
+                <Meta>{t('projects:card.files', { count: project.files.length })}</Meta>
+              ) : null}
+              <Meta>{t('projects:card.chats', { count: projectChats.length })}</Meta>
+              <Meta>{t('projects:card.updated', { when: formatRelativeDate(project.updatedAt) })}</Meta>
+              {project.pinned ? (
+                <Meta>
+                  <Pin size={10} className="inline -translate-y-px mr-1" aria-hidden />
+                  {t('projects:list.filterPinned')}
+                </Meta>
+              ) : null}
+            </dl>
+          </div>
+
+          {/* Composer. Centered, with a small inline label so the project
+              context is unmistakable. */}
+          {canUseKnowledgeBases ? (
+            <section className="mt-12 sm:mt-16">
+              <div className="mx-auto max-w-[44rem]">
+                <p className="mb-3 text-[12px] text-[var(--color-fg-subtle)]">
+                  {t('projects:detail.newChat')}
+                </p>
+                <Composer
+                  modelId={effectiveProjectModelId}
+                  fast={projectFast}
+                  onFastChange={setPickedFast}
+                  onModelChange={(modelId) => {
+                    setProjectComposerModelId(modelId)
+                    useSettings.getState().setModels({ defaultModelId: modelId })
+                    setGlobalDefaultModel(modelId)
+                    void persistUserSettings({ default_model_id: modelId }).catch(() => {})
+                  }}
+                  onSubmit={(text, atts, opts) => void startProjectChat(text, atts, opts)}
+                  conversationId={pendingConversationId}
+                  kbIds={selectedKnowledgeBaseIds}
+                  projectKBId={project.kbId}
+                  onKBChange={setSelectedKnowledgeBaseIds}
+                  ensureConversationId={ensureProjectConversation}
+                  onAttachmentsDrained={discardDraftConversation}
+                />
+              </div>
+            </section>
+          ) : (
+            <section className="mt-12 border-y border-[var(--color-divider)] py-8 sm:mt-16">
+              <div className="mx-auto max-w-[44rem]">
+                <h2 className="text-[15px] font-medium text-[var(--color-fg)]">
+                  {t('kb:groupPermissionTitle')}
+                </h2>
+                <p className="mt-1.5 text-[13px] leading-relaxed text-[var(--color-fg-muted)]">
+                  {t('kb:groupPermissionRequired')}
+                </p>
+              </div>
+            </section>
+          )}
+
+          {/* Instructions, files, and chats are separate full-width bands. This
+              keeps the reading order stable at every viewport width. */}
+          <section className="mt-14 border-t border-[var(--color-divider)] pt-8 sm:mt-16 sm:pt-10">
+            <SectionHeader
+              title={t('projects:detail.instructionsSection')}
+              action={
+                !editingInstructions && project.instructions ? (
+                  <button
+                    type="button"
+                    onClick={startInstructionsEdit}
+                    className="inline-flex min-h-8 items-center gap-1.5 rounded-[6px] px-2 text-[12px] text-[var(--color-fg-muted)] hover:text-[var(--color-fg)] interactive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] max-sm:min-h-[var(--tap-min)]"
+                  >
+                    <Pencil size={12} aria-hidden />
+                    {t('projects:detail.instructionsEdit')}
+                  </button>
+                ) : null
+              }
+            />
+
+            {editingInstructions ? (
+              <div className="mt-4 flex flex-col gap-3">
+                <Textarea
+                  value={instructionsDraft}
+                  onChange={(e) => setInstructionsDraft(e.target.value)}
+                  aria-label={t('projects:detail.instructionsSection')}
+                  placeholder={t('projects:detail.instructionsPlaceholder')}
+                  rows={9}
+                  className="text-[15px] leading-relaxed"
+                />
+                <div className="flex items-center justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    leadingIcon={<X size={13} aria-hidden />}
+                    onClick={() => setEditingInstructions(false)}
+                    className="max-sm:min-h-[var(--tap-min)]"
+                  >
+                    {t('common:actions.cancel')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    leadingIcon={<Save size={13} aria-hidden />}
+                    onClick={() => void saveInstructions()}
+                    loading={savingInstructions}
+                    disabled={savingInstructions}
+                    className="max-sm:min-h-[var(--tap-min)]"
+                  >
+                    {t('projects:detail.instructionsSave')}
+                  </Button>
+                </div>
+              </div>
+            ) : project.instructions ? (
+              <div className="mt-4 max-w-[62ch] whitespace-pre-wrap text-[15px] leading-[1.7] text-[var(--color-fg)]">
+                {project.instructions}
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={startInstructionsEdit}
+                className={cn(
+                  'mt-4 w-full text-left rounded-[12px] border border-dashed border-[var(--color-border)] p-5',
+                  'text-[13.5px] text-[var(--color-fg-subtle)] hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg-muted)] interactive',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                )}
+              >
+                <span className="block text-[var(--color-fg-muted)] mb-1.5 max-w-[60ch]">
+                  {t('projects:detail.instructionsEmpty')}
+                </span>
+                <span className="inline-flex items-center gap-1 text-[12px] text-[var(--color-accent)]">
+                  <Plus size={12} aria-hidden /> {t('projects:detail.instructionsAddCta')}
+                </span>
+              </button>
+            )}
+          </section>
+
+          {canUseKnowledgeBases ? (
+          <section className="mt-12 border-t border-[var(--color-divider)] pt-8 sm:mt-14 sm:pt-10">
+            <SectionHeader
+              title={t('projects:detail.filesSection')}
+              count={project.files.length}
+              action={
+                canUploadProjectFiles ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  leadingIcon={<Plus size={12} aria-hidden />}
+                  onClick={() => setAddFileOpen(true)}
+                  className="max-sm:min-h-[var(--tap-min)]"
+                >
+                  {t('projects:detail.filesAdd')}
+                </Button>
+                ) : null
+              }
+            />
+
+            {project.files.length === 0 ? (
+              canUploadProjectFiles ? (
+              <button
+                type="button"
+                onClick={() => setAddFileOpen(true)}
+                className={cn(
+                  'mt-4 w-full rounded-[12px] border border-dashed border-[var(--color-border)] p-5 text-left',
+                  'text-[12.5px] text-[var(--color-fg-subtle)] hover:bg-[var(--color-bg-muted)] interactive',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                )}
+              >
+                <p className="text-[var(--color-fg-muted)] font-medium">
+                  {t('projects:detail.filesEmpty')}
+                </p>
+                <p className="mt-1.5 leading-relaxed">{t('projects:detail.filesEmptyBody')}</p>
+                <span className="mt-3 inline-flex items-center gap-1 text-[12px] text-[var(--color-accent)]">
+                  <Plus size={12} aria-hidden /> {t('projects:detail.filesAdd')}
+                </span>
+              </button>
+              ) : (
+                <p className="mt-4 max-w-[60ch] text-[13.5px] leading-relaxed text-[var(--color-fg-subtle)]">
+                  {t('kb:fileUploadPermissionRequired')}
+                </p>
+              )
+            ) : (
+              <ul className="mt-3 flex flex-col divide-y divide-[var(--color-divider)] border-t border-[var(--color-divider)]">
+                {project.files.map((f) => {
+                  const Icon = fileKindIcon(f.kind)
+                  return (
+                    <li key={f.id}>
+                      <div className="group/file relative flex min-w-0 items-start gap-3 py-3.5 pr-1">
+                        <Icon
+                          size={14}
+                          className="mt-1 shrink-0 text-[var(--color-fg-subtle)]"
+                          aria-hidden
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="break-words text-[14px] font-medium leading-snug text-[var(--color-fg)]">
+                            {f.name}
+                          </div>
+                          <div className="mt-1 text-[10.5px] text-[var(--color-fg-subtle)] tabular-nums">
+                            {t(`projects:detail.kinds.${f.kind}`)}
+                            {f.size > 0 ? (
+                              <>
+                                <span aria-hidden className="mx-1.5 opacity-50">·</span>
+                                {formatFileSize(f.size)}
+                              </>
+                            ) : null}
+                          </div>
+                          {f.excerpt ? (
+                            <p className="mt-1.5 text-[12px] text-[var(--color-fg-muted)] leading-snug line-clamp-2">
+                              {f.excerpt}
+                            </p>
+                          ) : null}
+                        </div>
+                        {canDeleteProjectContent ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`${t('chat:actions.more')}: ${f.name}`}
+                              className="inline-flex size-7 shrink-0 items-center justify-center rounded-[6px] text-[var(--color-fg-faint)] opacity-0 group-hover/file:opacity-100 data-[state=open]:opacity-100 hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg-muted)] interactive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] max-lg:size-[var(--tap-min)] max-lg:opacity-100"
+                            >
+                              <MoreHorizontal size={13} aria-hidden />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              disabled={fileMutationID === f.id}
+                              onSelect={() => setRenameFileState({ id: f.id, draft: f.name })}
+                            >
+                              <Pencil size={13} aria-hidden /> {t('chat:sidebar.rename')}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              destructive
+                              disabled={fileMutationID === f.id}
+                              onSelect={() => {
+                                void (async () => {
+                                  if (fileMutationID || !canDeleteProjectContent) return
+                                  setFileMutationID(f.id)
+                                  try {
+                                    if (await removeFile(project.id, f.id)) {
+                                      toast.success(t('projects:detail.filesRemoved'))
+                                    }
+                                  } finally {
+                                    setFileMutationID(null)
+                                  }
+                                })()
+                              }}
+                            >
+                              <Trash2 size={13} aria-hidden /> {t('common:actions.delete')}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                        ) : null}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </section>
+          ) : null}
+
+          {/* Conversations TOC */}
+          <section className="mt-12 border-t border-[var(--color-divider)] pt-8 sm:mt-14 sm:pt-10">
+            <SectionHeader
+              title={t('projects:detail.chatsSection')}
+              count={projectChats.length}
+            />
+
+            {loadingProjectChats && projectChats.length === 0 ? (
+              <div
+                className="mt-3 flex min-h-16 items-center gap-3 border-t border-[var(--color-divider)] py-3"
+                role="status"
+                aria-label={t('common:common.loading')}
+              >
+                <Skeleton className="h-4 w-2/5" />
+                <Skeleton className="ml-auto h-3 w-20" />
+              </div>
+            ) : projectChats.length === 0 ? (
+              <p className="mt-4 max-w-[60ch] text-[13.5px] leading-relaxed text-[var(--color-fg-subtle)]">
+                {t('projects:detail.chatsEmptyBody')}
+              </p>
+            ) : (
+              <ul className="mt-3 flex flex-col divide-y divide-[var(--color-divider)] border-t border-[var(--color-divider)]">
+                {projectChats.map((c) => (
+                  <li key={c.id}>
+                    <div className="group/chatrow relative -mx-2 rounded-[10px] interactive hover:bg-[var(--color-bg-muted)]">
+                      <Link
+                        to={`/chat/${c.id}`}
+                        aria-label={t('projects:detail.openChatAria', { title: c.title })}
+                        className={cn(
+                          'grid grid-cols-1 items-baseline gap-y-1 rounded-[10px] py-3.5 pl-2 pr-12 sm:grid-cols-[minmax(0,1fr)_auto] sm:gap-x-5 sm:py-4 sm:pr-11',
+                          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                        )}
+                      >
+                        <span
+                          title={c.title}
+                          className="truncate text-[15px] font-medium leading-snug text-[var(--color-fg)] sm:text-[16px]"
+                        >
+                          {truncate(c.title, 90)}
+                        </span>
+                        <time
+                          className="shrink-0 text-[11.5px] tabular-nums text-[var(--color-fg-subtle)]"
+                          dateTime={new Date(c.updatedAt).toISOString()}
+                        >
+                          {formatRelativeDate(c.updatedAt)}
+                        </time>
+                      </Link>
+                      <div className="absolute right-1 top-1/2 -translate-y-1/2">
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`${t('chat:actions.more')}: ${c.title}`}
+                              className="inline-flex size-7 items-center justify-center rounded-[6px] text-[var(--color-fg-faint)] opacity-0 group-hover/chatrow:opacity-100 data-[state=open]:opacity-100 hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg-muted)] interactive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)] max-lg:size-[var(--tap-min)] max-lg:opacity-100"
+                            >
+                              <MoreHorizontal size={13} aria-hidden />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <MoveToProjectSub conversationId={c.id} currentProjectId={project.id} />
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
+      </div>
+
+      {/* Rename dialog */}
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent size="sm">
+          <DialogHeader>
+            <DialogTitle>{t('projects:detail.renameTitle')}</DialogTitle>
+          </DialogHeader>
+          <DialogBody>
+            <Input
+              autoFocus
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  e.preventDefault()
+                  void submitRename()
+                }
+              }}
+            />
+          </DialogBody>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRenameOpen(false)}>
+              {t('common:actions.cancel')}
+            </Button>
+            <Button onClick={() => void submitRename()} loading={renaming} disabled={!renameDraft.trim()}>
+              {t('projects:detail.renameSave')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit dialog */}
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent size="lg">
+          <DialogHeader>
+            <DialogTitle>{t('projects:detail.editTitle')}</DialogTitle>
+            <DialogDescription>{t('projects:detail.editDescription')}</DialogDescription>
+          </DialogHeader>
+          <DialogBody className="flex flex-col gap-4">
+            <Field label={t('projects:detail.editNameLabel')} htmlFor="ep-name">
+              <Input
+                id="ep-name"
+                value={editDraft.name}
+                onChange={(e) => setEditDraft((d) => ({ ...d, name: e.target.value }))}
+                autoFocus
+              />
+            </Field>
+            <Field label={t('projects:detail.editDescLabel')} htmlFor="ep-desc">
+              <Input
+                id="ep-desc"
+                value={editDraft.description}
+                onChange={(e) => setEditDraft((d) => ({ ...d, description: e.target.value }))}
+                placeholder={t('projects:detail.editDescPlaceholder')}
+              />
+            </Field>
+            <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-4">
+              <Field label={t('projects:detail.editAccentLabel')}>
+                <div className="flex flex-wrap gap-2">
+                  {PROJECT_ACCENT_OPTIONS.map((a) => {
+                    const cls = accentClasses(a)
+                    const selected = editDraft.accent === a
+                    return (
+                      <button
+                        type="button"
+                        key={a}
+                        onClick={() => setEditDraft((d) => ({ ...d, accent: a }))}
+                        aria-pressed={selected}
+                        aria-label={t(`projects:accent.${a}`)}
+                        className={cn(
+                          'inline-flex items-center gap-2 rounded-[10px] px-2.5 py-1.5 text-xs interactive border',
+                          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+                          selected
+                            ? 'border-[var(--color-border-strong)] bg-[var(--color-bg-muted)] text-[var(--color-fg)]'
+                            : 'border-[var(--color-border)] text-[var(--color-fg-muted)] hover:bg-[var(--color-bg-muted)] hover:text-[var(--color-fg)]',
+                        )}
+                      >
+                        <span className={cn('inline-block size-3 rounded-full', cls.bar)} aria-hidden />
+                        {t(`projects:accent.${a}`)}
+                      </button>
+                    )
+                  })}
+                </div>
+              </Field>
+              <Field label={t('projects:detail.editEmojiLabel')} htmlFor="ep-emoji">
+                <Input
+                  id="ep-emoji"
+                  value={editDraft.emoji}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, emoji: e.target.value }))}
+                  placeholder={t('projects:detail.editEmojiPlaceholder')}
+                  maxLength={2}
+                />
+              </Field>
+            </div>
+            {canUploadProjectFiles ? (
+              <label
+                htmlFor="ep-auto-add"
+                className="flex items-start justify-between gap-4 rounded-[12px] border border-[var(--color-border)] p-3.5"
+              >
+                <span className="min-w-0">
+                  <span className="block text-[13.5px] font-medium text-[var(--color-fg)]">
+                    {t('projects:detail.editAutoAddLabel')}
+                  </span>
+                  <span className="mt-0.5 block text-[12px] text-[var(--color-fg-subtle)] leading-relaxed">
+                    {t('projects:detail.editAutoAddHint')}
+                  </span>
+                </span>
+                <Switch
+                  id="ep-auto-add"
+                  checked={editDraft.autoAddUploads}
+                  onCheckedChange={(v) => setEditDraft((d) => ({ ...d, autoAddUploads: v }))}
+                />
+              </label>
+            ) : null}
+          </DialogBody>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setEditOpen(false)}>
+              {t('common:actions.cancel')}
+            </Button>
+            <Button onClick={() => void submitEdit()} loading={savingDetails}>
+              {t('projects:detail.editSave')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Confirm delete */}
+      <Dialog open={confirmDelete && canDeleteProject} onOpenChange={setConfirmDelete}>
+        <DialogContent size="sm">
+          <DialogHeader>
+            <DialogTitle>{t('projects:detail.deleteTitle')}</DialogTitle>
+            <DialogDescription>{t('projects:detail.deleteBody')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setConfirmDelete(false)} disabled={deleting}>
+              {t('common:actions.cancel')}
+            </Button>
+            <Button variant="destructive" onClick={submitDelete} loading={deleting}>
+              {t('common:actions.delete')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add file */}
+      {canUploadProjectFiles ? (
+      <AddFileDialog
+        open={addFileOpen && canUploadProjectFiles}
+        onOpenChange={setAddFileOpen}
+        projectName={project.name}
+        onUpload={async (files, upload) => {
+          let ok = 0
+          for (const file of files) {
+            if (upload.signal.aborted || !canUploadProjectFilesRef.current) break
+            upload.onFileStart(file)
+            const res = await uploadFile(project.id, file, {
+              signal: upload.signal,
+              onProgress: (progress) => {
+                if (typeof progress.percent !== 'number') return
+                upload.onProgress(file, progress.percent)
+              },
+            })
+            if (res) {
+              ok += 1
+              upload.onProcessing(file)
+            }
+          }
+          // Re-pull the document list so freshly-uploaded docs (and their
+          // server-assigned size / status) replace the optimistic entries.
+          if (!upload.signal.aborted && canUploadProjectFilesRef.current) await loadOne(project.id)
+          if (upload.signal.aborted) return
+          if (ok > 0) toast.success(t('projects:detail.filesAdded', { count: ok }))
+          if (ok < files.length) toast.error(t('projects:detail.filesAddFailed'))
+        }}
+      />
+      ) : null}
+
+      {/* Rename file */}
+      <Dialog
+        open={Boolean(renameFileState) && canDeleteProjectContent}
+        onOpenChange={(open) => {
+          if (!open) setRenameFileState(null)
+        }}
+      >
+        <DialogContent size="sm">
+          <DialogHeader>
+            <DialogTitle>{t('chat:sidebar.rename')}</DialogTitle>
+          </DialogHeader>
+          <DialogBody>
+            <Input
+              autoFocus
+              value={renameFileState?.draft ?? ''}
+              onChange={(e) =>
+                setRenameFileState((s) => (s ? { ...s, draft: e.target.value } : s))
+              }
+            />
+          </DialogBody>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRenameFileState(null)}>
+              {t('common:actions.cancel')}
+            </Button>
+            <Button
+              loading={Boolean(renameFileState && fileMutationID === renameFileState.id)}
+              disabled={!renameFileState?.draft.trim()}
+              onClick={() => {
+                void (async () => {
+                  if (!renameFileState || fileMutationID || !canDeleteProjectContent) return
+                  const state = renameFileState
+                  setFileMutationID(state.id)
+                  try {
+                    if (await renameFile(project.id, state.id, state.draft)) {
+                      setRenameFileState(null)
+                      toast.success(t('projects:detail.filesRenamed'))
+                    }
+                  } finally {
+                    setFileMutationID(null)
+                  }
+                })()
+              }}
+            >
+              {t('common:actions.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
+function ProjectDetailSkeleton({ label }: { label: string }) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto" role="status" aria-label={label}>
+      <div className="mx-auto w-full max-w-[var(--layout-content-max-w)] px-5 py-8 sm:px-8">
+        <Skeleton shape="line" className="h-7 w-48" />
+        <Skeleton shape="line" className="mt-4 w-full max-w-xl" />
+        <Skeleton shape="line" className="mt-2 w-3/4 max-w-md" />
+        <div className="mt-10 space-y-4">
+          <Skeleton className="h-28 w-full" />
+          <Skeleton className="h-44 w-full" />
+          <Skeleton className="h-32 w-full" />
+        </div>
+      </div>
+      <span className="sr-only">{label}</span>
+    </div>
+  )
+}
+
+/* Small primitives kept local: they're page-specific micro-typography
+   patterns and don't earn a shared module yet. */
+function Meta({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center after:content-['/'] after:ml-4 after:text-[var(--color-fg-faint)] last:after:hidden">
+      {children}
+    </span>
+  )
+}
+
+function SectionHeader({
+  title,
+  count,
+  action,
+}: {
+  title: string
+  count?: number
+  action?: React.ReactNode
+}) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+      <h2 className="min-w-0 break-words text-[18px] font-semibold tracking-normal text-[var(--color-fg)] sm:text-[20px]">
+        {title}
+      </h2>
+      {typeof count === 'number' ? (
+        <span className="text-[12px] text-[var(--color-fg-subtle)] tabular-nums">
+          {count}
+        </span>
+      ) : null}
+      {action ? <div className="ml-auto shrink-0">{action}</div> : null}
+    </div>
+  )
+}
+
+function AddFileDialog({
+  open,
+  onOpenChange,
+  projectName,
+  onUpload,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  projectName: string
+  onUpload: (files: File[], handlers: ProjectUploadHandlers) => Promise<void>
+}) {
+  const { t } = useTranslation(['projects', 'common'])
+  const fileInput = useRef<HTMLInputElement>(null)
+  const uploadController = useRef<AbortController | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadJob, setUploadJob] = useState<{ name: string; progress: number; phase: 'uploading' | 'processing' } | null>(null)
+
+  useEffect(() => {
+    if (open) return
+    uploadController.current?.abort()
+    uploadController.current = null
+    setUploading(false)
+    setUploadJob(null)
+  }, [open])
+
+  useEffect(() => () => uploadController.current?.abort(), [])
+
+  async function handleFiles(list: FileList | null) {
+    if (!list || list.length === 0) return
+    const selected = Array.from(list)
+    const controller = new AbortController()
+    uploadController.current?.abort()
+    uploadController.current = controller
+    setUploading(true)
+    setUploadJob({ name: selected[0].name, progress: 0, phase: 'uploading' })
+    try {
+      await onUpload(selected, {
+        onFileStart: (file) => setUploadJob({ name: file.name, progress: 0, phase: 'uploading' }),
+        onProgress: (file, percent) => setUploadJob({ name: file.name, progress: percent, phase: 'uploading' }),
+        onProcessing: (file) => setUploadJob({ name: file.name, progress: 100, phase: 'processing' }),
+        signal: controller.signal,
+      })
+      if (!controller.signal.aborted) onOpenChange(false)
+    } finally {
+      if (uploadController.current === controller) {
+        uploadController.current = null
+        setUploading(false)
+        setUploadJob(null)
+      }
+    }
+  }
+
+  const uploadPercent = Math.max(0, Math.min(100, Math.round(uploadJob?.progress ?? 0)))
+  const uploadLabel = uploadJob
+    ? uploadJob.phase === 'processing'
+      ? t('projects:detail.filesProcessing')
+      : t('projects:detail.filesUploadingPercent', { percent: uploadPercent })
+    : t('projects:detail.filesUploading')
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => {
+      if (!next) uploadController.current?.abort()
+      onOpenChange(next)
+    }}>
+      <DialogContent size="md">
+        <DialogHeader>
+          <DialogTitle>{t('projects:detail.filesAddTitle', { name: projectName })}</DialogTitle>
+          <DialogDescription>{t('projects:detail.filesAddDescription')}</DialogDescription>
+        </DialogHeader>
+        <DialogBody>
+          <button
+            type="button"
+            onClick={() => fileInput.current?.click()}
+            disabled={uploading}
+            className={cn(
+              'w-full rounded-[14px] border border-dashed border-[var(--color-border-strong)] bg-[var(--color-bg-muted)] p-10 text-center interactive',
+              'hover:border-[var(--color-accent)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-ring)]',
+              uploading && 'opacity-60 cursor-not-allowed',
+            )}
+          >
+            <input
+              ref={fileInput}
+              type="file"
+              hidden
+              multiple
+              onChange={(e) => {
+                void handleFiles(e.currentTarget.files)
+                e.currentTarget.value = ''
+              }}
+            />
+            {uploading ? (
+              <ProgressRing
+                value={uploadPercent}
+                size={44}
+                strokeWidth={4}
+                showValue
+                label={uploadLabel}
+                className="mx-auto text-[var(--color-accent)]"
+              />
+            ) : (
+              <Upload size={24} className="mx-auto text-[var(--color-fg-subtle)]" aria-hidden />
+            )}
+            <p className="mt-3 text-[var(--color-fg-muted)] text-sm">
+              {uploading ? uploadLabel : t('projects:detail.filesClickToChoose')}
+            </p>
+            {uploading && uploadJob ? (
+              <p className="mt-1 truncate text-xs text-[var(--color-fg-subtle)]">{uploadJob.name}</p>
+            ) : null}
+          </button>
+        </DialogBody>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => {
+            uploadController.current?.abort()
+            onOpenChange(false)
+          }}>
+            {t('common:actions.cancel')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
